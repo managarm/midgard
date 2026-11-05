@@ -1,0 +1,9 @@
+[package]
+name = "bifrost"
+version = "0.1.0"
+edition = "2024"
+description = "CLI for running lightweight Linux VMs on Managarm"
+license = "MIT"
+
+[dependencies]
+clap.workspace = true

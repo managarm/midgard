@@ -1,0 +1,14 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/bifrost",
+    "crates/midgard",
+    "crates/midgard-hv",
+    "crates/midgard-vmm",
+]
+# midgard-init deliberately isn't part of the workspace because
+# it gets built separately as a statically linked musl binary.
+exclude = ["crates/midgard-init"]
+
+[workspace.dependencies]
+clap = { version = "4.6.7", features = ["derive"] }

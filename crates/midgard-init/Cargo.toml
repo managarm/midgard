@@ -1,0 +1,8 @@
+[package]
+name = "midgard-init"
+version = "0.1.0"
+edition = "2024"
+description = "midgard's guest agent, runs as PID 1 in the Linux guest"
+license = "MIT"
+
+[dependencies]
