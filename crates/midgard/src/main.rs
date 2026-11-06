@@ -1,13 +1,14 @@
-//! midgard: runs Linux in lightweight VMs on managarm. bifrost decides how a VM looks
-//! and launches midgard with its configuration (see [`midgard_protocol`]);
-//! `bifrost --boot` runs a VM in the foreground.
+//! midgard: runs Linux in lightweight VMs on managarm (see [`midgard_vmm`]). bifrost
+//! decides how a VM looks and launches midgard with its configuration (see
+//! [`midgard_protocol`]); `bifrost --boot` runs a VM in the foreground.
 
 use std::fs::File;
 use std::os::fd::{FromRawFd, RawFd};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use midgard_protocol::MachineConfig;
+use midgard_vmm::{log, machine};
 
 /// Runs Linux VMs (bifrost launches it).
 #[derive(Parser)]
@@ -36,12 +37,15 @@ fn read_config(fd: RawFd) -> Result<MachineConfig> {
         .context("bifrost did not pass a VM configuration")
 }
 
+/// Boots a VM with its console on stdin / stdout.
 fn boot(config_fd: RawFd) -> Result<()> {
     let config = read_config(config_fd)?;
-    bail!(
-        "booting is not implemented yet (kernel {})",
-        config.kernel.display()
-    );
+    let machine = machine::start(&config, Box::new(std::io::stdout()))?;
+    let vm = machine.vm.clone();
+    let result = machine.run();
+    vm.flush_console();
+    log!("{}", machine::describe(result?));
+    Ok(())
 }
 
 fn main() {
@@ -50,7 +54,7 @@ fn main() {
         Command::Boot { config_fd } => boot(config_fd),
     };
     if let Err(error) = result {
-        eprintln!("midgard: {error:#}");
+        log!("{error:#}");
         std::process::exit(1);
     }
 }

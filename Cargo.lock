@@ -246,6 +246,7 @@ dependencies = [
  "anyhow",
  "clap",
  "midgard-protocol",
+ "midgard-vmm",
 ]
 
 [[package]]
@@ -272,6 +273,13 @@ dependencies = [
 [[package]]
 name = "midgard-vmm"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "midgard-hv",
+ "midgard-protocol",
+ "zerocopy",
+]
 
 [[package]]
 name = "once_cell_polyfill"

@@ -2,6 +2,12 @@
 name = "midgard-vmm"
 version = "0.1.0"
 edition = "2024"
+description = "midgard's virtual machine monitor: the guest's platform, its devices and their host side"
 license = "MIT"
 
 [dependencies]
+anyhow.workspace = true
+libc.workspace = true
+midgard-hv.workspace = true
+midgard-protocol.workspace = true
+zerocopy.workspace = true

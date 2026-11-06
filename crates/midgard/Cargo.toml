@@ -9,3 +9,4 @@ license = "MIT"
 anyhow.workspace = true
 clap.workspace = true
 midgard-protocol.workspace = true
+midgard-vmm.workspace = true
