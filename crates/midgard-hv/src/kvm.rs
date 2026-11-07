@@ -56,8 +56,9 @@ const LEAF1_ECX_EMULATED: u32 =
 const LEAF1_EDX_EMULATED: u32 = cpuid::LEAF1_EDX_APIC;
 
 /// The mapping of guest RAM into our address space (an anonymous shared mapping), which
-/// [`GuestMemory`] accesses. The VM refers to it, too; everything that can run the guest
-/// holds a reference such that it stays mapped while the guest can access it.
+/// [`GuestMemory`] accesses. The VM refers to it, too (unless the memory is detached);
+/// everything that can run the guest holds a reference such that it stays mapped while
+/// the guest can access it.
 pub(crate) struct Mapping {
     base: *mut u8,
     size: usize,
@@ -70,7 +71,7 @@ unsafe impl Send for Mapping {}
 unsafe impl Sync for Mapping {}
 
 impl Mapping {
-    fn new(size: usize) -> std::io::Result<Self> {
+    pub(crate) fn new(size: usize) -> std::io::Result<Self> {
         // SAFETY: A new anonymous mapping does not alias anything.
         let base = unsafe {
             libc::mmap(
@@ -89,6 +90,10 @@ impl Mapping {
             base: base.cast(),
             size,
         })
+    }
+
+    pub(crate) fn base(&self) -> *mut u8 {
+        self.base
     }
 }
 
@@ -160,13 +165,13 @@ pub(crate) fn create(memory_size: u64) -> Result<(Hypervisor, GuestMemory)> {
         flags: 0,
         guest_phys_addr: 0,
         memory_size,
-        userspace_addr: mapping.base as u64,
+        userspace_addr: mapping.base() as u64,
     };
     // SAFETY: The region stays mapped as long as the VM exists: the Hypervisor and the
     // vCPUs (whose file descriptors keep the VM alive) hold a reference to the mapping.
     unsafe { vm.set_user_memory_region(region) }.context("KVM_SET_USER_MEMORY_REGION failed")?;
     // SAFETY: The GuestMemory holds a reference to the mapping.
-    let memory = unsafe { GuestMemory::new(mapping.base, memory_size, mapping.clone()) };
+    let memory = unsafe { GuestMemory::new(mapping.base(), memory_size, mapping.clone()) };
 
     let supported_cpuid = kvm
         .get_supported_cpuid(KVM_MAX_CPUID_ENTRIES)
