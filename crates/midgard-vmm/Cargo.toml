@@ -7,7 +7,13 @@ license = "MIT"
 
 [dependencies]
 anyhow.workspace = true
+async-channel.workspace = true
+async-executor.workspace = true
+async-io.workspace = true
+blocking.workspace = true
+event-listener.workspace = true
 libc.workspace = true
 midgard-hv.workspace = true
 midgard-protocol.workspace = true
+thiserror.workspace = true
 zerocopy.workspace = true

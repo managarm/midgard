@@ -23,6 +23,10 @@ pub enum MemoryError {
 /// model does not know about. Hence, guest memory is never part of a Rust allocation: we
 /// never create references to it and only access it through volatile accesses, which Rust
 /// permits for memory outside of its allocations (see [`std::ptr::read_volatile`]).
+///
+/// Clones refer to the same memory, and each keeps it mapped (e.g., while asynchronous
+/// I/O accesses it).
+#[derive(Clone)]
 pub struct GuestMemory {
     base: *mut u8,
     size: u64,
@@ -61,16 +65,23 @@ impl GuestMemory {
         self.size
     }
 
-    /// Returns a pointer to `length` bytes of guest memory at `address`. Accesses through
-    /// it must be volatile (see [`GuestMemory`]) or happen outside of Rust (e.g., the
-    /// kernel's, in a read() system call).
-    pub fn pointer(&self, address: u64, length: usize) -> Result<*mut u8, MemoryError> {
+    /// Checks that `length` bytes at `address` are inside guest memory (e.g., before a
+    /// device starts I/O that it cannot undo).
+    pub fn check_range(&self, address: u64, length: usize) -> Result<(), MemoryError> {
         if address
             .checked_add(length as u64)
             .is_none_or(|end| end > self.size)
         {
             return Err(MemoryError::OutOfRange { address, length });
         }
+        Ok(())
+    }
+
+    /// Returns a pointer to `length` bytes of guest memory at `address`. Accesses through
+    /// it must be volatile (see [`GuestMemory`]) or happen outside of Rust (e.g., the
+    /// kernel's, in a read() system call).
+    pub fn pointer(&self, address: u64, length: usize) -> Result<*mut u8, MemoryError> {
+        self.check_range(address, length)?;
         // Guest memory is not a Rust allocation, so we cannot use add().
         Ok(self.base.wrapping_add(address as usize))
     }
@@ -206,5 +217,8 @@ mod tests {
             })
         );
         assert_eq!(memory.read_u64(8), Ok(0));
+        assert_eq!(memory.check_range(0, 16), Ok(()));
+        assert!(memory.check_range(1, 16).is_err());
+        assert!(memory.check_range(u64::MAX, 2).is_err());
     }
 }

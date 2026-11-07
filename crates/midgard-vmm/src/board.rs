@@ -11,6 +11,7 @@ use crate::devices::serial::{self, Serial};
 use crate::devices::{read_bytes, write_bytes};
 use crate::logging::{ReportOnce, log};
 use crate::machine::Stop;
+use crate::virtio::{self, DeviceRef, Effect, Transport};
 use crate::{platform, vcpu};
 
 /// Problems that are reported once (see [`ReportOnce`]).
@@ -23,11 +24,12 @@ enum Unhandled {
 }
 
 /// The guest's hardware, shared by all vCPUs: RAM, the devices that are not in the
-/// hypervisor (UART, PM1) and the routing of port I/O, MMIO and interrupt lines to them.
-/// The local APICs and the I/O APIC are the hypervisor's. Also tracks whether the guest
-/// is done (stop requested).
+/// hypervisor (UART, PM1, the virtio transports) and the routing of port I/O, MMIO and
+/// interrupt lines to them. The local APICs and the I/O APIC are the hypervisor's. Also
+/// tracks whether the guest is done (stop requested).
 ///
-/// vCPU threads call into it on every exit.
+/// vCPU threads call into it on every exit; the host side of virtio devices reaches its
+/// device through [`Board::with_device`].
 pub(crate) struct Board {
     hypervisor: Hypervisor,
     pub(crate) memory: GuestMemory,
@@ -42,6 +44,8 @@ pub(crate) struct Board {
     kickers: Mutex<Vec<Kicker>>,
     /// [`Board::stop`] was called.
     stopping: AtomicBool,
+    /// The virtio devices, in the order of their slots (see [`platform::virtio_slot`]).
+    virtio: Vec<Mutex<Transport>>,
     reported: ReportOnce<Unhandled>,
     /// What the vCPUs reported (each vCPU tends to do the same, e.g., probe an MSR).
     pub(crate) vcpu_reported: ReportOnce<vcpu::Unsupported>,
@@ -55,6 +59,7 @@ impl Board {
         tsc_hz: u64,
         hypervisor: Hypervisor,
         console: Box<dyn Write + Send>,
+        virtio: Vec<Transport>,
     ) -> Self {
         Self {
             hypervisor,
@@ -66,6 +71,7 @@ impl Board {
             pm1: Mutex::new(Pm1::default()),
             kickers: Mutex::new(Vec::new()),
             stopping: AtomicBool::new(false),
+            virtio: virtio.into_iter().map(Mutex::new).collect(),
             reported: ReportOnce::new(),
             vcpu_reported: ReportOnce::new(),
         }
@@ -109,8 +115,30 @@ impl Board {
         }
     }
 
+    /// Generates an edge on an (ISA, edge-triggered) interrupt line.
+    fn pulse_irq(&self, pin: usize) {
+        self.set_irq_line(pin, true);
+        self.set_irq_line(pin, false);
+    }
+
     pub(crate) fn flush_console(&self) {
         self.serial.lock().unwrap().flush();
+    }
+
+    /// Runs `f` on a virtio device (for the host side of devices); raises its interrupt
+    /// if `f` added used buffers.
+    pub(crate) fn with_device<D: virtio::Device, R>(
+        &self,
+        device: DeviceRef<D>,
+        f: impl FnOnce(&mut D, &mut [virtio::Queue], &GuestMemory) -> (R, bool),
+    ) -> R {
+        let mut transport = self.virtio[device.slot()].lock().unwrap();
+        let (result, interrupt) = transport.with_device(&self.memory, f);
+        if interrupt {
+            // With the lock held (see mmio_write()).
+            self.pulse_irq(transport.irq);
+        }
+        result
     }
 
     fn report(&self, key: Unhandled, what: std::fmt::Arguments) {
@@ -200,8 +228,18 @@ impl Board {
         None
     }
 
+    /// The virtio device whose registers are at `address`, and the offset into them.
+    fn virtio_device(&self, address: u64) -> Option<(usize, u64)> {
+        let offset = address.checked_sub(platform::VIRTIO_BASE)?;
+        let index = (offset / virtio::MMIO_SIZE) as usize;
+        (index < self.virtio.len()).then_some((index, offset % virtio::MMIO_SIZE))
+    }
+
     /// MMIO read of `size` bytes.
     pub(crate) fn mmio_read(&self, address: u64, size: u8) -> u64 {
+        if let Some((index, offset)) = self.virtio_device(address) {
+            return self.virtio[index].lock().unwrap().read(offset, size);
+        }
         self.report(
             Unhandled::Mmio(address),
             format_args!("MMIO read of {size} bytes at {address:#x}"),
@@ -210,7 +248,25 @@ impl Board {
     }
 
     /// MMIO write of `size` bytes.
-    pub(crate) fn mmio_write(&self, address: u64, size: u8, _value: u64) {
+    pub(crate) fn mmio_write(&self, address: u64, size: u8, value: u64) {
+        if let Some((index, offset)) = self.virtio_device(address) {
+            let mut transport = self.virtio[index].lock().unwrap();
+            match transport.write(offset, size, value, &self.memory) {
+                Effect::None => {}
+                // With the lock held: the edges of two threads must not merge into one
+                // (after the guest saw the first one's used buffers, but not the second
+                // one's).
+                Effect::Interrupt => self.pulse_irq(transport.irq),
+                Effect::Reset(in_flight) => {
+                    drop(transport);
+                    // The requests complete on the VM's executor, which keeps running
+                    // while vCPUs exist (see Machine).
+                    in_flight.wait();
+                    self.virtio[index].lock().unwrap().finish_reset();
+                }
+            }
+            return;
+        }
         self.report(
             Unhandled::Mmio(address),
             format_args!("MMIO write of {size} bytes at {address:#x}"),
