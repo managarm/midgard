@@ -2,15 +2,14 @@
 //! VM's configuration and asks midgard (on midgard's socket) to run it.
 
 use std::io::{self, Write};
-use std::os::unix::net::UnixStream;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use midgard_protocol::control::{Request, Response};
 use midgard_protocol::machine::{Disk, MachineConfig};
-use midgard_protocol::runtime;
 
 use crate::cli::BootArgs;
+use crate::client;
 
 /// The guest's RAM unless --memory says otherwise.
 const DEFAULT_MEMORY: u64 = 1 << 30;
@@ -56,13 +55,7 @@ fn config(boot: &BootArgs) -> Result<MachineConfig> {
 /// which stops it).
 pub fn boot(args: &BootArgs) -> Result<()> {
     let config = config(args)?;
-    let socket = runtime::daemon_socket();
-    let mut stream = UnixStream::connect(&socket).with_context(|| {
-        format!(
-            "failed to connect to midgard at {} (is midgard.socket running?)",
-            socket.display()
-        )
-    })?;
+    let mut stream = client::connect_daemon()?;
     midgard_protocol::write_message(&mut stream, &Request::Boot(config))?;
     let mut stdout = io::stdout().lock();
     loop {

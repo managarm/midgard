@@ -54,8 +54,7 @@ pub struct RunArgs {
     #[arg(long, value_name = "NAME")]
     pub vm: Option<String>,
 
-    /// The working directory in the guest [default: the current working directory
-    /// through the shared directory mount]
+    /// The working directory in the guest [default: root's home directory]
     #[arg(short = 'C', long = "cd", value_name = "DIR")]
     pub cwd: Option<String>,
 
@@ -207,7 +206,6 @@ impl RunArgs {
     }
 
     /// Whether the command runs on a pseudo terminal (`None`: decide from stdin / stdout).
-    #[expect(dead_code, reason = "the tty options are not wired up yet")]
     pub fn tty(&self) -> Option<bool> {
         if self.tty {
             Some(true)

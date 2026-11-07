@@ -1,11 +1,30 @@
+//! bifrost: runs commands, or a login shell, in midgard's VMs (see [`client`]).
+
 use std::process::ExitCode;
+
+use midgard_protocol::runtime::DEFAULT_VM;
 
 mod boot;
 mod cli;
+mod client;
+mod terminal;
+
+use cli::Action;
+
+/// Prints a message (like `eprintln!`) with bifrost's prefix.
+macro_rules! log {
+    ($($arg:tt)*) => { eprintln!("bifrost: {}", format_args!($($arg)*)) };
+}
+pub(crate) use log;
 
 /// The exit code for bifrost's own failures, such that they aren't mistaken
 /// for the command's exit code.
 const EXIT_FAILURE: u8 = 255;
+
+/// The VM instance that the command line names, or the default one.
+fn vm(name: &Option<String>) -> &str {
+    name.as_deref().unwrap_or(DEFAULT_VM)
+}
 
 fn main() -> ExitCode {
     let cli = match cli::Cli::try_parse_args(std::env::args_os()) {
@@ -20,13 +39,19 @@ fn main() -> ExitCode {
             };
         }
     };
-    match &cli.action {
-        Some(cli::Action::Boot(args)) => match boot::boot(args) {
-            Ok(()) => return ExitCode::SUCCESS,
-            Err(error) => eprintln!("bifrost: {error:#}"),
-        },
-        Some(action) => eprintln!("bifrost: not implemented yet: {action:?}"),
-        None => eprintln!("bifrost: not implemented yet: running {:?}", cli.run),
+    let result = match &cli.action {
+        None => client::run(vm(&cli.run.vm), &cli.run),
+        Some(Action::Boot(args)) => boot::boot(args).map(|()| 0),
+        Some(action) => Err(anyhow::anyhow!("not implemented yet: {action:?}")),
+    };
+    terminal::restore();
+    match result {
+        // Exit codes of commands are 0 to 255 (128 + the signal for those that a signal
+        // killed).
+        Ok(code) => ExitCode::from(code as u8),
+        Err(error) => {
+            log!("{error:#}");
+            ExitCode::from(EXIT_FAILURE)
+        }
     }
-    ExitCode::from(EXIT_FAILURE)
 }
