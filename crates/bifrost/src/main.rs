@@ -20,12 +20,13 @@ fn main() -> ExitCode {
             };
         }
     };
-    match cli.action() {
-        cli::Action::Boot => match boot::boot(&cli) {
+    match &cli.action {
+        Some(cli::Action::Boot(args)) => match boot::boot(args) {
             Ok(()) => return ExitCode::SUCCESS,
             Err(error) => eprintln!("bifrost: {error:#}"),
         },
-        action => eprintln!("bifrost: not implemented yet: {action:?}"),
+        Some(action) => eprintln!("bifrost: not implemented yet: {action:?}"),
+        None => eprintln!("bifrost: not implemented yet: running {:?}", cli.run),
     }
     ExitCode::from(EXIT_FAILURE)
 }

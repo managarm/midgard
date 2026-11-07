@@ -1,4 +1,4 @@
-//! `bifrost --boot`: boots a VM in the foreground (for debugging). bifrost decides the
+//! `bifrost boot`: boots a VM in the foreground (for debugging). bifrost decides the
 //! VM's configuration and asks midgard (on midgard's socket) to run it.
 
 use std::io::{self, Write};
@@ -9,7 +9,7 @@ use anyhow::{Context, Result, bail};
 use midgard_protocol::control::{Request, Response};
 use midgard_protocol::{MachineConfig, runtime};
 
-use crate::cli::Cli;
+use crate::cli::BootArgs;
 
 /// The guest's RAM unless --memory says otherwise.
 const DEFAULT_MEMORY: u64 = 1 << 30;
@@ -20,25 +20,20 @@ fn absolute(path: &Path) -> Result<std::path::PathBuf> {
 }
 
 /// The VM that the command line describes.
-fn config(cli: &Cli) -> Result<MachineConfig> {
-    let boot = &cli.boot;
-    let kernel = boot
-        .kernel
-        .as_deref()
-        .expect("clap requires --kernel with --boot");
+fn config(boot: &BootArgs) -> Result<MachineConfig> {
     Ok(MachineConfig {
-        kernel: absolute(kernel)?,
+        kernel: absolute(&boot.kernel)?,
         initrd: boot.initrd.as_deref().map(absolute).transpose()?,
         cmdline: boot.cmdline.clone(),
         append: boot.append.clone(),
-        memory: cli.memory.unwrap_or(DEFAULT_MEMORY),
+        memory: boot.memory.unwrap_or(DEFAULT_MEMORY),
     })
 }
 
 /// Asks midgard to boot the VM and prints its console until it stops (or we are killed,
 /// which stops it).
-pub fn boot(cli: &Cli) -> Result<()> {
-    let config = config(cli)?;
+pub fn boot(args: &BootArgs) -> Result<()> {
+    let config = config(args)?;
     let socket = runtime::daemon_socket();
     let mut stream = UnixStream::connect(&socket).with_context(|| {
         format!(
@@ -67,11 +62,15 @@ pub fn boot(cli: &Cli) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::{Action, Cli};
 
     #[test]
     fn defaults() {
-        let cli = Cli::try_parse_args(["bifrost", "--boot", "--kernel", "bzImage"]).unwrap();
-        let config = config(&cli).unwrap();
+        let cli = Cli::try_parse_args(["bifrost", "boot", "--kernel", "bzImage"]).unwrap();
+        let Some(Action::Boot(boot)) = cli.action else {
+            panic!("not boot: {:?}", cli.action);
+        };
+        let config = config(&boot).unwrap();
         assert!(config.kernel.is_absolute());
         assert!(config.kernel.ends_with("bzImage"));
         assert_eq!(config.initrd, None);

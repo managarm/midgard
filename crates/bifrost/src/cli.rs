@@ -2,82 +2,57 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 
 use clap::error::ErrorKind;
-use clap::{Args, CommandFactory, Parser};
+use clap::{Args, CommandFactory, Parser, Subcommand};
 
 /// Runs a command, or your login shell, in the VM.
 ///
-/// The VM is started on demand and keeps running until it is shut down.
+/// The VM is started on demand and keeps running until it is shut down. To run a
+/// command that has the name of an action, put `--` in front of it.
 #[derive(Debug, Parser)]
 #[command(
     version,
-    override_usage = "\
-bifrost [OPTIONS] [--] [COMMAND]...
-       bifrost --create NAME [--template NAME] [--memory SIZE] [--disk-size SIZE]
-       bifrost --delete NAME
-       bifrost --list
-       bifrost [-d NAME] --shutdown | --shutdown --all
-       bifrost [-d NAME] --log [--follow]
-       bifrost --boot --kernel FILE [--initrd FILE] [--cmdline ARGS] [--append ARG]... [--memory SIZE]",
+    args_conflicts_with_subcommands = true,
+    disable_help_subcommand = true,
+    subcommand_value_name = "ACTION",
+    subcommand_help_heading = "Actions",
     args_override_self = true
 )]
 pub struct Cli {
+    /// What to do instead of running a command.
+    #[command(subcommand)]
+    pub action: Option<Action>,
+
+    #[command(flatten)]
+    pub run: RunArgs,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum Action {
+    /// Create a new VM instance from a template
+    Create(CreateArgs),
+
+    /// Delete a VM instance and its disk
+    Delete(DeleteArgs),
+
+    /// List VM instances and templates
+    List,
+
+    /// Stop a VM instance
+    Shutdown(ShutdownArgs),
+
+    /// Show a VM instance's log
+    Log(LogArgs),
+
+    /// Boot a VM in the foreground, with its console on stdout (for debugging)
+    Boot(BootArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct RunArgs {
     /// The VM [default: the configured default VM]
     #[arg(short = 'd', long, value_name = "NAME")]
     pub distro: Option<String>,
 
-    /// The VM's memory, e.g. 2G (with --create or --boot)
-    #[arg(long, value_name = "SIZE", value_parser = parse_size, requires = "sized")]
-    pub memory: Option<u64>,
-
-    #[command(flatten)]
-    pub actions: Actions,
-
-    #[command(flatten)]
-    pub run: RunArgs,
-
-    #[command(flatten)]
-    pub create: CreateArgs,
-
-    #[command(flatten)]
-    pub boot: BootArgs,
-
-    #[command(flatten)]
-    pub modifiers: Modifiers,
-}
-
-#[derive(Debug, Args)]
-#[group(id = "action", multiple = false)]
-#[command(next_help_heading = "Actions")]
-pub struct Actions {
-    /// Create a new VM instance from a template
-    #[arg(long, value_name = "NAME", conflicts_with = "distro", group = "sized")]
-    create: Option<String>,
-
-    /// Delete a VM instance and its disk
-    #[arg(long, value_name = "NAME", conflicts_with = "distro")]
-    delete: Option<String>,
-
-    /// List VM instances and templates
-    #[arg(short = 'l', long, conflicts_with = "distro")]
-    list: bool,
-
-    /// Stop the VM instance
-    #[arg(long)]
-    shutdown: bool,
-
-    /// Show the VM instance's log
-    #[arg(long)]
-    log: bool,
-
-    /// Boot a VM in the foreground, with its console on stdout (for debugging)
-    #[arg(long, conflicts_with = "distro", group = "sized")]
-    boot: bool,
-}
-
-#[derive(Debug, Args)]
-#[group(id = "run", multiple = true, conflicts_with = "action")]
-#[command(next_help_heading = "Running commands")]
-pub struct RunArgs {
     /// The working directory in the guest [default: the current working directory
     /// through the shared directory mount]
     #[arg(short = 'C', long = "cd", value_name = "DIR")]
@@ -105,85 +80,90 @@ pub struct RunArgs {
     #[arg(long)]
     pub no_start: bool,
 
+    /// Answer questions with their defaults
+    #[arg(short = 'y', long)]
+    pub yes: bool,
+
     /// The command and its arguments [default: your login shell]
     #[arg(trailing_var_arg = true, value_name = "COMMAND")]
     pub command: Vec<String>,
 }
 
 #[derive(Debug, Args)]
-#[command(next_help_heading = "Creating VM instances")]
 pub struct CreateArgs {
+    /// The name of the new VM instance
+    pub name: String,
+
     /// The template to create the new VM instance from [default: the VM instance's name]
-    #[arg(long, value_name = "NAME", requires = "create")]
+    #[arg(long, value_name = "NAME")]
     pub template: Option<String>,
 
+    /// The VM instance's memory, e.g. 2G
+    #[arg(long, value_name = "SIZE", value_parser = parse_size)]
+    pub memory: Option<u64>,
+
     /// The size of the VM instance's disk, e.g. 64G
-    #[arg(long, value_name = "SIZE", value_parser = parse_size, requires = "create")]
+    #[arg(long, value_name = "SIZE", value_parser = parse_size)]
     pub disk_size: Option<u64>,
-}
-
-#[derive(Debug, Args)]
-#[command(next_help_heading = "Booting VMs")]
-pub struct BootArgs {
-    /// The guest kernel (a bzImage)
-    #[arg(
-        long,
-        value_name = "FILE",
-        requires = "boot",
-        required_if_eq("boot", "true")
-    )]
-    pub kernel: Option<PathBuf>,
-
-    /// An initrd
-    #[arg(long, value_name = "FILE", requires = "boot")]
-    pub initrd: Option<PathBuf>,
-
-    /// Replace the base kernel parameters
-    #[arg(
-        long,
-        value_name = "ARGS",
-        requires = "boot",
-        allow_hyphen_values = true
-    )]
-    pub cmdline: Option<String>,
-
-    /// Add a kernel parameter, can be provided multiple times
-    #[arg(
-        long,
-        value_name = "ARG",
-        requires = "boot",
-        allow_hyphen_values = true
-    )]
-    pub append: Vec<String>,
-}
-
-#[derive(Debug, Args)]
-#[command(next_help_heading = "Other options")]
-pub struct Modifiers {
-    /// With --shutdown: stop all VM instances
-    #[arg(long, requires = "shutdown", conflicts_with = "distro")]
-    pub all: bool,
-
-    /// With --log: keep printing as the console gets written to
-    #[arg(short = 'f', long, requires = "log")]
-    pub follow: bool,
 
     /// Answer questions with their defaults
     #[arg(short = 'y', long)]
     pub yes: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Action<'a> {
-    Run,
-    /// Create the VM instance with this name.
-    Create(&'a str),
-    /// Delete the VM instance with this name.
-    Delete(&'a str),
-    List,
-    Shutdown,
-    Log,
-    Boot,
+#[derive(Debug, Args)]
+pub struct DeleteArgs {
+    /// The VM instance to delete
+    pub name: String,
+
+    /// Answer questions with their defaults
+    #[arg(short = 'y', long)]
+    pub yes: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct ShutdownArgs {
+    /// The VM instance [default: the configured default VM]
+    #[arg(short = 'd', long, value_name = "NAME")]
+    pub distro: Option<String>,
+
+    /// Stop all VM instances
+    #[arg(long, conflicts_with = "distro")]
+    pub all: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct LogArgs {
+    /// The VM instance [default: the configured default VM]
+    #[arg(short = 'd', long, value_name = "NAME")]
+    pub distro: Option<String>,
+
+    /// Keep printing as the console gets written to
+    #[arg(short = 'f', long)]
+    pub follow: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct BootArgs {
+    /// The guest kernel (a bzImage)
+    #[arg(long, value_name = "FILE")]
+    pub kernel: PathBuf,
+
+    /// An initrd
+    #[arg(long, value_name = "FILE")]
+    pub initrd: Option<PathBuf>,
+
+    /// Replace the base kernel parameters
+    #[arg(long, value_name = "ARGS", allow_hyphen_values = true)]
+    pub cmdline: Option<String>,
+
+    /// Add a kernel parameter, can be provided multiple times
+    #[arg(long, value_name = "ARG", allow_hyphen_values = true)]
+    pub append: Vec<String>,
+
+    /// The VM's memory, e.g. 2G
+    #[arg(long, value_name = "SIZE", value_parser = parse_size)]
+    pub memory: Option<u64>,
 }
 
 impl Cli {
@@ -202,24 +182,6 @@ impl Cli {
             }
         }
         Ok(cli)
-    }
-
-    pub fn action(&self) -> Action<'_> {
-        if let Some(name) = &self.actions.create {
-            Action::Create(name)
-        } else if let Some(name) = &self.actions.delete {
-            Action::Delete(name)
-        } else if self.actions.list {
-            Action::List
-        } else if self.actions.shutdown {
-            Action::Shutdown
-        } else if self.actions.log {
-            Action::Log
-        } else if self.actions.boot {
-            Action::Boot
-        } else {
-            Action::Run
-        }
     }
 }
 
@@ -275,35 +237,88 @@ mod tests {
     }
 
     #[test]
+    fn run() {
+        let cli = parse(&["-d", "alpine", "ls", "-la", "--color"]).unwrap();
+        assert!(cli.action.is_none());
+        assert_eq!(cli.run.distro.as_deref(), Some("alpine"));
+        assert_eq!(cli.run.command, ["ls", "-la", "--color"]);
+    }
+
+    #[test]
+    fn run_shell() {
+        let cli = parse(&[]).unwrap();
+        assert!(cli.action.is_none());
+        assert!(cli.run.command.is_empty());
+    }
+
+    #[test]
+    fn run_command_named_like_an_action() {
+        let cli = parse(&["--", "list", "-v"]).unwrap();
+        assert!(cli.action.is_none());
+        assert_eq!(cli.run.command, ["list", "-v"]);
+
+        let cli = parse(&["help"]).unwrap();
+        assert_eq!(cli.run.command, ["help"]);
+
+        let cli = parse(&["-C", "/tmp", "boot"]).unwrap();
+        assert!(cli.action.is_none());
+        assert_eq!(cli.run.command, ["boot"]);
+    }
+
+    #[test]
+    fn run_options_conflict_with_actions() {
+        assert!(parse(&["list", "-C", "/tmp"]).is_err());
+        assert!(parse(&["create", "alpine", "--no-start"]).is_err());
+    }
+
+    #[test]
+    fn env() {
+        let cli = parse(&["-e", "A", "-1", "env"]).unwrap();
+        assert_eq!(cli.run.env().collect::<Vec<_>>(), [("A", "-1")]);
+        assert_eq!(cli.run.command, ["env"]);
+        assert!(parse(&["-e", "A=B", "C", "env"]).is_err());
+    }
+
+    #[test]
     fn boot() {
         let cli = parse(&[
-            "--boot", "--kernel", "bzImage", "--append", "quiet", "--append", "-v", "--memory",
-            "2G",
+            "boot", "--kernel", "bzImage", "--append", "quiet", "--append", "-v", "--memory", "2G",
         ])
         .unwrap();
-        assert_eq!(cli.action(), Action::Boot);
-        assert_eq!(cli.boot.kernel, Some("bzImage".into()));
-        assert_eq!(cli.boot.append, ["quiet", "-v"]);
-        assert_eq!(cli.memory, Some(2 << 30));
+        let Some(Action::Boot(boot)) = cli.action else {
+            panic!("not boot: {:?}", cli.action);
+        };
+        assert_eq!(boot.kernel, PathBuf::from("bzImage"));
+        assert_eq!(boot.append, ["quiet", "-v"]);
+        assert_eq!(boot.memory, Some(2 << 30));
     }
 
     #[test]
     fn boot_needs_a_kernel() {
-        assert!(parse(&["--boot"]).is_err());
+        assert!(parse(&["boot"]).is_err());
     }
 
     #[test]
-    fn boot_options_need_boot() {
+    fn options_belong_to_their_action() {
         assert!(parse(&["--kernel", "bzImage"]).is_err());
-        assert!(parse(&["--append", "quiet"]).is_err());
         assert!(parse(&["--memory", "2G"]).is_err());
-        assert!(parse(&["--boot", "--kernel", "bzImage", "--create", "alpine"]).is_err());
+        assert!(parse(&["create", "alpine", "--kernel", "bzImage"]).is_err());
+        assert!(parse(&["list", "--all"]).is_err());
     }
 
     #[test]
     fn create_with_memory() {
-        let cli = parse(&["--create", "alpine", "--memory", "512M"]).unwrap();
-        assert_eq!(cli.action(), Action::Create("alpine"));
-        assert_eq!(cli.memory, Some(512 << 20));
+        let cli = parse(&["create", "alpine", "--memory", "512M"]).unwrap();
+        let Some(Action::Create(create)) = cli.action else {
+            panic!("not create: {:?}", cli.action);
+        };
+        assert_eq!(create.name, "alpine");
+        assert_eq!(create.memory, Some(512 << 20));
+    }
+
+    #[test]
+    fn shutdown_all_conflicts_with_distro() {
+        assert!(parse(&["shutdown", "--all"]).is_ok());
+        assert!(parse(&["shutdown", "--all", "-d", "alpine"]).is_err());
     }
 }
