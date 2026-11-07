@@ -18,6 +18,8 @@
 //! the backend's own types, whose methods (see `backend!`) are the same on all of
 //! them. Nothing here is a trait object.
 
+#![warn(unreachable_pub)]
+
 use anyhow::Result;
 
 pub mod memory;

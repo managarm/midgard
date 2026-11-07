@@ -77,7 +77,7 @@ pub struct Hypervisor {
     supported_cpuid: Vec<kvm_cpuid_entry2>,
 }
 
-pub fn create(memory_size: u64) -> Result<(Hypervisor, GuestMemory)> {
+pub(crate) fn create(memory_size: u64) -> Result<(Hypervisor, GuestMemory)> {
     let kvm = Kvm::new().context("failed to open /dev/kvm")?;
     for cap in [
         Cap::Irqchip,
