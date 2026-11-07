@@ -156,6 +156,7 @@ mod tests {
             control::Response::Stopped("the guest powered off".into()),
             control::Response::Starting,
             control::Response::Ready,
+            control::Response::Running(vec!["alpine".into()]),
             control::Response::Error("no such file".into()),
         ];
         for response in &responses {

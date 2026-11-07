@@ -187,6 +187,10 @@ async fn respond(stream: &Async<UnixStream>, response: control::Response) -> Res
 }
 
 impl Instances {
+    pub fn running(&self) -> Vec<String> {
+        self.running.lock().unwrap().keys().cloned().collect()
+    }
+
     /// Connects `stream` to the agent in the VM of `name` (see
     /// [`control::Request::Session`]).
     pub async fn session(&self, stream: Async<UnixStream>, name: &str, start: bool) -> Result<()> {

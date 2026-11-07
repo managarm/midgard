@@ -16,6 +16,8 @@ pub enum Request {
     /// the VM and [`Response::Ready`] once the agent answers; from then on, the
     /// connection carries the session protocol (see [`crate::session`]).
     Session { name: String, start: bool },
+    /// The VM instances whose VMs run ([`Response::Running`]).
+    Running,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -28,6 +30,7 @@ pub enum Response {
     Starting,
     /// The connection now goes to the agent.
     Ready,
+    Running(Vec<String>),
     /// The request failed.
     Error(String),
 }

@@ -196,6 +196,7 @@ async fn serve(stream: Async<UnixStream>) -> Result<()> {
                 }
             }
         }
+        Request::Running => Response::Running(INSTANCES.running()),
         Request::Session { .. } => unreachable!(),
     };
     // bifrost may be gone already (which stopped the VM).

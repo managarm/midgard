@@ -1,6 +1,6 @@
 //! Talking to midgard (on its socket, see [`midgard_protocol::control`]): runs commands
-//! (or a login shell) in a VM instance. midgard starts an instance's VM for the first
-//! session with it; the VM stays up for later commands.
+//! (or a login shell) in a VM instance and stops VMs. midgard starts an instance's VM
+//! for the first session with it; the VM stays up for later commands.
 
 use std::fs::File;
 use std::io::{self, Read, Write};
@@ -8,6 +8,7 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use midgard_protocol::session::{Exec, Request, Response, WindowSize};
@@ -48,6 +49,17 @@ pub fn connect_daemon() -> Result<UnixStream> {
             socket.display()
         )
     })
+}
+
+/// Sends `request` to midgard and returns its answer.
+fn ask(request: control::Request) -> Result<control::Response> {
+    let mut stream = connect_daemon()?;
+    midgard_protocol::write_message(&mut stream, &request)?;
+    match midgard_protocol::read_message(&mut stream).context("lost the connection to midgard")? {
+        Some(control::Response::Error(message)) => bail!("{message}"),
+        Some(response) => Ok(response),
+        None => bail!("midgard closed the connection"),
+    }
 }
 
 /// Connects to the agent in the VM of `name`, which midgard starts first if it does
@@ -256,4 +268,51 @@ fn session(stream: UnixStream, writer: Arc<Mutex<UnixStream>>, tty: bool) -> Res
     })();
     stop_input();
     result
+}
+
+/// The VM instances whose VMs run.
+fn running() -> Result<Vec<String>> {
+    match ask(control::Request::Running)? {
+        control::Response::Running(names) => Ok(names),
+        other => bail!("unexpected answer from midgard: {other:?}"),
+    }
+}
+
+/// Stops all VMs that run.
+pub fn shutdown_all() -> Result<()> {
+    let mut failed = false;
+    for name in running()? {
+        if let Err(error) = shutdown(&name) {
+            log!("{name}: {error:#}");
+            failed = true;
+        }
+    }
+    if failed {
+        bail!("not all VMs stopped");
+    }
+    Ok(())
+}
+
+/// Stops the VM of a distribution.
+pub fn shutdown(name: &str) -> Result<()> {
+    let mut stream = connect(name, false)?;
+    midgard_protocol::write_message(&mut stream, &Request::Shutdown)?;
+    // The agent acknowledges before it powers off; then we wait until midgard says that
+    // the VM stopped.
+    match midgard_protocol::read_message::<Response>(&mut stream)
+        .context("lost the connection to the VM")?
+    {
+        Some(Response::Exited { .. }) => {}
+        Some(Response::Error(message)) => bail!("{message}"),
+        other => bail!("unexpected answer to the shutdown request: {other:?}"),
+    }
+    drop(stream);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while running()?.iter().any(|running| running == name) {
+        if Instant::now() > deadline {
+            bail!("{name} did not stop within 60 s");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    Ok(())
 }
