@@ -6,8 +6,11 @@
 //! hypervisor), kvmclock and a 16550A UART. Minimal ACPI tables describe the CPUs and
 //! power off.
 //!
+//! Each vCPU runs on its own thread; the host side of the devices runs as tasks on one
+//! executor per VM (see [`Machine::run_until_stopped`]).
+//!
 //! [`start`] boots a guest and returns a [`Machine`], which the calling thread owns and
-//! waits for (each vCPU runs on a thread of its own). Everything else that wants to
+//! drives. Everything else that wants to
 //! talk to the running VM (e.g., the daemon's connection tasks) holds a
 //! [`MachineHandle`]. The guest's hardware itself (RAM, devices, I/O routing) is
 //! private to this crate.

@@ -4,10 +4,13 @@ use std::fmt;
 use std::io::Write;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::Path;
-use std::sync::{Arc, Weak, mpsc};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Weak};
 use std::thread::JoinHandle;
 
 use anyhow::{Context, Result, anyhow, bail};
+use async_executor::Executor;
+use event_listener::Event;
 use midgard_protocol::machine::MachineConfig;
 
 use crate::board::Board;
@@ -53,16 +56,59 @@ fn read(path: &Path, what: &str) -> Result<Vec<u8>> {
     std::fs::read(path).with_context(|| format!("failed to read {what} {path:?}"))
 }
 
-/// A running VM, owned by the thread that waits for it.
+/// A running VM, owned by the thread that drives it.
 ///
-/// The vCPUs run on their own threads; [`Machine::run_until_stopped`] waits for them.
-/// Dropping the `Machine` stops the VM (if it still runs) and releases it. To interact
-/// with the VM from elsewhere, take a [`MachineHandle`].
+/// The vCPUs run on their own threads; the host side of the devices (e.g., disk I/O)
+/// runs as tasks on an executor that only this thread runs (see
+/// [`Machine::run_until_stopped`]). Dropping the `Machine` stops the VM (if it still
+/// runs) and releases it. To interact with the VM from elsewhere, take a
+/// [`MachineHandle`].
 pub struct Machine {
     board: Arc<Board>,
     threads: Vec<JoinHandle<()>>,
     /// Receives the result of each vCPU that stops (the VM is done with the first one).
-    stopped: mpsc::Receiver<Result<Stop>>,
+    stopped: async_channel::Receiver<Result<Stop>>,
+    executor: Arc<Executor<'static>>,
+    running: Arc<Running>,
+}
+
+/// Counts the vCPU threads that did not exit yet.
+#[derive(Default)]
+struct Running {
+    threads: AtomicUsize,
+    /// Notified when a thread exits.
+    exited: Event,
+}
+
+impl Running {
+    /// Waits until all vCPU threads exited.
+    async fn wait(&self) {
+        loop {
+            // Check again after listening, such that we do not miss the notification.
+            let listener = self.exited.listen();
+            if self.threads.load(Ordering::SeqCst) == 0 {
+                return;
+            }
+            listener.await;
+        }
+    }
+
+    /// Counts a vCPU thread until the returned guard is dropped (when the thread exits,
+    /// also by panicking, or if it cannot be spawned).
+    fn enter(self: &Arc<Self>) -> Exit {
+        self.threads.fetch_add(1, Ordering::SeqCst);
+        Exit(self.clone())
+    }
+}
+
+/// See [`Running::enter`].
+struct Exit(Arc<Running>);
+
+impl Drop for Exit {
+    fn drop(&mut self) {
+        self.0.threads.fetch_sub(1, Ordering::SeqCst);
+        self.0.exited.notify(usize::MAX);
+    }
 }
 
 impl Machine {
@@ -73,11 +119,12 @@ impl Machine {
         }
     }
 
-    /// Waits until the guest stops (or a vCPU fails); returns why. Flushes the console
-    /// before returning.
+    /// Runs the VM's tasks on this thread until the guest stops (or a vCPU fails);
+    /// returns why. Flushes the console before returning.
     pub fn run_until_stopped(&mut self) -> Result<Stop> {
         // Each vCPU thread sends its result before it exits.
-        let result = self.stopped.recv().expect("all vCPU threads exited");
+        let result = async_io::block_on(self.executor.run(self.stopped.recv()))
+            .expect("all vCPU threads exited");
         self.board.flush_console();
         result
     }
@@ -86,6 +133,9 @@ impl Machine {
 impl Drop for Machine {
     fn drop(&mut self) {
         self.board.stop();
+        // The VM's tasks keep running until the vCPUs are gone: a vCPU may wait for them
+        // (e.g., for a device's host side).
+        async_io::block_on(self.executor.run(self.running.wait()));
         for thread in self.threads.drain(..) {
             let _ = thread.join();
         }
@@ -142,24 +192,32 @@ impl fmt::Display for Stop {
 
 /// Starts a thread for each vCPU. The VM stops as soon as one vCPU stops (e.g., because
 /// the guest reset it): that one stops the others, after it sent its result.
-fn spawn_vcpus(board: Arc<Board>, vcpus: Vec<vcpu::Vcpu>) -> Result<Machine> {
-    let (sender, stopped) = mpsc::channel();
+fn spawn_vcpus(
+    board: Arc<Board>,
+    executor: Arc<Executor<'static>>,
+    vcpus: Vec<vcpu::Vcpu>,
+) -> Result<Machine> {
+    let (sender, stopped) = async_channel::unbounded();
     // If a thread cannot be spawned, dropping the machine stops the others.
     let mut machine = Machine {
         board,
         threads: Vec::new(),
         stopped,
+        executor,
+        running: Arc::default(),
     };
     for (id, mut vcpu) in vcpus.into_iter().enumerate() {
         let sender = sender.clone();
         let board = machine.board.clone();
+        let exit = machine.running.enter();
         let thread = std::thread::Builder::new()
             .name(format!("vcpu{id}"))
             .spawn(move || {
+                let _exit = exit;
                 // A panic stops the VM like an error does (the panic hook printed it).
                 let result = panic::catch_unwind(AssertUnwindSafe(|| vcpu.run()))
                     .unwrap_or_else(|_| Err(anyhow!("vCPU {id} panicked")));
-                let _ = sender.send(result);
+                let _ = sender.send_blocking(result);
                 board.stop();
             })
             .context("failed to spawn a vCPU thread")?;
@@ -170,7 +228,7 @@ fn spawn_vcpus(board: Arc<Board>, vcpus: Vec<vcpu::Vcpu>) -> Result<Machine> {
 
 /// Boots the VM that `config` describes. The guest's console output (the serial port)
 /// goes to `console`. The vCPUs start running on their own threads before this returns;
-/// the caller then waits for the VM with [`Machine::run_until_stopped`].
+/// the caller must then drive the VM with [`Machine::run_until_stopped`].
 pub fn start(config: &MachineConfig, console: Box<dyn Write + Send>) -> Result<Machine> {
     validate(config)?;
     let cmdline = kernel_cmdline(config);
@@ -202,5 +260,6 @@ pub fn start(config: &MachineConfig, console: Box<dyn Write + Send>) -> Result<M
         config.cpus,
         config.memory >> 20,
     );
-    spawn_vcpus(board, vcpus)
+    let executor = Arc::new(Executor::new());
+    spawn_vcpus(board, executor, vcpus)
 }

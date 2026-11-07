@@ -429,6 +429,10 @@ name = "midgard-vmm"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-channel",
+ "async-executor",
+ "async-io",
+ "event-listener",
  "libc",
  "midgard-hv",
  "midgard-protocol",
