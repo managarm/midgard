@@ -12,6 +12,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use async_executor::Executor;
 use event_listener::Event;
 use midgard_protocol::machine::MachineConfig;
+use midgard_protocol::param;
 
 use crate::board::Board;
 use crate::host::image;
@@ -40,6 +41,9 @@ fn validate(config: &MachineConfig) -> Result<()> {
             "guest memory above {:#x} is not supported yet",
             platform::MAX_LOW_RAM
         );
+    }
+    if config.agent.is_some() && config.initrd.is_some() {
+        bail!("the agent and an initrd are mutually exclusive");
     }
     Ok(())
 }
@@ -91,13 +95,18 @@ fn kernel_cmdline(config: &MachineConfig, devices: &Devices) -> String {
                 .split_whitespace()
                 .any(|p| p.starts_with("root="))
         });
-    // Without an initrd, the kernel mounts the first disk (vda) as the root file system.
     if let Some(disk) = config.disks.first()
-        && config.initrd.is_none()
         && !explicit_root
     {
-        let flags = if disk.read_only { "ro" } else { "rw" };
-        cmdline.push(format!("root=/dev/vda {flags}"));
+        if config.agent.is_some() {
+            // midgard-init mounts it.
+            cmdline.push(format!("{}=/dev/vda", param::ROOT));
+        } else if config.initrd.is_none() {
+            // Without an initrd, the kernel mounts the first disk (vda) as the root file
+            // system.
+            let flags = if disk.read_only { "ro" } else { "rw" };
+            cmdline.push(format!("root=/dev/vda {flags}"));
+        }
     }
     cmdline.extend(config.append.iter().cloned());
     cmdline.join(" ")
@@ -105,6 +114,17 @@ fn kernel_cmdline(config: &MachineConfig, devices: &Devices) -> String {
 
 fn read(path: &Path, what: &str) -> Result<Vec<u8>> {
     std::fs::read(path).with_context(|| format!("failed to read {what} {path:?}"))
+}
+
+/// Reads the guest kernel and builds or reads the initrd.
+fn load_images(config: &MachineConfig) -> Result<(Vec<u8>, Option<Vec<u8>>)> {
+    let kernel = read(&config.kernel, "the kernel")?;
+    let initrd = match (&config.agent, &config.initrd) {
+        (Some(agent), _) => Some(boot::initramfs::build(&read(agent, "the agent")?)),
+        (None, Some(path)) => Some(read(path, "the initrd")?),
+        (None, None) => None,
+    };
+    Ok((kernel, initrd))
 }
 
 /// A running VM, owned by the thread that drives it.
@@ -296,11 +316,7 @@ pub fn start(config: &MachineConfig, console: Box<dyn Write + Send>) -> Result<M
     validate(config)?;
     let devices = create_devices(config)?;
     let cmdline = kernel_cmdline(config, &devices);
-    let kernel = read(&config.kernel, "the kernel")?;
-    let initrd = match &config.initrd {
-        Some(path) => Some(read(path, "the initrd")?),
-        None => None,
-    };
+    let (kernel, initrd) = load_images(config)?;
 
     let tsc_hz = clock::calibrate();
     log!("TSC runs at {} kHz", tsc_hz / 1000);

@@ -43,6 +43,7 @@ fn config(boot: &BootArgs) -> Result<MachineConfig> {
     Ok(MachineConfig {
         kernel: absolute(&boot.kernel)?,
         initrd: boot.initrd.as_deref().map(absolute).transpose()?,
+        agent: boot.agent.as_deref().map(absolute).transpose()?,
         cmdline: boot.cmdline.clone(),
         append: boot.append.clone(),
         memory: boot.memory.unwrap_or(DEFAULT_MEMORY),
@@ -95,6 +96,7 @@ mod tests {
         assert!(config.kernel.is_absolute());
         assert!(config.kernel.ends_with("bzImage"));
         assert_eq!(config.initrd, None);
+        assert_eq!(config.agent, None);
         assert_eq!(config.cmdline, None);
         assert!(config.append.is_empty());
         assert_eq!(config.memory, DEFAULT_MEMORY);

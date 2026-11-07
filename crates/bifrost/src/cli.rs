@@ -148,9 +148,13 @@ pub struct BootArgs {
     #[arg(long, value_name = "FILE")]
     pub kernel: PathBuf,
 
-    /// An initrd
-    #[arg(long, value_name = "FILE")]
+    /// An initrd (instead of midgard-init)
+    #[arg(long, value_name = "FILE", conflicts_with = "agent")]
     pub initrd: Option<PathBuf>,
+
+    /// Boot midgard-init from FILE as the guest's agent
+    #[arg(long, value_name = "FILE")]
+    pub agent: Option<PathBuf>,
 
     /// Replace the base kernel parameters
     #[arg(long, value_name = "ARGS", allow_hyphen_values = true)]
@@ -350,6 +354,16 @@ mod tests {
             ]
         );
         assert!(parse(&["boot", "--kernel", "bzImage", "--disk", ",ro"]).is_err());
+    }
+
+    #[test]
+    fn boot_agent() {
+        let cli = parse(&["boot", "--kernel", "bzImage", "--agent", "midgard-init"]).unwrap();
+        let Some(Action::Boot(boot)) = cli.action else {
+            panic!("not boot: {:?}", cli.action);
+        };
+        assert_eq!(boot.agent, Some(PathBuf::from("midgard-init")));
+        assert!(parse(&["boot", "--kernel", "k", "--agent", "a", "--initrd", "i"]).is_err());
     }
 
     #[test]

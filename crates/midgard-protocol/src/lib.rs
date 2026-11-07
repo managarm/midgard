@@ -130,7 +130,8 @@ mod tests {
     fn machine_config_round_trip() {
         let config = MachineConfig {
             kernel: "/boot/bzImage".into(),
-            initrd: Some("/boot/initrd".into()),
+            initrd: None,
+            agent: Some("/usr/lib/midgard/midgard-init".into()),
             cmdline: None,
             append: vec!["quiet".into(), "loglevel=3".into()],
             memory: 2 << 30,

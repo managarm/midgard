@@ -11,6 +11,8 @@ pub struct MachineConfig {
     /// The guest kernel (a bzImage).
     pub kernel: PathBuf,
     pub initrd: Option<PathBuf>,
+    /// Boot midgard-init (from this file) as the guest's agent.
+    pub agent: Option<PathBuf>,
     /// Replaces midgard's base kernel parameters.
     pub cmdline: Option<String>,
     /// Kernel parameters in addition to the base ones.
