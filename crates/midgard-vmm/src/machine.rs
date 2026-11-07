@@ -1,7 +1,9 @@
 //! Setting up, starting and stopping a VM.
 
+use std::cell::OnceCell;
 use std::fmt;
-use std::io::Write;
+use std::future::Future;
+use std::io::{self, Write};
 use std::panic::{self, AssertUnwindSafe};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -18,6 +20,7 @@ use crate::board::Board;
 use crate::host::image;
 use crate::logging::log;
 use crate::virtio::block::{self, Block};
+use crate::virtio::vsock::{Vsock, VsockStream};
 use crate::virtio::{DeviceList, DeviceRef};
 use crate::{acpi, boot, clock, platform, vcpu, virtio};
 
@@ -48,16 +51,18 @@ fn validate(config: &MachineConfig) -> Result<()> {
     Ok(())
 }
 
-/// The VM's virtio devices, and the host side of those that have one (which starts once
-/// the VM exists).
+/// The VM's virtio devices, and handles to those that have a host side.
 struct Devices {
     list: DeviceList,
-    /// The block devices and their host side.
+    vsock: Option<DeviceRef<Vsock>>,
+    /// The block devices and their host side (which starts once the VM exists).
     disks: Vec<(DeviceRef<Block>, block::Backend)>,
 }
 
 fn create_devices(config: &MachineConfig) -> Result<Devices> {
     let mut list = DeviceList::default();
+    // The agent talks to us over vsock.
+    let vsock = config.agent.is_some().then(|| list.add(Vsock::default()));
     let mut disks = Vec::new();
     for (index, disk) in config.disks.iter().enumerate() {
         let image = image::open(&disk.path, disk.read_only)
@@ -72,7 +77,7 @@ fn create_devices(config: &MachineConfig) -> Result<Devices> {
             platform::VIRTIO_IRQS.len()
         );
     }
-    Ok(Devices { list, disks })
+    Ok(Devices { list, vsock, disks })
 }
 
 /// The guest kernel's command line.
@@ -130,8 +135,8 @@ fn load_images(config: &MachineConfig) -> Result<(Vec<u8>, Option<Vec<u8>>)> {
 /// A running VM, owned by the thread that drives it.
 ///
 /// The vCPUs run on their own threads; the host side of the devices (e.g., disk I/O)
-/// runs as tasks on an executor that only this thread runs (see
-/// [`Machine::run_until_stopped`]). Dropping the `Machine` stops the VM (if it still
+/// and the tasks of [`MachineHandle::spawn`] run on an executor that only this thread
+/// runs (see [`Machine::run`]). Dropping the `Machine` stops the VM (if it still
 /// runs) and releases it. To interact with the VM from elsewhere, take a
 /// [`MachineHandle`].
 pub struct Machine {
@@ -139,6 +144,9 @@ pub struct Machine {
     threads: Vec<JoinHandle<()>>,
     /// Receives the result of each vCPU that stops (the VM is done with the first one).
     stopped: async_channel::Receiver<Result<Stop>>,
+    /// The first vCPU's result, once received (the error as text, such that it can be
+    /// returned more than once).
+    stop: OnceCell<Result<Stop, String>>,
     executor: Arc<Executor<'static>>,
     running: Arc<Running>,
     /// The block devices' I/O, which must finish before the VM is gone.
@@ -185,21 +193,46 @@ impl Drop for Exit {
 }
 
 impl Machine {
-    /// A handle for other threads.
+    /// A handle for other threads and tasks.
     pub fn handle(&self) -> MachineHandle {
         MachineHandle {
             board: Arc::downgrade(&self.board),
+            executor: Arc::downgrade(&self.executor),
         }
+    }
+
+    /// Runs the VM's tasks on this thread until `future` completes.
+    pub fn run<T>(&self, future: impl Future<Output = T>) -> T {
+        async_io::block_on(self.executor.run(future))
     }
 
     /// Runs the VM's tasks on this thread until the guest stops (or a vCPU fails);
     /// returns why. Flushes the console before returning.
-    pub fn run_until_stopped(&mut self) -> Result<Stop> {
-        // Each vCPU thread sends its result before it exits.
-        let result = async_io::block_on(self.executor.run(self.stopped.recv()))
-            .expect("all vCPU threads exited");
+    pub fn run_until_stopped(&self) -> Result<Stop> {
+        if self.stop.get().is_none() {
+            // Each vCPU thread sends its result before it exits.
+            let result = self
+                .run(self.stopped.recv())
+                .expect("all vCPU threads exited");
+            self.record(result);
+        }
         self.board.flush_console();
-        result
+        self.try_stopped().expect("the stop was recorded")
+    }
+
+    /// Whether the guest stopped already (without running anything).
+    pub fn try_stopped(&self) -> Option<Result<Stop>> {
+        if self.stop.get().is_none()
+            && let Ok(result) = self.stopped.try_recv()
+        {
+            self.record(result);
+        }
+        let stop = self.stop.get()?;
+        Some(stop.clone().map_err(|error| anyhow!("{error}")))
+    }
+
+    fn record(&self, result: Result<Stop>) {
+        let _ = self.stop.set(result.map_err(|error| format!("{error:#}")));
     }
 }
 
@@ -224,28 +257,49 @@ impl Drop for Machine {
     }
 }
 
-/// What other threads may do with a VM while it runs: stop it and flush its console.
+/// What other threads and tasks may do with a VM while it runs: stop it, flush its
+/// console, talk to the guest over vsock, and run tasks next to the VM's own.
 ///
 /// Cheap to clone; usable from any thread. It does not keep the VM alive: once the
-/// owner's [`Machine`] is gone, operations do nothing.
+/// owner's [`Machine`] is gone, operations fail or do nothing.
 #[derive(Clone)]
 pub struct MachineHandle {
     board: Weak<Board>,
+    executor: Weak<Executor<'static>>,
 }
 
 impl MachineHandle {
+    fn board(&self) -> io::Result<Arc<Board>> {
+        self.board
+            .upgrade()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "the VM is gone"))
+    }
+
     /// Makes the guest stop with [`Stop::Requested`].
     pub fn stop(&self) {
-        if let Some(board) = self.board.upgrade() {
+        if let Ok(board) = self.board() {
             board.stop();
         }
     }
 
     /// Flushes buffered console output to the sink given to [`start`].
     pub fn flush_console(&self) {
-        if let Some(board) = self.board.upgrade() {
+        if let Ok(board) = self.board() {
             board.flush_console();
         }
+    }
+
+    /// Runs a task on the VM's executor (e.g., a session that forwards bytes to the
+    /// guest). The task runs while the owner drives the VM; it is dropped with the VM.
+    pub fn spawn(&self, future: impl Future<Output = ()> + Send + 'static) {
+        if let Some(executor) = self.executor.upgrade() {
+            executor.spawn(future).detach();
+        }
+    }
+
+    /// Connects to a vsock port that the guest listens on.
+    pub async fn vsock_connect(&self, port: u32) -> io::Result<VsockStream> {
+        VsockStream::connect(&self.board()?, port).await
     }
 }
 
@@ -285,6 +339,7 @@ fn spawn_vcpus(
         board,
         threads: Vec::new(),
         stopped,
+        stop: OnceCell::new(),
         executor,
         running: Arc::default(),
         disks,
@@ -311,7 +366,8 @@ fn spawn_vcpus(
 
 /// Boots the VM that `config` describes. The guest's console output (the serial port)
 /// goes to `console`. The vCPUs start running on their own threads before this returns;
-/// the caller must then drive the VM with [`Machine::run_until_stopped`].
+/// the caller must then drive the VM with [`Machine::run`] or
+/// [`Machine::run_until_stopped`].
 pub fn start(config: &MachineConfig, console: Box<dyn Write + Send>) -> Result<Machine> {
     validate(config)?;
     let devices = create_devices(config)?;
@@ -334,6 +390,7 @@ pub fn start(config: &MachineConfig, console: Box<dyn Write + Send>) -> Result<M
         hypervisor,
         console,
         devices.list.into_transports(),
+        devices.vsock,
     ));
     let mut vcpus = Vec::new();
     for id in 0..config.cpus {

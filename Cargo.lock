@@ -453,6 +453,7 @@ dependencies = [
  "async-io",
  "blocking",
  "event-listener",
+ "futures-lite",
  "libc",
  "midgard-hv",
  "midgard-protocol",

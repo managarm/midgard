@@ -7,6 +7,7 @@
 //! through [`DeviceRef`] (see [`crate::board::Board::with_device`]).
 
 pub(crate) mod block;
+pub(crate) mod vsock;
 
 use std::marker::PhantomData;
 use std::sync::atomic::{Ordering, fence};
@@ -105,13 +106,6 @@ pub(crate) struct Chain {
     pub descriptors: Vec<Descriptor>,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "for devices like virtio-vsock (virtio-blk reads the descriptors)"
-    )
-)]
 impl Chain {
     pub(crate) fn readable(&self) -> impl Iterator<Item = &Descriptor> {
         self.descriptors.iter().filter(|d| !d.writable)
@@ -330,10 +324,6 @@ impl Queue {
 
     /// Hands each available chain to `handle`, which returns how many bytes it wrote
     /// into the chain, and returns the chains to the driver. Returns whether it used any.
-    #[expect(
-        dead_code,
-        reason = "for devices like virtio-vsock (virtio-blk completes later)"
-    )]
     pub(crate) fn process(
         &mut self,
         memory: &GuestMemory,

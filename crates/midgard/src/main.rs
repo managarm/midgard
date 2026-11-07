@@ -115,7 +115,7 @@ impl Write for Console {
 /// Runs a VM on this (its own) thread until it stops.
 fn run_vm(config: &MachineConfig, events: async_channel::Sender<Event>) {
     let console = Console(events.clone());
-    let result = midgard_vmm::start(config, Box::new(console)).and_then(|mut machine| {
+    let result = midgard_vmm::start(config, Box::new(console)).and_then(|machine| {
         let _ = events.send_blocking(Event::Started(machine.handle()));
         Ok(machine.run_until_stopped()?.to_string())
     });

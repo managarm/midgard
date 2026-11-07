@@ -11,6 +11,7 @@ use crate::devices::serial::{self, Serial};
 use crate::devices::{read_bytes, write_bytes};
 use crate::logging::{ReportOnce, log};
 use crate::machine::Stop;
+use crate::virtio::vsock::Vsock;
 use crate::virtio::{self, DeviceRef, Effect, Transport};
 use crate::{platform, vcpu};
 
@@ -29,7 +30,7 @@ enum Unhandled {
 /// tracks whether the guest is done (stop requested).
 ///
 /// vCPU threads call into it on every exit; the host side of virtio devices reaches its
-/// device through [`Board::with_device`].
+/// device through [`Board::with_device`] (or [`Board::with_vsock`]).
 pub(crate) struct Board {
     hypervisor: Hypervisor,
     pub(crate) memory: GuestMemory,
@@ -46,6 +47,7 @@ pub(crate) struct Board {
     stopping: AtomicBool,
     /// The virtio devices, in the order of their slots (see [`platform::virtio_slot`]).
     virtio: Vec<Mutex<Transport>>,
+    vsock: Option<DeviceRef<Vsock>>,
     reported: ReportOnce<Unhandled>,
     /// What the vCPUs reported (each vCPU tends to do the same, e.g., probe an MSR).
     pub(crate) vcpu_reported: ReportOnce<vcpu::Unsupported>,
@@ -60,6 +62,7 @@ impl Board {
         hypervisor: Hypervisor,
         console: Box<dyn Write + Send>,
         virtio: Vec<Transport>,
+        vsock: Option<DeviceRef<Vsock>>,
     ) -> Self {
         Self {
             hypervisor,
@@ -72,6 +75,7 @@ impl Board {
             kickers: Mutex::new(Vec::new()),
             stopping: AtomicBool::new(false),
             virtio: virtio.into_iter().map(Mutex::new).collect(),
+            vsock,
             reported: ReportOnce::new(),
             vcpu_reported: ReportOnce::new(),
         }
@@ -139,6 +143,14 @@ impl Board {
             self.pulse_irq(transport.irq);
         }
         result
+    }
+
+    /// Runs `f` on the vsock device; returns None without one.
+    pub(crate) fn with_vsock<R>(
+        &self,
+        f: impl FnOnce(&mut Vsock, &mut [virtio::Queue], &GuestMemory) -> (R, bool),
+    ) -> Option<R> {
+        Some(self.with_device(self.vsock?, f))
     }
 
     fn report(&self, key: Unhandled, what: std::fmt::Arguments) {
