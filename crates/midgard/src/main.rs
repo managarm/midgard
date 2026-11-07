@@ -1,18 +1,24 @@
 //! midgard: runs Linux in lightweight VMs on managarm (see [`midgard_vmm`]). It is a
 //! daemon that systemd starts through socket activation (see the unit files in
-//! `systemd/`) once bifrost connects to its socket; bifrost decides how a VM looks and
-//! asks midgard to run it (see [`midgard_protocol::control`]).
+//! `systemd/`) once bifrost connects to its socket. bifrost asks it to run VMs (see
+//! [`midgard_protocol::control`]): VMs in the foreground that bifrost describes, and the
+//! VMs of VM instances, which midgard keeps running for bifrost's sessions (see
+//! [`daemon`]).
 //!
 //! The connections to bifrost are tasks on one executor ([`EXECUTOR`], on the main
-//! thread). Each VM has a thread of its own that starts it and waits for it to stop
-//! (its vCPUs have threads of their own), which reports to the connection's task
-//! through a channel (see [`Event`]).
+//! thread). Each VM runs on a thread of its own with its own executor (see
+//! [`midgard_vmm::Machine::run`]; its vCPUs have threads of their own); a VM in the
+//! foreground reports to its connection's task through a channel (see [`Event`]).
+
+mod daemon;
+mod instance;
+mod paths;
 
 use std::io::{self, Write};
 use std::os::fd::{FromRawFd, RawFd};
 use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use anyhow::{Context, Result, bail};
 use async_executor::Executor;
@@ -24,10 +30,13 @@ use midgard_protocol::nonblocking::{read_message, write_message};
 use midgard_protocol::runtime;
 use midgard_vmm::MachineHandle;
 
+use crate::daemon::Instances;
+
 /// Prints a message (like `eprintln!`) with midgard's prefix; it goes to the console log.
 macro_rules! log {
     ($($arg:tt)*) => { eprintln!("midgard: {}", format_args!($($arg)*)) };
 }
+pub(crate) use log;
 
 /// The daemon that runs Linux VMs for bifrost (systemd starts it when bifrost connects
 /// to its socket).
@@ -37,6 +46,9 @@ struct Cli {}
 
 /// Runs the connections to bifrost.
 static EXECUTOR: Executor<'static> = Executor::new();
+
+/// The VM instances' VMs.
+static INSTANCES: LazyLock<Instances> = LazyLock::new(Instances::default);
 
 /// The first file descriptor that systemd passes (see sd_listen_fds(3)).
 const LISTEN_FDS_START: RawFd = 3;
@@ -160,9 +172,15 @@ async fn boot(stream: &Arc<Async<UnixStream>>, config: MachineConfig) -> Result<
 
 /// Serves one connection from bifrost.
 async fn serve(stream: Async<UnixStream>) -> Result<()> {
-    let stream = Arc::new(stream);
-    let Some(request) = read_message::<Request>(&mut &*stream).await? else {
+    let Some(request) = read_message::<Request>(&mut &stream).await? else {
         return Ok(());
+    };
+    let stream = match request {
+        // The session takes the connection over (if it gets to the agent).
+        Request::Session { name, start } => {
+            return INSTANCES.session(stream, &name, start).await;
+        }
+        _ => Arc::new(stream),
     };
     let response = match request {
         Request::Boot(config) => {
@@ -178,6 +196,7 @@ async fn serve(stream: Async<UnixStream>) -> Result<()> {
                 }
             }
         }
+        Request::Session { .. } => unreachable!(),
     };
     // bifrost may be gone already (which stopped the VM).
     let _ = write_message(&mut &*stream, &response).await;

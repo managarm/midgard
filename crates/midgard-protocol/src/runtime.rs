@@ -1,7 +1,10 @@
-//! Where midgard keeps its runtime files (the socket that bifrost connects to), which
-//! bifrost and midgard both need to agree on.
+//! Where midgard keeps its runtime files (the socket that bifrost connects to and the
+//! VM instances' console logs), which bifrost and midgard both need to agree on.
 
 use std::path::PathBuf;
+
+/// The VM instance that bifrost uses unless it is given one.
+pub const DEFAULT_VM: &str = "alpine";
 
 fn env_path(name: &str) -> Option<PathBuf> {
     std::env::var_os(name).map(PathBuf::from)
@@ -18,4 +21,14 @@ pub fn runtime_root() -> PathBuf {
 /// The socket that midgard listens on (systemd's midgard.socket creates it).
 pub fn daemon_socket() -> PathBuf {
     runtime_root().join("midgard.sock")
+}
+
+/// The directory with the runtime files of a VM instance (in [`runtime_root`]).
+pub fn runtime_dir(name: &str) -> PathBuf {
+    runtime_root().join(name)
+}
+
+/// The console output of a VM instance's VM (since it started last).
+pub fn console_log(name: &str) -> PathBuf {
+    runtime_dir(name).join("console.log")
 }

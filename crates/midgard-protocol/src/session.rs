@@ -1,8 +1,14 @@
 //! What bifrost and the agent say in a session.
 //!
-//! One connection to the agent carries one session: the client's first message is
-//! [`Request::Exec`] (or [`Request::Ping`] / [`Request::Shutdown`]); then stdin, resizes
-//! and signals flow to the agent and output flows back until [`Response::Exited`].
+//! A session starts with [`control::Request::Session`]. Once midgard answered
+//! [`control::Response::Ready`], it forwards the connection to the agent over vsock
+//! without looking at it. One connection carries one session: the client's first message
+//! to the agent is [`Request::Exec`] (or [`Request::Ping`] / [`Request::Shutdown`]); then
+//! stdin, resizes and signals flow to the agent and output flows back until
+//! [`Response::Exited`].
+//!
+//! [`control::Request::Session`]: crate::control::Request::Session
+//! [`control::Response::Ready`]: crate::control::Response::Ready
 
 use serde::{Deserialize, Serialize};
 

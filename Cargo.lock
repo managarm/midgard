@@ -416,6 +416,8 @@ dependencies = [
  "async-executor",
  "async-io",
  "clap",
+ "event-listener",
+ "futures-lite",
  "libc",
  "midgard-protocol",
  "midgard-vmm",

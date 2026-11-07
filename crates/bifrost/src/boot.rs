@@ -76,6 +76,7 @@ pub fn boot(args: &BootArgs) -> Result<()> {
                 return Ok(());
             }
             Some(Response::Error(error)) => bail!("{error}"),
+            Some(other) => bail!("unexpected answer from midgard: {other:?}"),
             None => bail!("midgard closed the connection"),
         }
     }

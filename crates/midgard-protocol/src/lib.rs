@@ -154,6 +154,8 @@ mod tests {
         let responses = [
             control::Response::Console(b"Linux version".to_vec()),
             control::Response::Stopped("the guest powered off".into()),
+            control::Response::Starting,
+            control::Response::Ready,
             control::Response::Error("no such file".into()),
         ];
         for response in &responses {
@@ -163,6 +165,17 @@ mod tests {
         for response in responses {
             assert_eq!(read_message(&mut reader).unwrap(), Some(response));
         }
+    }
+
+    #[test]
+    fn control_requests() {
+        let mut stream = Vec::new();
+        let request = control::Request::Session {
+            name: "alpine".into(),
+            start: true,
+        };
+        write_message(&mut stream, &request).unwrap();
+        assert_eq!(read_message(&mut stream.as_slice()).unwrap(), Some(request));
     }
 
     #[test]
