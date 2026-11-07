@@ -225,9 +225,11 @@ impl Cli {
 
 impl RunArgs {
     pub fn env(&self) -> impl Iterator<Item = (&str, &str)> {
-        self.env
-            .chunks_exact(2)
-            .map(|pair| (pair[0].as_str(), pair[1].as_str()))
+        // clap takes the values in pairs (num_args = 2), so there is no remainder.
+        let (pairs, _) = self.env.as_chunks::<2>();
+        pairs
+            .iter()
+            .map(|[key, value]| (key.as_str(), value.as_str()))
     }
 
     /// Whether the command runs on a pseudo terminal (`None`: decide from stdin / stdout).
