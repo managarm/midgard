@@ -16,5 +16,17 @@ futures-lite.workspace = true
 libc.workspace = true
 midgard-hv.workspace = true
 midgard-protocol.workspace = true
+smoltcp = { version = "0.14", default-features = false, features = [
+    "std",
+    "medium-ethernet",
+    "proto-ipv4",
+    "proto-ipv4-fragmentation",
+    "socket-raw",
+    "socket-tcp",
+    "socket-udp",
+    # Datagrams of up to 64 KiB for the guest, and several in reassembly at once.
+    "fragmentation-buffer-size-65536",
+    "reassembly-buffer-count-4",
+] }
 thiserror.workspace = true
 zerocopy.workspace = true

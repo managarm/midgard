@@ -7,6 +7,7 @@
 //! through [`DeviceRef`] (see [`crate::board::Board::with_device`]).
 
 pub(crate) mod block;
+pub(crate) mod net;
 pub(crate) mod vsock;
 
 use std::marker::PhantomData;

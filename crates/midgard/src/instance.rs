@@ -61,6 +61,7 @@ pub fn config(name: &str) -> Result<MachineConfig> {
             path: disk,
             read_only: false,
         }],
+        network: true,
     })
 }
 

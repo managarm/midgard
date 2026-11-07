@@ -171,6 +171,10 @@ pub struct BootArgs {
     #[arg(long, value_name = "N")]
     pub cpus: Option<u32>,
 
+    /// No network interface
+    #[arg(long)]
+    pub no_network: bool,
+
     /// A disk image (raw or qcow2), can be provided multiple times (the first one is
     /// the root file system)
     #[arg(long, value_name = "FILE[,ro]", value_parser = parse_disk)]

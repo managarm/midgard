@@ -23,6 +23,8 @@ pub struct MachineConfig {
     pub cpus: u32,
     /// The first disk is the root file system.
     pub disks: Vec<Disk>,
+    /// User-mode networking.
+    pub network: bool,
 }
 
 /// A disk image (raw or qcow2) that the guest sees as a virtio block device.
