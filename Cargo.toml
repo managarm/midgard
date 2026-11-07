@@ -15,5 +15,8 @@ exclude = ["crates/midgard-init"]
 anyhow = "1.0"
 clap = { version = "4.6.7", features = ["derive"] }
 libc = "0.2"
+thiserror = "2"
+zerocopy = { version = "0.8", features = ["derive"] }
 
+midgard-hv = { path = "crates/midgard-hv" }
 midgard-protocol = { path = "crates/midgard-protocol" }

@@ -2,6 +2,17 @@
 name = "midgard-hv"
 version = "0.1.0"
 edition = "2024"
+description = "The hypervisor that midgard runs on"
 license = "MIT"
 
 [dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+zerocopy.workspace = true
+
+# On Linux, midgard runs on KVM (for development).
+[target.'cfg(target_os = "linux")'.dependencies]
+kvm-bindings = { version = "0.14", features = ["fam-wrappers"] }
+kvm-ioctls = "0.25"
+libc.workspace = true
+vmm-sys-util = "0.15"

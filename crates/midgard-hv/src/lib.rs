@@ -1,23 +1,343 @@
-#[allow(unused_macros)]
+//! The hypervisor interface that midgard runs on.
+//!
+//! The model is Hel's (thor's virtualization API): the hypervisor emulates the local
+//! APICs (including HLT, IPIs and INIT / SIPI), the I/O APIC and CPUID (from a table).
+//! Exits report *what* the guest did; port I/O, MSR and hypercall exits leave the
+//! instruction unfinished until the next run completes it (see [`Completion`]). A kick
+//! makes the running (or next) run return. Other backends (KVM, for development on
+//! Linux) translate to this model.
+//!
+//! A kick may be observed more than once: a run may return [`Exit::Kicked`] for other
+//! reasons (e.g., a signal on KVM), and one kick may make more than one run return.
+//! Consumers must handle [`Exit::Kicked`] idempotently and never count them.
+//!
+//! On Linux, [`create`] installs a process-wide handler for SIGRTMIN, the signal with
+//! which kicks interrupt KVM_RUN. The rest of the process must not use that signal.
+//!
+//! The backend is chosen at compile time: [`Hypervisor`], [`Vcpu`] and [`Kicker`] are
+//! the backend's own types, whose methods (see `backend!`) are the same on all of
+//! them. Nothing here is a trait object.
+
+use anyhow::Result;
+
+pub mod memory;
+pub mod x86;
+
+pub use memory::{GuestMemory, MemoryError};
+use x86::msr;
+
+/// Gives a backend's type (`$ty`, which the backend defines) the inherent methods that
+/// every backend has: they forward to the trait `$tr`, which each backend implements
+/// for its type. The trait stays private, such that users of the crate call the
+/// methods on the concrete type (statically dispatched) and never see a trait object,
+/// and the compiler checks that each backend has all of them.
 macro_rules! backend {
     (
+        $(#[$type_attr:meta])*
         pub struct $ty:ident;
         trait $tr:ident {
             $(
+                $(#[$attr:meta])*
                 fn $name:ident(&$($self_:ident)+ $(, $arg:ident: $argty:ty)*) -> $ret:ty;
             )*
         }
     ) => {
+        $(#[$type_attr])*
         trait $tr {
             $(fn $name(&$($self_)+ $(, $arg: $argty)*) -> $ret;)*
         }
         impl $ty {
             $(
+                $(#[$attr])*
                 #[inline(always)]
                 pub fn $name(&$($self_)+ $(, $arg: $argty)*) -> $ret {
-                    <Self as $tr>::$name(self $(, $arg)*)
+                    <Self as $tr>::$name(receiver!($($self_)+) $(, $arg)*)
                 }
             )*
         }
     };
 }
+
+/// The `self` of `self` / `mut self` (for `backend!`: by hygiene, only the caller's
+/// `self` token refers to the method's receiver).
+macro_rules! receiver {
+    ($self_:ident) => {
+        $self_
+    };
+    (mut $self_:ident) => {
+        $self_
+    };
+}
+
+#[cfg(target_os = "linux")]
+mod kvm;
+#[cfg(target_os = "linux")]
+use kvm as imp;
+
+#[cfg(not(target_os = "linux"))]
+compile_error!("midgard-hv has no backend for this target OS");
+
+pub use imp::{Hypervisor, Kicker, Vcpu};
+
+/// Guest-physical addresses that the backend may use for itself, which the VMM must
+/// leave alone (KVM puts its identity map and real-mode TSS there).
+pub const RESERVED_BASE: u64 = 0xFFFB_C000;
+pub const RESERVED_SIZE: u64 = 0x4000;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Segment {
+    pub base: u64,
+    pub limit: u32,
+    pub selector: u16,
+    pub type_: u8,
+    pub present: u8,
+    pub dpl: u8,
+    pub db: u8,
+    pub s: u8,
+    pub l: u8,
+    pub g: u8,
+    pub avl: u8,
+    /// The segment register does not hold a usable segment (e.g., a null selector).
+    pub unusable: u8,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DescriptorTable {
+    pub base: u64,
+    pub limit: u16,
+}
+
+/// The registers that the VMM needs on most exits.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BasicRegs {
+    pub rax: u64,
+    pub rbx: u64,
+    pub rcx: u64,
+    pub rdx: u64,
+    pub rsi: u64,
+    pub rdi: u64,
+    pub rbp: u64,
+    pub r8: u64,
+    pub r9: u64,
+    pub r10: u64,
+    pub r11: u64,
+    pub r12: u64,
+    pub r13: u64,
+    pub r14: u64,
+    pub r15: u64,
+    pub rsp: u64,
+    pub rip: u64,
+    pub rflags: u64,
+}
+
+/// The full register state (the basic registers plus the system registers).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Regs {
+    pub basic: BasicRegs,
+    pub cs: Segment,
+    pub ds: Segment,
+    pub es: Segment,
+    pub fs: Segment,
+    pub gs: Segment,
+    pub ss: Segment,
+    pub tr: Segment,
+    pub ldt: Segment,
+    pub gdt: DescriptorTable,
+    pub idt: DescriptorTable,
+    pub cr0: u64,
+    pub cr2: u64,
+    pub cr3: u64,
+    pub cr4: u64,
+    pub cr8: u64,
+    pub efer: u64,
+}
+
+/// Guest state that the CPU does not switch on its own (the hypervisor does).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Msrs {
+    pub kernel_gs_base: u64,
+    pub star: u64,
+    pub lstar: u64,
+    pub cstar: u64,
+    pub sfmask: u64,
+    pub sysenter_cs: u64,
+    pub sysenter_esp: u64,
+    pub sysenter_eip: u64,
+    /// XCR0 (not an MSR, but switched in the same way).
+    pub xcr0: u64,
+}
+
+impl Msrs {
+    /// The MSRs in this struct (all fields but XCR0).
+    pub const INDICES: [u32; 8] = [
+        msr::KERNEL_GS_BASE,
+        msr::STAR,
+        msr::LSTAR,
+        msr::CSTAR,
+        msr::SFMASK,
+        msr::SYSENTER_CS,
+        msr::SYSENTER_ESP,
+        msr::SYSENTER_EIP,
+    ];
+
+    /// The field that holds the MSR `index` (one of [`Msrs::INDICES`]).
+    pub fn get_mut(&mut self, index: u32) -> Option<&mut u64> {
+        match index {
+            msr::KERNEL_GS_BASE => Some(&mut self.kernel_gs_base),
+            msr::STAR => Some(&mut self.star),
+            msr::LSTAR => Some(&mut self.lstar),
+            msr::CSTAR => Some(&mut self.cstar),
+            msr::SFMASK => Some(&mut self.sfmask),
+            msr::SYSENTER_CS => Some(&mut self.sysenter_cs),
+            msr::SYSENTER_ESP => Some(&mut self.sysenter_esp),
+            msr::SYSENTER_EIP => Some(&mut self.sysenter_eip),
+            _ => None,
+        }
+    }
+
+    pub fn get(&self, index: u32) -> Option<u64> {
+        let mut copy = *self;
+        copy.get_mut(index).copied()
+    }
+}
+
+/// Whether a vCPU runs (see [`Vcpu::mp_state`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MpState {
+    Runnable,
+    /// HLT: the vCPU waits for an interrupt.
+    Halted,
+    /// The vCPU waits for a startup IPI (an AP before it was started, or after INIT).
+    WaitForStartup,
+}
+
+/// An MMIO access that the backend already decoded (KVM decodes MMIO instructions in
+/// the kernel; Hel does not).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MmioAccess {
+    pub write: bool,
+    pub size: u8,
+    /// The written value.
+    pub data: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Exit {
+    /// Port I/O (needs a [`Completion`]; for IN, its value is the result). `data` is the
+    /// value of OUT. String instructions are not supported.
+    Io {
+        port: u16,
+        size: u8,
+        input: bool,
+        string: bool,
+        data: u32,
+    },
+    /// An access to guest-physical memory that is not RAM. Without `access`, the VMM
+    /// decodes the instruction (and skips it); with it, the backend completes the
+    /// instruction (see [`Vcpu::complete_mmio_read`]).
+    Mmio {
+        address: u64,
+        access: Option<MmioAccess>,
+    },
+    /// RDMSR (needs a [`Completion`] with the value).
+    Rdmsr { index: u32 },
+    /// WRMSR (needs a [`Completion`]).
+    Wrmsr { index: u32, value: u64 },
+    /// [`Kicker::kick`] was called.
+    Kicked,
+    /// A triple fault.
+    Shutdown,
+    /// VMCALL / VMMCALL (needs a [`Completion`]; its value goes to RAX).
+    /// (KVM handles hypercalls itself.)
+    Hypercall,
+    /// The hypervisor could not run the vCPU (e.g., the VM entry failed).
+    Failed(String),
+}
+
+/// Finishes an instruction that exited (I/O, MSR and hypercall exits): the next run
+/// either completes it or makes it raise #GP(0).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Completion {
+    /// The instruction completes with this result (if it has one).
+    Done(u64),
+    /// The instruction raises #GP(0).
+    Fault,
+}
+
+backend! {
+    /// What a backend's [`Kicker`] does: it makes a vCPU's run return with
+    /// [`Exit::Kicked`]; if the vCPU does not run, its next run returns immediately.
+    /// A `Kicker` is cheap to clone and works from any thread.
+    pub struct Kicker;
+    trait KickerOps {
+        /// Kicks the vCPU.
+        fn kick(&self) -> ();
+    }
+}
+
+backend! {
+    /// What a backend's [`Vcpu`] does (it can move to another thread between runs).
+    pub struct Vcpu;
+    trait VcpuOps {
+        /// Runs the vCPU until it exits. `completion` must be given if (and only if) the
+        /// previous exit needs one.
+        fn run(&mut self, completion: Option<Completion>) -> Result<Exit>;
+        fn basic_regs(&mut self) -> Result<BasicRegs>;
+        fn set_basic_regs(&mut self, regs: &BasicRegs) -> Result<()>;
+        fn regs(&mut self) -> Result<Regs>;
+        fn set_regs(&mut self, regs: &Regs) -> Result<()>;
+        fn msrs(&mut self) -> Result<Msrs>;
+        fn set_msrs(&mut self, msrs: &Msrs) -> Result<()>;
+        fn mp_state(&mut self) -> Result<MpState>;
+        /// Accesses a 32-bit register of an in-kernel device (the local APIC in xAPIC
+        /// mode or the I/O APIC) for an MMIO exit that the VMM decoded; `write` is the
+        /// value to write. Returns None if no in-kernel device is at `address`.
+        fn kernel_mmio(&mut self, address: u64, write: Option<u32>) -> Result<Option<u32>>;
+        /// Provides the result of a decoded MMIO read ([`Exit::Mmio`] with an access).
+        fn complete_mmio_read(&mut self, value: u64) -> Result<()>;
+        /// The vCPU's kicker (which other threads use while it runs).
+        fn kicker(&self) -> Kicker;
+    }
+}
+
+/// An entry of a vCPU's CPUID table.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CpuidEntry {
+    pub function: u32,
+    pub index: u32,
+    /// The entry only applies to its subleaf (`index`).
+    pub significant_index: bool,
+    pub eax: u32,
+    pub ebx: u32,
+    pub ecx: u32,
+    pub edx: u32,
+}
+
+backend! {
+    /// What a backend's [`Hypervisor`] (a VM) does; it is shared by all vCPU threads.
+    pub struct Hypervisor;
+    trait HypervisorOps {
+        /// Creates a vCPU (`id` is its x2APIC ID). The local APIC starts in x2APIC mode.
+        /// vCPU 0 is the bootstrap processor (it starts in its reset state; the VMM sets
+        /// its registers); the others wait for a startup IPI.
+        fn create_vcpu(&self, id: u32, cpuid: &[CpuidEntry]) -> Result<Vcpu>;
+        /// Sets the level of an I/O APIC pin. An edge-triggered pin interrupts on the
+        /// rising edge.
+        fn set_irq_line(&self, pin: u32, level: bool) -> Result<()>;
+    }
+}
+
+/// Creates a VM with `memory_size` bytes of RAM at guest-physical address zero.
+pub fn create(memory_size: u64) -> Result<(Hypervisor, GuestMemory)> {
+    imp::create(memory_size)
+}
+
+/// The threads that the VMM uses the backend's types from.
+const _: () = {
+    const fn send_sync<T: Send + Sync>() {}
+    const fn send<T: Send>() {}
+    send_sync::<Hypervisor>();
+    send_sync::<Kicker>();
+    send::<Vcpu>();
+    send_sync::<GuestMemory>();
+};
