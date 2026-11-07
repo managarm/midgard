@@ -1,5 +1,4 @@
-//! State that is shared by all vCPUs: guest memory and the devices. The interrupt
-//! controllers (local APICs and the I/O APIC) are the hypervisor's.
+//! The guest's hardware (see [`Board`]).
 
 use std::io::Write;
 use std::sync::Mutex;
@@ -12,18 +11,8 @@ use crate::devices::serial::{self, Serial};
 use crate::devices::{read_bytes, write_bytes};
 use crate::log;
 use crate::logging::ReportOnce;
+use crate::machine::Stop;
 use crate::platform;
-
-/// Why the VM stopped.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Stop {
-    /// The guest requested a reset (keyboard controller, port 0xCF9 or a triple fault).
-    Reset,
-    /// The guest entered S5 (ACPI poweroff).
-    PowerOff,
-    /// We stopped the VM (see [`Vm::stop`]).
-    Requested,
-}
 
 /// Problems that are reported once (see [`ReportOnce`]).
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
@@ -34,28 +23,34 @@ enum Unhandled {
     Mmio(u64),
 }
 
-pub struct Vm {
+/// The guest's hardware, shared by all vCPUs: RAM, the devices that are not in the
+/// hypervisor (UART, PM1) and the routing of port I/O, MMIO and interrupt lines to them.
+/// The local APICs and the I/O APIC are the hypervisor's. Also tracks whether the guest
+/// is done (stop requested).
+///
+/// vCPU threads call into it on every exit.
+pub(crate) struct Board {
     /// Declared (and thus dropped) before `memory`, whose mapping the VM in the
     /// hypervisor references.
     hypervisor: Hypervisor,
-    pub memory: GuestMemory,
-    pub num_cpus: u32,
+    pub(crate) memory: GuestMemory,
+    pub(crate) num_cpus: u32,
     /// The TSC frequency in Hz.
-    pub tsc_hz: u64,
+    pub(crate) tsc_hz: u64,
     serial: Mutex<Serial>,
     /// The level of the serial port's interrupt line.
     serial_irq: AtomicBool,
     pm1: Mutex<Pm1>,
-    /// The vCPUs' kickers (see [`Vm::stop`]).
+    /// The vCPUs' kickers (see [`Board::stop`]).
     kickers: Mutex<Vec<Kicker>>,
-    /// [`Vm::stop`] was called.
+    /// [`Board::stop`] was called.
     stopping: AtomicBool,
     reported: ReportOnce<Unhandled>,
 }
 
-impl Vm {
+impl Board {
     /// The serial port's output goes to `console`.
-    pub fn new(
+    pub(crate) fn new(
         memory: GuestMemory,
         num_cpus: u32,
         tsc_hz: u64,
@@ -77,24 +72,24 @@ impl Vm {
     }
 
     /// The VM in the hypervisor (e.g., for creating vCPUs).
-    pub fn hypervisor(&self) -> &Hypervisor {
+    pub(crate) fn hypervisor(&self) -> &Hypervisor {
         &self.hypervisor
     }
 
-    /// Lets [`Vm::stop`] kick a vCPU.
+    /// Lets [`Board::stop`] kick a vCPU.
     pub(crate) fn add_kicker(&self, kicker: Kicker) {
         self.kickers.lock().unwrap().push(kicker);
     }
 
     /// Makes all vCPUs stop with [`Stop::Requested`] (from any thread).
-    pub fn stop(&self) {
+    pub(crate) fn stop(&self) {
         self.stopping.store(true, Ordering::SeqCst);
         for kicker in self.kickers.lock().unwrap().iter() {
             kicker.kick();
         }
     }
 
-    /// Whether [`Vm::stop`] was called.
+    /// Whether [`Board::stop`] was called.
     pub(crate) fn stopping(&self) -> bool {
         self.stopping.load(Ordering::SeqCst)
     }
@@ -114,7 +109,7 @@ impl Vm {
         }
     }
 
-    pub fn flush_console(&self) {
+    pub(crate) fn flush_console(&self) {
         self.serial.lock().unwrap().flush();
     }
 
@@ -125,7 +120,7 @@ impl Vm {
     }
 
     /// Port input of `size` bytes.
-    pub fn pio_in(&self, port: u16, size: u32) -> u32 {
+    pub(crate) fn pio_in(&self, port: u16, size: u32) -> u32 {
         if let Some(offset) = port_offset(port, platform::COM1_PORT, serial::NUM_PORTS) {
             let mut serial = self.serial.lock().unwrap();
             let value = read_bytes(serial::NUM_PORTS, offset, size, |o| serial.read(o));
@@ -166,7 +161,7 @@ impl Vm {
     }
 
     /// Port output of `size` bytes.
-    pub fn pio_out(&self, port: u16, size: u32, value: u32) -> Option<Stop> {
+    pub(crate) fn pio_out(&self, port: u16, size: u32, value: u32) -> Option<Stop> {
         if let Some(offset) = port_offset(port, platform::COM1_PORT, serial::NUM_PORTS) {
             let mut serial = self.serial.lock().unwrap();
             write_bytes(serial::NUM_PORTS, offset, size, value, |o, byte| {
@@ -206,7 +201,7 @@ impl Vm {
     }
 
     /// MMIO read of `size` bytes.
-    pub fn mmio_read(&self, address: u64, size: u8) -> u64 {
+    pub(crate) fn mmio_read(&self, address: u64, size: u8) -> u64 {
         self.report(
             Unhandled::Mmio(address),
             format_args!("MMIO read of {size} bytes at {address:#x}"),
@@ -215,7 +210,7 @@ impl Vm {
     }
 
     /// MMIO write of `size` bytes.
-    pub fn mmio_write(&self, address: u64, size: u8, _value: u64) {
+    pub(crate) fn mmio_write(&self, address: u64, size: u8, _value: u64) {
         self.report(
             Unhandled::Mmio(address),
             format_args!("MMIO write of {size} bytes at {address:#x}"),

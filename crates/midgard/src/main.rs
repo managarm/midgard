@@ -20,7 +20,7 @@ use clap::Parser;
 use midgard_protocol::control::{Request, Response};
 use midgard_protocol::nonblocking::{read_message, write_message};
 use midgard_protocol::{MachineConfig, runtime};
-use midgard_vmm::{Vm, log, machine};
+use midgard_vmm::{MachineHandle, log};
 
 /// The daemon that runs Linux VMs for bifrost (systemd starts it when bifrost connects
 /// to its socket).
@@ -81,7 +81,7 @@ fn own_listener() -> Result<UnixListener> {
 /// What a VM's thread tells the task of its connection.
 enum Event {
     /// The VM exists (its console may have written before).
-    Started(Arc<Vm>),
+    Started(MachineHandle),
     /// Output of the VM's console.
     Console(Vec<u8>),
     /// The VM stopped (why), or did not start.
@@ -108,20 +108,17 @@ impl Write for Console {
 /// Runs a VM on this (its own) thread until it stops.
 fn run_vm(config: &MachineConfig, events: async_channel::Sender<Event>) {
     let console = Console(events.clone());
-    let result = machine::start(config, Box::new(console)).and_then(|machine| {
-        let vm = machine.vm.clone();
-        let _ = events.send_blocking(Event::Started(vm.clone()));
-        let result = machine.run();
-        vm.flush_console();
-        Ok(machine::describe(result?).to_string())
+    let result = midgard_vmm::start(config, Box::new(console)).and_then(|mut machine| {
+        let _ = events.send_blocking(Event::Started(machine.handle()));
+        Ok(machine.run_until_stopped()?.to_string())
     });
     let _ = events.send_blocking(Event::Stopped(result));
 }
 
 /// Stops the VM when bifrost closes the connection.
-async fn watch(stream: Arc<Async<UnixStream>>, vm: Arc<Vm>) {
+async fn watch(stream: Arc<Async<UnixStream>>, machine: MachineHandle) {
     let _ = read_message::<Request>(&mut &*stream).await;
-    vm.stop();
+    machine.stop();
 }
 
 /// Runs a VM until it stops (or bifrost goes away); returns why it stopped.
@@ -134,7 +131,9 @@ async fn boot(stream: &Arc<Async<UnixStream>>, config: MachineConfig) -> Result<
     let mut watcher = None;
     while let Ok(event) = events.recv().await {
         match event {
-            Event::Started(vm) => watcher = Some(EXECUTOR.spawn(watch(stream.clone(), vm))),
+            Event::Started(machine) => {
+                watcher = Some(EXECUTOR.spawn(watch(stream.clone(), machine)))
+            }
             Event::Console(mut data) => {
                 // Send what has piled up in one message.
                 while let Ok(Event::Console(more)) = events.try_recv() {

@@ -1,14 +1,15 @@
-//! Setting up and starting a VM.
+//! Setting up, starting and stopping a VM.
 
+use std::fmt;
 use std::io::Write;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use anyhow::{Context, Result, bail};
 use midgard_protocol::MachineConfig;
 
+use crate::board::Board;
 use crate::log;
-use crate::vm::{Stop, Vm};
 use crate::{acpi, boot, clock, platform, vcpu};
 
 /// Kernel parameters that every guest needs (unless the configuration replaces them);
@@ -41,20 +42,83 @@ fn read(path: &Path, what: &str) -> Result<Vec<u8>> {
     std::fs::read(path).with_context(|| format!("failed to read {what} {path:?}"))
 }
 
-/// A VM with a single vCPU, which [`Machine::run`] runs on the calling thread.
+/// A running VM, owned by the thread that drives it.
+///
+/// The VM has a single vCPU, which [`Machine::run_until_stopped`] runs on this thread.
+/// Dropping the `Machine` after the guest stopped releases the VM. To interact with the
+/// VM from elsewhere, take a [`MachineHandle`].
 pub struct Machine {
-    pub vm: Arc<Vm>,
+    board: Arc<Board>,
     vcpu: vcpu::Vcpu,
 }
 
 impl Machine {
-    /// Runs the vCPU until the guest stops it.
-    pub fn run(mut self) -> Result<Stop> {
-        self.vcpu.run()
+    /// A handle for other threads.
+    pub fn handle(&self) -> MachineHandle {
+        MachineHandle {
+            board: Arc::downgrade(&self.board),
+        }
+    }
+
+    /// Runs the vCPU on this thread until the guest stops (or the vCPU fails); returns
+    /// why. Flushes the console before returning.
+    pub fn run_until_stopped(&mut self) -> Result<Stop> {
+        let result = self.vcpu.run();
+        self.board.flush_console();
+        result
     }
 }
 
-/// Starts a VM whose serial console writes to `console`.
+/// What other threads may do with a VM while it runs: stop it and flush its console.
+///
+/// Cheap to clone; usable from any thread. It does not keep the VM alive: once the
+/// owner's [`Machine`] is gone, operations do nothing.
+#[derive(Clone)]
+pub struct MachineHandle {
+    board: Weak<Board>,
+}
+
+impl MachineHandle {
+    /// Makes the guest stop with [`Stop::Requested`].
+    pub fn stop(&self) {
+        if let Some(board) = self.board.upgrade() {
+            board.stop();
+        }
+    }
+
+    /// Flushes buffered console output to the sink given to [`start`].
+    pub fn flush_console(&self) {
+        if let Some(board) = self.board.upgrade() {
+            board.flush_console();
+        }
+    }
+}
+
+/// Why a VM stopped. `Display` gives the sentence for the user ("the guest powered
+/// off").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stop {
+    /// The guest requested a reset (keyboard controller, port 0xCF9 or a triple fault).
+    Reset,
+    /// The guest entered S5 (ACPI poweroff).
+    PowerOff,
+    /// We stopped the VM (see [`MachineHandle::stop`]).
+    Requested,
+}
+
+impl fmt::Display for Stop {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str(match self {
+            Stop::Reset => "the guest reset the machine",
+            Stop::PowerOff => "the guest powered off",
+            Stop::Requested => "the VM was stopped",
+        })
+    }
+}
+
+/// Boots the VM that `config` describes. The guest's console output (the serial port)
+/// goes to `console`. The caller must then drive the VM with
+/// [`Machine::run_until_stopped`].
 pub fn start(config: &MachineConfig, console: Box<dyn Write + Send>) -> Result<Machine> {
     validate(config)?;
     let cmdline = kernel_cmdline(config);
@@ -72,8 +136,8 @@ pub fn start(config: &MachineConfig, console: Box<dyn Write + Send>) -> Result<M
     drop((kernel, initrd));
     acpi::write(&memory, platform::ACPI_TABLES, 1).context("failed to write the ACPI tables")?;
 
-    let vm = Arc::new(Vm::new(memory, 1, tsc_hz, hypervisor, console));
-    let mut vcpu = vcpu::Vcpu::new(vm.clone(), 0)?;
+    let board = Arc::new(Board::new(memory, 1, tsc_hz, hypervisor, console));
+    let mut vcpu = vcpu::Vcpu::new(board.clone(), 0)?;
     vcpu.set_registers(&boot::entry_registers(&entry))?;
 
     log!(
@@ -81,14 +145,5 @@ pub fn start(config: &MachineConfig, console: Box<dyn Write + Send>) -> Result<M
         config.kernel.display(),
         config.memory >> 20,
     );
-    Ok(Machine { vm, vcpu })
-}
-
-/// Describes why the VM stopped.
-pub fn describe(stop: Stop) -> &'static str {
-    match stop {
-        Stop::Reset => "the guest reset the machine",
-        Stop::PowerOff => "the guest powered off",
-        Stop::Requested => "the VM was stopped",
-    }
+    Ok(Machine { board, vcpu })
 }

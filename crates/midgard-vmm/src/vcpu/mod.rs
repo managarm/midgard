@@ -8,10 +8,11 @@ use anyhow::{Result, bail};
 use midgard_hv::x86::{EFER_LMA, msr};
 use midgard_hv::{Completion, Exit, MmioAccess, Msrs, Regs};
 
+use crate::board::Board;
 use crate::clock;
 use crate::log;
 use crate::logging::ReportOnce;
-use crate::vm::{Stop, Vm};
+use crate::machine::Stop;
 
 mod cpuid;
 mod kvmclock;
@@ -37,7 +38,7 @@ enum Unsupported {
 pub(crate) struct Vcpu {
     id: u32,
     backend: midgard_hv::Vcpu,
-    vm: Arc<Vm>,
+    board: Arc<Board>,
     kvmclock: Kvmclock,
     /// MSRs that we only store.
     msrs: BTreeMap<u32, u64>,
@@ -46,16 +47,16 @@ pub(crate) struct Vcpu {
 
 impl Vcpu {
     /// Creates the vCPU. vCPU 0 is the BSP; the others wait for a startup IPI.
-    pub(crate) fn new(vm: Arc<Vm>, id: u32) -> Result<Self> {
-        let backend = vm
+    pub(crate) fn new(board: Arc<Board>, id: u32) -> Result<Self> {
+        let backend = board
             .hypervisor()
-            .create_vcpu(id, &cpuid::table(id, vm.num_cpus))?;
-        vm.add_kicker(backend.kicker());
-        let kvmclock = Kvmclock::new(vm.tsc_hz);
+            .create_vcpu(id, &cpuid::table(id, board.num_cpus))?;
+        board.add_kicker(backend.kicker());
+        let kvmclock = Kvmclock::new(board.tsc_hz);
         Ok(Self {
             id,
             backend,
-            vm,
+            board,
             kvmclock,
             msrs: BTreeMap::new(),
             reported: ReportOnce::new(),
@@ -75,7 +76,7 @@ impl Vcpu {
                 Handled::Continue => {}
                 Handled::Complete(result) => completion = Some(result),
                 Handled::Stop(stop) => {
-                    self.vm.flush_console();
+                    self.board.flush_console();
                     return Ok(stop);
                 }
             }
@@ -94,10 +95,10 @@ impl Vcpu {
             Exit::Rdmsr { index } => Handled::Complete(self.rdmsr(index)?),
             Exit::Wrmsr { index, value } => Handled::Complete(self.wrmsr(index, value)?),
             // E.g., a signal interrupted the run, or the VM stops.
-            Exit::Kicked if self.vm.stopping() => Handled::Stop(Stop::Requested),
+            Exit::Kicked if self.board.stopping() => Handled::Stop(Stop::Requested),
             Exit::Kicked => {
                 // A failure was reported when the guest set the MSR.
-                let _ = self.kvmclock.update(&self.vm.memory);
+                let _ = self.kvmclock.update(&self.board.memory);
                 Handled::Continue
             }
             Exit::Shutdown => {
@@ -126,9 +127,9 @@ impl Vcpu {
             );
         };
         if access.write {
-            self.vm.mmio_write(address, access.size, access.data);
+            self.board.mmio_write(address, access.size, access.data);
         } else {
-            let value = self.vm.mmio_read(address, access.size);
+            let value = self.board.mmio_read(address, access.size);
             self.backend.complete_mmio_read(value)?;
         }
         Ok(())
@@ -162,7 +163,7 @@ impl Vcpu {
         let size = size as u32;
         if input {
             return Ok(Handled::Complete(Completion::Done(
-                self.vm.pio_in(port, size) as u64,
+                self.board.pio_in(port, size) as u64,
             )));
         }
         let mask = if size >= 4 {
@@ -170,7 +171,7 @@ impl Vcpu {
         } else {
             (1u32 << (8 * size)) - 1
         };
-        Ok(match self.vm.pio_out(port, size, data & mask) {
+        Ok(match self.board.pio_out(port, size, data & mask) {
             Some(stop) => Handled::Stop(stop),
             None => Handled::Complete(Completion::Done(0)),
         })
@@ -246,14 +247,14 @@ impl Vcpu {
             // We do not offset the TSC.
             msr::TSC => true,
             msr::KVM_SYSTEM_TIME | msr::KVM_SYSTEM_TIME_NEW => {
-                if let Err(error) = self.kvmclock.set_msr(&self.vm.memory, value) {
+                if let Err(error) = self.kvmclock.set_msr(&self.board.memory, value) {
                     log!("vCPU {}: kvmclock: {error}", self.id);
                 }
                 true
             }
             msr::KVM_WALL_CLOCK | msr::KVM_WALL_CLOCK_NEW => {
                 self.msrs.insert(index, value);
-                if let Err(error) = kvmclock::write_wall_clock(&self.vm.memory, value) {
+                if let Err(error) = kvmclock::write_wall_clock(&self.board.memory, value) {
                     log!("vCPU {}: wall clock: {error}", self.id);
                 }
                 true
