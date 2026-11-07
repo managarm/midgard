@@ -1,0 +1,160 @@
+//! Boot: mount the root file system, move into it and serve sessions.
+
+mod process;
+mod reaper;
+mod rt;
+mod session;
+mod sys;
+
+use std::fs::File;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result, bail};
+use async_io::{Async, Timer};
+use midgard_protocol::{AGENT_PORT, param};
+use sys::mount;
+
+/// The default PATH of sessions.
+pub const PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+macro_rules! log {
+    ($($arg:tt)*) => { eprintln!("midgard-init: {}", format_args!($($arg)*)) };
+}
+pub(crate) use log;
+
+pub fn main() {
+    if std::process::id() != 1 {
+        eprintln!("midgard-init: must run as PID 1");
+        std::process::exit(1);
+    }
+    if let Err(error) = boot() {
+        log!("{error:#}");
+        // PID 1 must not exit; stop the VM instead (midgard sees all vCPUs halt).
+        sys::power_off();
+    }
+}
+
+/// Returns the value of `name=` on the kernel command line.
+fn parameter(cmdline: &str, name: &str) -> Option<String> {
+    cmdline
+        .split_whitespace()
+        .find_map(|p| p.strip_prefix(name)?.strip_prefix('=').map(str::to_string))
+}
+
+fn boot() -> Result<()> {
+    // In the initramfs: devices and /proc, then the console as stdin / stdout / stderr.
+    for dir in ["/dev", "/proc", "/sys", "/newroot"] {
+        let _ = std::fs::create_dir(dir);
+    }
+    mount("devtmpfs", "/dev", "devtmpfs", 0, Some("mode=0755"))?;
+    mount("proc", "/proc", "proc", 0, None)?;
+    sys::open_console();
+
+    let cmdline = std::fs::read_to_string("/proc/cmdline").context("reading /proc/cmdline")?;
+    let root = parameter(&cmdline, param::ROOT)
+        .with_context(|| format!("no {}= parameter", param::ROOT))?;
+    let fstype = parameter(&cmdline, param::ROOT_FSTYPE).unwrap_or_else(|| "ext4".into());
+
+    // The disk shows up once its driver probed it.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !std::path::Path::new(&root).exists() {
+        if Instant::now() > deadline {
+            bail!("{root} does not exist");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    mount(&root, "/newroot", &fstype, 0, None)?;
+
+    // Move /dev and /proc into the new root and make it the root (like switch_root;
+    // the initramfs stays in memory, but it only contains us).
+    for dir in ["/dev", "/proc"] {
+        let target = format!("/newroot{dir}");
+        let _ = std::fs::create_dir(&target);
+        mount(dir, &target, "", libc::MS_MOVE, None)?;
+    }
+    sys::chdir("/newroot")?;
+    mount(".", "/", "", libc::MS_MOVE, None)?;
+    sys::chroot(".")?;
+    sys::chdir("/")?;
+
+    setup_root();
+    setup_network();
+    agent()
+}
+
+/// Serves sessions as PID 1. One thread runs everything (see [`rt`]).
+fn agent() -> Result<()> {
+    // Before any thread starts (async-io starts one).
+    reaper::block_sigchld();
+    rt::block_on(async {
+        rt::spawn(reaper::run()).detach();
+        serve().await
+    })
+}
+
+/// Mounts that every distribution expects.
+fn setup_root() {
+    let mounts: [(&str, &str, &str, Option<&str>); 4] = [
+        ("sysfs", "/sys", "sysfs", None),
+        (
+            "devpts",
+            "/dev/pts",
+            "devpts",
+            Some("gid=5,mode=620,ptmxmode=666"),
+        ),
+        ("tmpfs", "/dev/shm", "tmpfs", Some("mode=1777")),
+        ("tmpfs", "/run", "tmpfs", Some("mode=0755")),
+    ];
+    for (source, target, fstype, options) in mounts {
+        let _ = std::fs::create_dir_all(target);
+        if let Err(error) = mount(source, target, fstype, 0, options) {
+            log!("{error}");
+        }
+    }
+    // Some distributions expect /dev/ptmx to be the devpts one.
+    if !std::path::Path::new("/dev/ptmx").exists() {
+        let _ = std::os::unix::fs::symlink("pts/ptmx", "/dev/ptmx");
+    }
+    let hostname = std::fs::read_to_string("/etc/hostname")
+        .ok()
+        .map(|h| h.trim().to_string())
+        .filter(|h| !h.is_empty() && h != "localhost")
+        .unwrap_or_else(|| "midgard".into());
+    sys::set_hostname(&hostname);
+}
+
+/// Brings up the loopback interface (the guest has no other network interface).
+fn setup_network() {
+    if let Err(error) = sys::interface_up("lo") {
+        log!("{error}");
+    }
+}
+
+/// Accepts sessions on the agent port; each one is a task.
+async fn serve() -> Result<()> {
+    let listener = sys::vsock_listen(AGENT_PORT)?;
+    // SAFETY: We own the new socket.
+    let listener = Async::new(unsafe { OwnedFd::from_raw_fd(listener) })
+        .context("registering the vsock listener")?;
+    log!("ready");
+    loop {
+        match listener
+            .read_with(|listener| sys::accept(listener.as_raw_fd()))
+            .await
+        {
+            Ok(fd) => {
+                // SAFETY: accept() returned a new socket that we own.
+                let stream = unsafe { File::from_raw_fd(fd) };
+                match Async::new(stream) {
+                    Ok(stream) => rt::spawn(session::handle(stream)).detach(),
+                    Err(error) => log!("vsock stream: {error}"),
+                }
+            }
+            Err(error) => {
+                log!("accept(): {error}");
+                Timer::after(Duration::from_millis(100)).await;
+            }
+        }
+    }
+}
