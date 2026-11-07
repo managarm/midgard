@@ -14,11 +14,14 @@ use event_listener::Event;
 use midgard_protocol::machine::MachineConfig;
 
 use crate::board::Board;
+use crate::host::image;
 use crate::logging::log;
-use crate::{acpi, boot, clock, platform, vcpu};
+use crate::virtio::block::{self, Block};
+use crate::virtio::{DeviceList, DeviceRef};
+use crate::{acpi, boot, clock, platform, vcpu, virtio};
 
 /// Kernel parameters that every guest needs (unless the configuration replaces them);
-/// the console is added.
+/// the console and the virtio devices are added.
 const BASE_CMDLINE: &str = "pci=off reboot=k panic=-1";
 
 /// Checks that midgard can run the VM.
@@ -38,16 +41,64 @@ fn validate(config: &MachineConfig) -> Result<()> {
             platform::MAX_LOW_RAM
         );
     }
-    if !config.disks.is_empty() {
-        bail!("disks are not supported yet");
-    }
     Ok(())
 }
 
+/// The VM's virtio devices, and the host side of those that have one (which starts once
+/// the VM exists).
+struct Devices {
+    list: DeviceList,
+    /// The block devices and their host side.
+    disks: Vec<(DeviceRef<Block>, block::Backend)>,
+}
+
+fn create_devices(config: &MachineConfig) -> Result<Devices> {
+    let mut list = DeviceList::default();
+    let mut disks = Vec::new();
+    for (index, disk) in config.disks.iter().enumerate() {
+        let image = image::open(&disk.path, disk.read_only)
+            .with_context(|| format!("failed to open disk {:?}", disk.path))?;
+        let (block, backend) = Block::new(image, disk.read_only, index);
+        disks.push((list.add(block), backend));
+    }
+    // Each device needs an interrupt line.
+    if list.len() > platform::VIRTIO_IRQS.len() {
+        bail!(
+            "too many devices (a VM can have at most {} virtio devices)",
+            platform::VIRTIO_IRQS.len()
+        );
+    }
+    Ok(Devices { list, disks })
+}
+
 /// The guest kernel's command line.
-fn kernel_cmdline(config: &MachineConfig) -> String {
+fn kernel_cmdline(config: &MachineConfig, devices: &Devices) -> String {
     let base = config.cmdline.as_deref().unwrap_or(BASE_CMDLINE);
     let mut cmdline = vec![base.to_string(), "console=ttyS0".to_string()];
+    for slot in 0..devices.list.len() {
+        let (base, irq) = platform::virtio_slot(slot);
+        cmdline.push(format!(
+            "virtio_mmio.device={}K@{base:#x}:{irq}",
+            virtio::MMIO_SIZE >> 10
+        ));
+    }
+    let explicit_root = config
+        .cmdline
+        .iter()
+        .chain(&config.append)
+        .any(|parameters| {
+            parameters
+                .split_whitespace()
+                .any(|p| p.starts_with("root="))
+        });
+    // Without an initrd, the kernel mounts the first disk (vda) as the root file system.
+    if let Some(disk) = config.disks.first()
+        && config.initrd.is_none()
+        && !explicit_root
+    {
+        let flags = if disk.read_only { "ro" } else { "rw" };
+        cmdline.push(format!("root=/dev/vda {flags}"));
+    }
     cmdline.extend(config.append.iter().cloned());
     cmdline.join(" ")
 }
@@ -70,6 +121,8 @@ pub struct Machine {
     stopped: async_channel::Receiver<Result<Stop>>,
     executor: Arc<Executor<'static>>,
     running: Arc<Running>,
+    /// The block devices' I/O, which must finish before the VM is gone.
+    disks: Vec<block::Shutdown>,
 }
 
 /// Counts the vCPU threads that did not exit yet.
@@ -133,9 +186,17 @@ impl Machine {
 impl Drop for Machine {
     fn drop(&mut self) {
         self.board.stop();
-        // The VM's tasks keep running until the vCPUs are gone: a vCPU may wait for them
-        // (e.g., for a device's host side).
-        async_io::block_on(self.executor.run(self.running.wait()));
+        let disks = std::mem::take(&mut self.disks);
+        async_io::block_on(self.executor.run(async {
+            // The VM's tasks keep running until the vCPUs are gone: a vCPU may wait for
+            // them (e.g., for disk I/O when the guest resets the device).
+            self.running.wait().await;
+            // The guest is gone, but its disk I/O must finish (e.g., before another VM
+            // may open the images).
+            for disk in disks {
+                disk.wait().await;
+            }
+        }));
         for thread in self.threads.drain(..) {
             let _ = thread.join();
         }
@@ -195,6 +256,7 @@ impl fmt::Display for Stop {
 fn spawn_vcpus(
     board: Arc<Board>,
     executor: Arc<Executor<'static>>,
+    disks: Vec<block::Shutdown>,
     vcpus: Vec<vcpu::Vcpu>,
 ) -> Result<Machine> {
     let (sender, stopped) = async_channel::unbounded();
@@ -205,6 +267,7 @@ fn spawn_vcpus(
         stopped,
         executor,
         running: Arc::default(),
+        disks,
     };
     for (id, mut vcpu) in vcpus.into_iter().enumerate() {
         let sender = sender.clone();
@@ -231,7 +294,8 @@ fn spawn_vcpus(
 /// the caller must then drive the VM with [`Machine::run_until_stopped`].
 pub fn start(config: &MachineConfig, console: Box<dyn Write + Send>) -> Result<Machine> {
     validate(config)?;
-    let cmdline = kernel_cmdline(config);
+    let devices = create_devices(config)?;
+    let cmdline = kernel_cmdline(config, &devices);
     let kernel = read(&config.kernel, "the kernel")?;
     let initrd = match &config.initrd {
         Some(path) => Some(read(path, "the initrd")?),
@@ -247,7 +311,14 @@ pub fn start(config: &MachineConfig, console: Box<dyn Write + Send>) -> Result<M
     acpi::write(&memory, platform::ACPI_TABLES, config.cpus)
         .context("failed to write the ACPI tables")?;
 
-    let board = Arc::new(Board::new(memory, config.cpus, tsc_hz, hypervisor, console));
+    let board = Arc::new(Board::new(
+        memory,
+        config.cpus,
+        tsc_hz,
+        hypervisor,
+        console,
+        devices.list.into_transports(),
+    ));
     let mut vcpus = Vec::new();
     for id in 0..config.cpus {
         vcpus.push(vcpu::Vcpu::new(board.clone(), id)?);
@@ -261,5 +332,8 @@ pub fn start(config: &MachineConfig, console: Box<dyn Write + Send>) -> Result<M
         config.memory >> 20,
     );
     let executor = Arc::new(Executor::new());
-    spawn_vcpus(board, executor, vcpus)
+    let disks = (devices.disks.into_iter())
+        .map(|(device, backend)| block::start(&executor, board.clone(), device, backend))
+        .collect();
+    spawn_vcpus(board, executor, disks, vcpus)
 }
