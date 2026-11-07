@@ -10,8 +10,7 @@ use midgard_hv::{Completion, Exit, MmioAccess, Msrs, Regs};
 
 use crate::board::Board;
 use crate::clock;
-use crate::log;
-use crate::logging::ReportOnce;
+use crate::logging::{ReportOnce, log};
 use crate::machine::Stop;
 
 mod cpuid;

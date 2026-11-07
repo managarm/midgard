@@ -9,8 +9,7 @@ use midgard_hv::{GuestMemory, Hypervisor, Kicker};
 use crate::devices::pm1::{self, Pm1};
 use crate::devices::serial::{self, Serial};
 use crate::devices::{read_bytes, write_bytes};
-use crate::log;
-use crate::logging::ReportOnce;
+use crate::logging::{ReportOnce, log};
 use crate::machine::Stop;
 use crate::platform;
 

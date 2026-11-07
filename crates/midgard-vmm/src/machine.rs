@@ -9,7 +9,7 @@ use anyhow::{Context, Result, bail};
 use midgard_protocol::MachineConfig;
 
 use crate::board::Board;
-use crate::log;
+use crate::logging::log;
 use crate::{acpi, boot, clock, platform, vcpu};
 
 /// Kernel parameters that every guest needs (unless the configuration replaces them);

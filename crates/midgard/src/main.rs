@@ -20,7 +20,12 @@ use clap::Parser;
 use midgard_protocol::control::{Request, Response};
 use midgard_protocol::nonblocking::{read_message, write_message};
 use midgard_protocol::{MachineConfig, runtime};
-use midgard_vmm::{MachineHandle, log};
+use midgard_vmm::MachineHandle;
+
+/// Prints a message (like `eprintln!`) with midgard's prefix; it goes to the console log.
+macro_rules! log {
+    ($($arg:tt)*) => { eprintln!("midgard: {}", format_args!($($arg)*)) };
+}
 
 /// The daemon that runs Linux VMs for bifrost (systemd starts it when bifrost connects
 /// to its socket).

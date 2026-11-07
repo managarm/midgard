@@ -5,10 +5,10 @@ use std::collections::BTreeSet;
 use std::sync::Mutex;
 
 /// Prints a message (like `eprintln!`) with midgard's prefix.
-#[macro_export]
 macro_rules! log {
     ($($arg:tt)*) => { eprintln!("midgard: {}", format_args!($($arg)*)) };
 }
+pub(crate) use log;
 
 /// Remembers which problems were reported, such that a guest that keeps doing something
 /// unsupported does not flood the log.
