@@ -23,6 +23,10 @@ pub enum MemoryError {
 /// model does not know about. Hence, guest memory is never part of a Rust allocation: we
 /// never create references to it and only access it through volatile accesses, which Rust
 /// permits for memory outside of its allocations (see [`std::ptr::read_volatile`]).
+///
+/// Clones refer to the same memory, and each keeps it mapped (e.g., while asynchronous
+/// I/O accesses it).
+#[derive(Clone)]
 pub struct GuestMemory {
     base: *mut u8,
     size: u64,
