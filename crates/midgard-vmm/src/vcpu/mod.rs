@@ -10,7 +10,7 @@ use midgard_hv::{Completion, Exit, MmioAccess, Msrs, Regs};
 
 use crate::board::Board;
 use crate::clock;
-use crate::logging::{ReportOnce, log};
+use crate::logging::log;
 use crate::machine::Stop;
 
 mod cpuid;
@@ -27,9 +27,10 @@ const PAT_DEFAULT: u64 = 0x0007_0406_0007_0406;
 /// The microcode revision (in the high half), like KVM.
 const MICROCODE_REVISION: u64 = 0x1_0000_0000;
 
-/// What the guest did that we do not support (reported once, see [`ReportOnce`]).
+/// What the guest did that we do not support (reported once per VM, not per vCPU, see
+/// [`Board::vcpu_reported`]).
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
-enum Unsupported {
+pub(crate) enum Unsupported {
     Msr(u32),
     Hypercall(u64),
 }
@@ -41,7 +42,6 @@ pub(crate) struct Vcpu {
     kvmclock: Kvmclock,
     /// MSRs that we only store.
     msrs: BTreeMap<u32, u64>,
-    reported: ReportOnce<Unsupported>,
 }
 
 impl Vcpu {
@@ -58,7 +58,6 @@ impl Vcpu {
             board,
             kvmclock,
             msrs: BTreeMap::new(),
-            reported: ReportOnce::new(),
         })
     }
 
@@ -138,7 +137,11 @@ impl Vcpu {
     /// return -KVM_ENOSYS.
     fn hypercall(&mut self) -> Result<Completion> {
         let number = self.backend.basic_regs()?.rax;
-        if self.reported.first(Unsupported::Hypercall(number)) {
+        if self
+            .board
+            .vcpu_reported
+            .first(Unsupported::Hypercall(number))
+        {
             log!("vCPU {}: unsupported hypercall {number}", self.id);
         }
         Ok(Completion::Done(KVM_ENOSYS as u64))
@@ -177,7 +180,7 @@ impl Vcpu {
     }
 
     fn report_msr(&mut self, index: u32, what: &str) {
-        if self.reported.first(Unsupported::Msr(index)) {
+        if self.board.vcpu_reported.first(Unsupported::Msr(index)) {
             log!("vCPU {}: #GP on {what} of MSR {index:#x}", self.id);
         }
     }

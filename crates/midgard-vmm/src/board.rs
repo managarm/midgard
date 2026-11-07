@@ -11,7 +11,7 @@ use crate::devices::serial::{self, Serial};
 use crate::devices::{read_bytes, write_bytes};
 use crate::logging::{ReportOnce, log};
 use crate::machine::Stop;
-use crate::platform;
+use crate::{platform, vcpu};
 
 /// Problems that are reported once (see [`ReportOnce`]).
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
@@ -43,6 +43,8 @@ pub(crate) struct Board {
     /// [`Board::stop`] was called.
     stopping: AtomicBool,
     reported: ReportOnce<Unhandled>,
+    /// What the vCPUs reported (each vCPU tends to do the same, e.g., probe an MSR).
+    pub(crate) vcpu_reported: ReportOnce<vcpu::Unsupported>,
 }
 
 impl Board {
@@ -65,6 +67,7 @@ impl Board {
             kickers: Mutex::new(Vec::new()),
             stopping: AtomicBool::new(false),
             reported: ReportOnce::new(),
+            vcpu_reported: ReportOnce::new(),
         }
     }
 
