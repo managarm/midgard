@@ -6,6 +6,8 @@
 //! bifrost and midgard come from the same installation, so the encoding does not need
 //! to be self-describing.
 
+#![warn(unreachable_pub)]
+
 use std::io::{self, Read, Write};
 
 use serde::{Serialize, de::DeserializeOwned};
