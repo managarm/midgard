@@ -7,7 +7,8 @@
 //! UDP flows under their original destination addresses ("any IP"); we make the same
 //! connections and send the same datagrams from the host and copy the data. Pings go
 //! through the host's ICMP sockets (see [`super::ping`]); midgard answers those to
-//! 10.0.2.2 and 10.0.2.3 itself.
+//! 10.0.2.2 and 10.0.2.3 itself. If the host cannot reach a destination, the guest gets
+//! the ICMP error that a router (or the destination) would send.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
@@ -28,8 +29,9 @@ use smoltcp::phy::{self, ChecksumCapabilities, DeviceCapabilities, Medium};
 use smoltcp::socket::{raw, tcp, udp};
 use smoltcp::time::Instant;
 use smoltcp::wire::{
-    EthernetAddress, EthernetFrame, EthernetProtocol, HardwareAddress, Icmpv4Packet, Icmpv4Repr,
-    IpAddress, IpCidr, IpEndpoint, IpProtocol, IpVersion, Ipv4Packet, Ipv4Repr, TcpPacket,
+    EthernetAddress, EthernetFrame, EthernetProtocol, HardwareAddress, Icmpv4DstUnreachable,
+    Icmpv4Packet, Icmpv4Repr, IpAddress, IpCidr, IpEndpoint, IpProtocol, IpVersion, Ipv4Packet,
+    Ipv4Repr, TcpPacket,
 };
 
 use crate::host::ping::PingSocket;
@@ -61,6 +63,8 @@ const UDP_PACKETS: usize = 64;
 /// The buffers of smoltcp's socket for ICMP (in each direction).
 const ICMP_BUFFER: usize = 256 * 1024;
 const ICMP_PACKETS: usize = 64;
+/// The bytes of the payload that ICMP errors quote (RFC 792).
+const QUOTE_LEN: usize = 8;
 /// UDP flows and pings end after they were idle for this long.
 const FLOW_IDLE: Duration = Duration::from_secs(60);
 /// DNS flows end sooner (like slirp's SO_EXPIREFAST): there is one per query, as resolvers
@@ -306,6 +310,16 @@ fn parse_echo_request(packet: &[u8]) -> Option<EchoRequest> {
     }
 }
 
+/// The IP header of a packet of the guest in `frame` and the start of its payload (what
+/// an ICMP error quotes).
+fn quote(frame: &[u8]) -> Option<(Ipv4Repr, Vec<u8>)> {
+    let ethernet = EthernetFrame::new_checked(frame).ok()?;
+    let ip = Ipv4Packet::new_checked(ethernet.payload()).ok()?;
+    let header = Ipv4Repr::parse(&ip, &ChecksumCapabilities::ignored()).ok()?;
+    let payload = ip.payload();
+    Some((header, payload[..payload.len().min(QUOTE_LEN)].to_vec()))
+}
+
 /// An IP packet with an ICMP message from `source` to `destination`.
 fn icmp_packet(source: Ipv4Addr, destination: Ipv4Addr, icmp: &Icmpv4Repr) -> Vec<u8> {
     let checksums = ChecksumCapabilities::default();
@@ -546,10 +560,14 @@ impl UserNet {
         };
         let stream = match result {
             Ok(stream) => stream,
-            Err(_) => {
+            Err(error) => {
                 // Without a listening socket, smoltcp answers the SYN with a reset (like a
-                // refused connection).
-                self.receive_now(syn);
+                // refused connection), unless an ICMP error describes the failure.
+                let reported = quote(&syn)
+                    .is_some_and(|(header, data)| self.report_unreachable(&error, header, &data));
+                if !reported {
+                    self.receive_now(syn);
+                }
                 return;
             }
         };
@@ -734,6 +752,7 @@ impl UserNet {
     fn pump_udp(&mut self) {
         let now = std::time::Instant::now();
         // Guest -> host.
+        let mut failed = Vec::new();
         for (&port, &handle) in &self.udp_ports {
             let socket = self.sockets.get_mut::<udp::Socket>(handle);
             while let Ok((payload, meta)) = socket.recv() {
@@ -751,14 +770,30 @@ impl UserNet {
                     // Without room in the host's buffer, the datagram is lost (like on a busy
                     // link).
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-                    Err(error) => {
-                        report!(
-                            self.reported,
-                            Problem::SendDatagram,
-                            "sending UDP to {destination}: {error}"
-                        );
-                    }
+                    Err(error) => failed.push((guest, destination, payload.len(), error)),
                 }
+            }
+        }
+        for (guest, destination, len, error) in failed {
+            let length = (8 + len) as u16;
+            let header = Ipv4Repr {
+                src_addr: *guest.ip(),
+                dst_addr: *destination.ip(),
+                next_header: IpProtocol::Udp,
+                payload_len: length.into(),
+                hop_limit: 64,
+            };
+            // The UDP header (without a checksum).
+            let mut data = [0u8; QUOTE_LEN];
+            data[0..2].copy_from_slice(&guest.port().to_be_bytes());
+            data[2..4].copy_from_slice(&destination.port().to_be_bytes());
+            data[4..6].copy_from_slice(&length.to_be_bytes());
+            if !self.report_unreachable(&error, header, &data) {
+                report!(
+                    self.reported,
+                    Problem::SendDatagram,
+                    "sending UDP to {destination}: {error}"
+                );
             }
         }
         // Host -> guest.
@@ -905,8 +940,52 @@ impl UserNet {
         }
         let flow = self.pings.get_mut(&key).unwrap();
         flow.last_used = now;
-        // If the host cannot send it, the guest sees no reply.
-        let _ = flow.socket.send(destination, ident, seq_no, data);
+        if let Err(error) = flow.socket.send(destination, ident, seq_no, data) {
+            let icmp = Icmpv4Repr::EchoRequest {
+                ident,
+                seq_no,
+                data,
+            };
+            let header = Ipv4Repr {
+                src_addr: guest,
+                dst_addr: destination,
+                next_header: IpProtocol::Icmp,
+                payload_len: icmp.buffer_len(),
+                hop_limit: 64,
+            };
+            let mut message = vec![0u8; icmp.buffer_len()];
+            icmp.emit(
+                &mut Icmpv4Packet::new_unchecked(&mut message[..]),
+                &ChecksumCapabilities::default(),
+            );
+            // Otherwise, the guest sees no reply.
+            self.report_unreachable(&error, header, &message[..QUOTE_LEN]);
+        }
+    }
+
+    /// Tells the guest that the host could not deliver its packet (`header` and the start
+    /// of its payload, `data`) because of `error`, if an ICMP error describes it. Returns
+    /// whether it did.
+    fn report_unreachable(&mut self, error: &io::Error, header: Ipv4Repr, data: &[u8]) -> bool {
+        // A router reports unreachable networks and hosts; the destination reports closed
+        // ports.
+        let (reason, source) = match error.kind() {
+            io::ErrorKind::NetworkUnreachable => (Icmpv4DstUnreachable::NetUnreachable, HOST_IP),
+            io::ErrorKind::HostUnreachable | io::ErrorKind::TimedOut => {
+                (Icmpv4DstUnreachable::HostUnreachable, HOST_IP)
+            }
+            io::ErrorKind::ConnectionRefused if header.next_header == IpProtocol::Udp => {
+                (Icmpv4DstUnreachable::PortUnreachable, header.dst_addr)
+            }
+            _ => return false,
+        };
+        let icmp = Icmpv4Repr::DstUnreachable {
+            reason,
+            header,
+            data: &data[..data.len().min(QUOTE_LEN)],
+        };
+        self.send_icmp(source, header.src_addr, &icmp);
+        true
     }
 }
 
@@ -917,6 +996,8 @@ mod tests {
     use std::sync::mpsc;
 
     use smoltcp::socket::tcp;
+
+    use smoltcp::wire::{ArpOperation, ArpPacket, ArpRepr, EthernetRepr, Icmpv4Message};
 
     use super::*;
 
@@ -1039,6 +1120,70 @@ mod tests {
             );
             true
         });
+    }
+
+    #[test]
+    fn unreachable_destinations() {
+        let (_handle, from_guest) = channel();
+        let mut stack = UserNet::new(from_guest, Box::new(|_| {}));
+        // smoltcp learns the guest's MAC address from its ARP request.
+        let arp = ArpRepr::EthernetIpv4 {
+            operation: ArpOperation::Request,
+            source_hardware_addr: EthernetAddress(GUEST_MAC),
+            source_protocol_addr: GUEST_IP,
+            target_hardware_addr: EthernetAddress([0; 6]),
+            target_protocol_addr: HOST_IP,
+        };
+        let ethernet = EthernetRepr {
+            src_addr: EthernetAddress(GUEST_MAC),
+            dst_addr: EthernetAddress::BROADCAST,
+            ethertype: EthernetProtocol::Arp,
+        };
+        let mut frame = vec![0u8; ethernet.buffer_len() + arp.buffer_len()];
+        let mut ethernet_frame = EthernetFrame::new_unchecked(&mut frame[..]);
+        ethernet.emit(&mut ethernet_frame);
+        arp.emit(&mut ArpPacket::new_unchecked(ethernet_frame.payload_mut()));
+        stack.frames.rx.push_back(frame);
+
+        let destination = Ipv4Addr::new(192, 0, 2, 1);
+        let header = Ipv4Repr {
+            src_addr: GUEST_IP,
+            dst_addr: destination,
+            next_header: IpProtocol::Udp,
+            payload_len: 108,
+            hop_limit: 64,
+        };
+        let data = [0x0f, 0xa0, 0x00, 0x35, 0x00, 0x6c, 0x00, 0x00];
+        let denied = io::Error::from(io::ErrorKind::PermissionDenied);
+        assert!(!stack.report_unreachable(&denied, header, &data));
+        let unreachable = io::Error::from(io::ErrorKind::HostUnreachable);
+        assert!(stack.report_unreachable(&unreachable, header, &data));
+        stack
+            .iface
+            .poll(Instant::now(), &mut stack.frames, &mut stack.sockets);
+
+        let messages: Vec<_> = (stack.frames.tx.iter())
+            .filter_map(|frame| {
+                let ethernet = EthernetFrame::new_checked(&frame[..]).ok()?;
+                let ip = Ipv4Packet::new_checked(ethernet.payload()).ok()?;
+                (ip.next_header() == IpProtocol::Icmp).then(|| {
+                    assert_eq!((ip.src_addr(), ip.dst_addr()), (HOST_IP, GUEST_IP));
+                    // (smoltcp cannot parse the message: its quote of the guest's
+                    // packet is shorter than the packet.)
+                    let icmp = Icmpv4Packet::new_checked(ip.payload()).unwrap();
+                    assert_eq!(icmp.msg_type(), Icmpv4Message::DstUnreachable);
+                    let reason = Icmpv4DstUnreachable::HostUnreachable;
+                    assert_eq!(icmp.msg_code(), u8::from(reason));
+                    assert!(icmp.verify_checksum());
+                    let quote = Ipv4Packet::new_unchecked(icmp.data());
+                    assert_eq!(quote.src_addr(), GUEST_IP);
+                    assert_eq!(quote.dst_addr(), destination);
+                    assert_eq!(quote.total_len(), 128);
+                    assert_eq!(&icmp.data()[quote.header_len().into()..], data);
+                })
+            })
+            .collect();
+        assert_eq!(messages.len(), 1);
     }
 
     #[test]
