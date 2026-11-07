@@ -6,3 +6,6 @@ description = "Runs Linux VMs on Managarm"
 license = "MIT"
 
 [dependencies]
+anyhow.workspace = true
+clap.workspace = true
+midgard-protocol.workspace = true

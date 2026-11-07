@@ -1,4 +1,5 @@
 use std::ffi::OsString;
+use std::path::PathBuf;
 
 use clap::error::ErrorKind;
 use clap::{Args, CommandFactory, Parser};
@@ -15,13 +16,18 @@ bifrost [OPTIONS] [--] [COMMAND]...
        bifrost --delete NAME
        bifrost --list
        bifrost [-d NAME] --shutdown | --shutdown --all
-       bifrost [-d NAME] --log [--follow]",
+       bifrost [-d NAME] --log [--follow]
+       bifrost --boot --kernel FILE [--initrd FILE] [--cmdline ARGS] [--append ARG]... [--memory SIZE]",
     args_override_self = true
 )]
 pub struct Cli {
     /// The VM [default: the configured default VM]
     #[arg(short = 'd', long, value_name = "NAME")]
     pub distro: Option<String>,
+
+    /// The VM's memory, e.g. 2G (with --create or --boot)
+    #[arg(long, value_name = "SIZE", value_parser = parse_size, requires = "sized")]
+    pub memory: Option<u64>,
 
     #[command(flatten)]
     pub actions: Actions,
@@ -33,6 +39,9 @@ pub struct Cli {
     pub create: CreateArgs,
 
     #[command(flatten)]
+    pub boot: BootArgs,
+
+    #[command(flatten)]
     pub modifiers: Modifiers,
 }
 
@@ -41,7 +50,7 @@ pub struct Cli {
 #[command(next_help_heading = "Actions")]
 pub struct Actions {
     /// Create a new VM instance from a template
-    #[arg(long, value_name = "NAME", conflicts_with = "distro")]
+    #[arg(long, value_name = "NAME", conflicts_with = "distro", group = "sized")]
     create: Option<String>,
 
     /// Delete a VM instance and its disk
@@ -59,6 +68,10 @@ pub struct Actions {
     /// Show the VM instance's log
     #[arg(long)]
     log: bool,
+
+    /// Boot a VM in the foreground, with its console on stdin / stdout (for debugging)
+    #[arg(long, conflicts_with = "distro", group = "sized")]
+    boot: bool,
 }
 
 #[derive(Debug, Args)]
@@ -104,13 +117,44 @@ pub struct CreateArgs {
     #[arg(long, value_name = "NAME", requires = "create")]
     pub template: Option<String>,
 
-    /// The VM instance's memory, e.g. 2G
-    #[arg(long, value_name = "SIZE", value_parser = parse_size, requires = "create")]
-    pub memory: Option<u64>,
-
     /// The size of the VM instance's disk, e.g. 64G
     #[arg(long, value_name = "SIZE", value_parser = parse_size, requires = "create")]
     pub disk_size: Option<u64>,
+}
+
+#[derive(Debug, Args)]
+#[command(next_help_heading = "Booting VMs")]
+pub struct BootArgs {
+    /// The guest kernel (a bzImage)
+    #[arg(
+        long,
+        value_name = "FILE",
+        requires = "boot",
+        required_if_eq("boot", "true")
+    )]
+    pub kernel: Option<PathBuf>,
+
+    /// An initrd
+    #[arg(long, value_name = "FILE", requires = "boot")]
+    pub initrd: Option<PathBuf>,
+
+    /// Replace the base kernel parameters
+    #[arg(
+        long,
+        value_name = "ARGS",
+        requires = "boot",
+        allow_hyphen_values = true
+    )]
+    pub cmdline: Option<String>,
+
+    /// Add a kernel parameter, can be provided multiple times
+    #[arg(
+        long,
+        value_name = "ARG",
+        requires = "boot",
+        allow_hyphen_values = true
+    )]
+    pub append: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -139,6 +183,7 @@ pub enum Action<'a> {
     List,
     Shutdown,
     Log,
+    Boot,
 }
 
 impl Cli {
@@ -170,6 +215,8 @@ impl Cli {
             Action::Shutdown
         } else if self.actions.log {
             Action::Log
+        } else if self.actions.boot {
+            Action::Boot
         } else {
             Action::Run
         }
@@ -215,4 +262,46 @@ fn parse_size(text: &str) -> Result<u64, String> {
     number
         .checked_mul(1 << shift)
         .ok_or_else(|| format!("size {text:?} is too large"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
+        Cli::try_parse_args(std::iter::once("bifrost").chain(args.iter().copied()))
+    }
+
+    #[test]
+    fn boot() {
+        let cli = parse(&[
+            "--boot", "--kernel", "bzImage", "--append", "quiet", "--append", "-v", "--memory",
+            "2G",
+        ])
+        .unwrap();
+        assert_eq!(cli.action(), Action::Boot);
+        assert_eq!(cli.boot.kernel, Some("bzImage".into()));
+        assert_eq!(cli.boot.append, ["quiet", "-v"]);
+        assert_eq!(cli.memory, Some(2 << 30));
+    }
+
+    #[test]
+    fn boot_needs_a_kernel() {
+        assert!(parse(&["--boot"]).is_err());
+    }
+
+    #[test]
+    fn boot_options_need_boot() {
+        assert!(parse(&["--kernel", "bzImage"]).is_err());
+        assert!(parse(&["--append", "quiet"]).is_err());
+        assert!(parse(&["--memory", "2G"]).is_err());
+        assert!(parse(&["--boot", "--kernel", "bzImage", "--create", "alpine"]).is_err());
+    }
+
+    #[test]
+    fn create_with_memory() {
+        let cli = parse(&["--create", "alpine", "--memory", "512M"]).unwrap();
+        assert_eq!(cli.action(), Action::Create("alpine"));
+        assert_eq!(cli.memory, Some(512 << 20));
+    }
 }

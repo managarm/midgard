@@ -1,5 +1,6 @@
 use std::process::ExitCode;
 
+mod boot;
 mod cli;
 
 /// The exit code for bifrost's own failures, such that they aren't mistaken
@@ -19,6 +20,12 @@ fn main() -> ExitCode {
             };
         }
     };
-    eprintln!("bifrost: not implemented yet: {:?}", cli.action());
+    match cli.action() {
+        cli::Action::Boot => {
+            let Err(error) = boot::boot(&cli);
+            eprintln!("bifrost: {error:#}");
+        }
+        action => eprintln!("bifrost: not implemented yet: {action:?}"),
+    }
     ExitCode::from(EXIT_FAILURE)
 }

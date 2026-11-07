@@ -4,6 +4,7 @@ members = [
     "crates/bifrost",
     "crates/midgard",
     "crates/midgard-hv",
+    "crates/midgard-protocol",
     "crates/midgard-vmm",
 ]
 # midgard-init deliberately isn't part of the workspace because
@@ -11,4 +12,8 @@ members = [
 exclude = ["crates/midgard-init"]
 
 [workspace.dependencies]
+anyhow = "1.0"
 clap = { version = "4.6.7", features = ["derive"] }
+libc = "0.2"
+
+midgard-protocol = { path = "crates/midgard-protocol" }

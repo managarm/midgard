@@ -6,4 +6,7 @@ description = "CLI for running lightweight Linux VMs on Managarm"
 license = "MIT"
 
 [dependencies]
+anyhow.workspace = true
 clap.workspace = true
+libc.workspace = true
+midgard-protocol.workspace = true
