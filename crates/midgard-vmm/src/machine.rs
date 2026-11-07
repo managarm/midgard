@@ -35,6 +35,9 @@ fn validate(config: &MachineConfig) -> Result<()> {
             platform::MAX_LOW_RAM
         );
     }
+    if !config.disks.is_empty() {
+        bail!("disks are not supported yet");
+    }
     Ok(())
 }
 

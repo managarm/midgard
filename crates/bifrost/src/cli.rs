@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 use clap::error::ErrorKind;
 use clap::{Args, CommandFactory, Parser, Subcommand};
+use midgard_protocol::machine::Disk;
 
 /// Runs a command, or your login shell, in the VM.
 ///
@@ -168,6 +169,11 @@ pub struct BootArgs {
     /// The number of vCPUs [default: the host's CPUs, up to 8]
     #[arg(long, value_name = "N")]
     pub cpus: Option<u32>,
+
+    /// A disk image (raw or qcow2), can be provided multiple times (the first one is
+    /// the root file system)
+    #[arg(long, value_name = "FILE[,ro]", value_parser = parse_disk)]
+    pub disk: Vec<Disk>,
 }
 
 impl Cli {
@@ -209,6 +215,21 @@ impl RunArgs {
             None
         }
     }
+}
+
+/// Parses `FILE[,ro]`.
+fn parse_disk(text: &str) -> Result<Disk, String> {
+    let (path, read_only) = match text.strip_suffix(",ro") {
+        Some(path) => (path, true),
+        None => (text, false),
+    };
+    if path.is_empty() {
+        return Err("empty disk path".into());
+    }
+    Ok(Disk {
+        path: path.into(),
+        read_only,
+    })
 }
 
 fn parse_size(text: &str) -> Result<u64, String> {
@@ -297,6 +318,37 @@ mod tests {
         assert_eq!(boot.append, ["quiet", "-v"]);
         assert_eq!(boot.memory, Some(2 << 30));
         assert_eq!(boot.cpus, Some(4));
+    }
+
+    #[test]
+    fn boot_disks() {
+        let cli = parse(&[
+            "boot",
+            "--kernel",
+            "bzImage",
+            "--disk",
+            "root.img",
+            "--disk",
+            "data.img,ro",
+        ])
+        .unwrap();
+        let Some(Action::Boot(boot)) = cli.action else {
+            panic!("not boot: {:?}", cli.action);
+        };
+        assert_eq!(
+            boot.disk,
+            [
+                Disk {
+                    path: "root.img".into(),
+                    read_only: false
+                },
+                Disk {
+                    path: "data.img".into(),
+                    read_only: true
+                }
+            ]
+        );
+        assert!(parse(&["boot", "--kernel", "bzImage", "--disk", ",ro"]).is_err());
     }
 
     #[test]

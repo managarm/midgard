@@ -19,4 +19,13 @@ pub struct MachineConfig {
     pub memory: u64,
     /// The number of vCPUs.
     pub cpus: u32,
+    /// The first disk is the root file system.
+    pub disks: Vec<Disk>,
+}
+
+/// A disk image (raw or qcow2) that the guest sees as a virtio block device.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Disk {
+    pub path: PathBuf,
+    pub read_only: bool,
 }

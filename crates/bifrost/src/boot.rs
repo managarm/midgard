@@ -7,7 +7,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use midgard_protocol::control::{Request, Response};
-use midgard_protocol::machine::MachineConfig;
+use midgard_protocol::machine::{Disk, MachineConfig};
 use midgard_protocol::runtime;
 
 use crate::cli::BootArgs;
@@ -30,6 +30,16 @@ fn absolute(path: &Path) -> Result<std::path::PathBuf> {
 
 /// The VM that the command line describes.
 fn config(boot: &BootArgs) -> Result<MachineConfig> {
+    let disks = boot
+        .disk
+        .iter()
+        .map(|disk| {
+            Ok(Disk {
+                path: absolute(&disk.path)?,
+                read_only: disk.read_only,
+            })
+        })
+        .collect::<Result<_>>()?;
     Ok(MachineConfig {
         kernel: absolute(&boot.kernel)?,
         initrd: boot.initrd.as_deref().map(absolute).transpose()?,
@@ -37,6 +47,7 @@ fn config(boot: &BootArgs) -> Result<MachineConfig> {
         append: boot.append.clone(),
         memory: boot.memory.unwrap_or(DEFAULT_MEMORY),
         cpus: boot.cpus.unwrap_or_else(default_cpus),
+        disks,
     })
 }
 
@@ -88,5 +99,6 @@ mod tests {
         assert!(config.append.is_empty());
         assert_eq!(config.memory, DEFAULT_MEMORY);
         assert!((1..=DEFAULT_MAX_CPUS).contains(&config.cpus));
+        assert!(config.disks.is_empty());
     }
 }

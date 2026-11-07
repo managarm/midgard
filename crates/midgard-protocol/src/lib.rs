@@ -104,7 +104,7 @@ pub mod nonblocking {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::machine::MachineConfig;
+    use crate::machine::{Disk, MachineConfig};
 
     #[test]
     fn machine_config_round_trip() {
@@ -115,6 +115,10 @@ mod tests {
             append: vec!["quiet".into(), "loglevel=3".into()],
             memory: 2 << 30,
             cpus: 4,
+            disks: vec![Disk {
+                path: "/var/lib/midgard/alpine.qcow2".into(),
+                read_only: false,
+            }],
         };
         let mut stream = Vec::new();
         write_message(&mut stream, &config).unwrap();
