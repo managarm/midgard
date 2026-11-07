@@ -125,20 +125,6 @@ impl GuestMemory {
         Ok(())
     }
 
-    /// Returns guest memory as a byte slice, e.g., as the target of file I/O.
-    ///
-    /// # Safety
-    /// The guest may access the memory concurrently; callers must not rely on its
-    /// contents staying unchanged (like real DMA). Callers must not create overlapping
-    /// slices that are alive at the same time.
-    // Handing out `&mut` from `&self` is the point: guest memory is not owned by Rust.
-    #[allow(clippy::mut_from_ref)]
-    pub unsafe fn slice_mut(&self, address: u64, length: usize) -> Result<&mut [u8], MemoryError> {
-        let pointer = self.pointer(address, length)?;
-        // SAFETY: The range is inside guest memory; see above for concurrency.
-        Ok(unsafe { std::slice::from_raw_parts_mut(pointer, length) })
-    }
-
     /// Reads a plain-data object (e.g., a structure that the guest set up).
     pub fn read_obj<T: FromBytes + IntoBytes>(&self, address: u64) -> Result<T, MemoryError> {
         let mut value = T::new_zeroed();
