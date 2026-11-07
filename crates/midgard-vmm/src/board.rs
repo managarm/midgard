@@ -29,8 +29,6 @@ enum Unhandled {
 ///
 /// vCPU threads call into it on every exit.
 pub(crate) struct Board {
-    /// Declared (and thus dropped) before `memory`, whose mapping the VM in the
-    /// hypervisor references.
     hypervisor: Hypervisor,
     pub(crate) memory: GuestMemory,
     pub(crate) num_cpus: u32,

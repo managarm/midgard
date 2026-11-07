@@ -55,20 +55,47 @@ const LEAF1_ECX_EMULATED: u32 =
     cpuid::LEAF1_ECX_X2APIC | cpuid::LEAF1_ECX_TSC_DEADLINE | cpuid::LEAF1_ECX_HYPERVISOR;
 const LEAF1_EDX_EMULATED: u32 = cpuid::LEAF1_EDX_APIC;
 
-/// Guest RAM: an anonymous shared mapping.
-pub(crate) struct Ram {
+/// The mapping of guest RAM into our address space (an anonymous shared mapping), which
+/// [`GuestMemory`] accesses. The VM refers to it, too; everything that can run the guest
+/// holds a reference such that it stays mapped while the guest can access it.
+pub(crate) struct Mapping {
     base: *mut u8,
     size: usize,
 }
 
 // SAFETY: The mapping is only accessed through raw pointers.
-unsafe impl Send for Ram {}
-// SAFETY: Ram has no methods that take `&self`; it only unmaps the memory on drop.
-unsafe impl Sync for Ram {}
+unsafe impl Send for Mapping {}
+// SAFETY: Mapping has no methods that take `&self` and access the memory; it only unmaps
+// the memory on drop.
+unsafe impl Sync for Mapping {}
 
-impl Drop for Ram {
+impl Mapping {
+    fn new(size: usize) -> std::io::Result<Self> {
+        // SAFETY: A new anonymous mapping does not alias anything.
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+                -1,
+                0,
+            )
+        };
+        if base == libc::MAP_FAILED {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self {
+            base: base.cast(),
+            size,
+        })
+    }
+}
+
+impl Drop for Mapping {
     fn drop(&mut self) {
-        // SAFETY: We own the mapping.
+        // SAFETY: We own the mapping, and nothing can access it anymore: GuestMemory, the VM
+        // and the vCPUs all hold a reference to it.
         unsafe { libc::munmap(self.base.cast(), self.size) };
     }
 }
@@ -76,6 +103,8 @@ impl Drop for Ram {
 pub struct Hypervisor {
     vm: VmFd,
     supported_cpuid: Vec<kvm_cpuid_entry2>,
+    /// Declared after `vm`, such that the VM is destroyed first.
+    mapping: Arc<Mapping>,
 }
 
 pub(crate) fn create(memory_size: u64) -> Result<(Hypervisor, GuestMemory)> {
@@ -124,36 +153,20 @@ pub(crate) fn create(memory_size: u64) -> Result<(Hypervisor, GuestMemory)> {
     vm.set_msr_filter(MsrFilterDefaultAction::DENY, &ranges)
         .context("KVM_X86_SET_MSR_FILTER failed")?;
 
-    // SAFETY: A new anonymous mapping does not alias anything.
-    let base = unsafe {
-        libc::mmap(
-            std::ptr::null_mut(),
-            memory_size as usize,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_SHARED | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
-            -1,
-            0,
-        )
-    };
-    if base == libc::MAP_FAILED {
-        return Err(std::io::Error::last_os_error()).context("failed to allocate guest memory");
-    }
-    let ram = Ram {
-        base: base.cast(),
-        size: memory_size as usize,
-    };
+    let mapping =
+        Arc::new(Mapping::new(memory_size as usize).context("failed to allocate guest memory")?);
     let region = kvm_userspace_memory_region {
         slot: 0,
         flags: 0,
         guest_phys_addr: 0,
         memory_size,
-        userspace_addr: base as u64,
+        userspace_addr: mapping.base as u64,
     };
-    // SAFETY: The region stays mapped as long as the VM exists (the GuestMemory lives
-    // as long as the process).
+    // SAFETY: The region stays mapped as long as the VM exists: the Hypervisor and the
+    // vCPUs (whose file descriptors keep the VM alive) hold a reference to the mapping.
     unsafe { vm.set_user_memory_region(region) }.context("KVM_SET_USER_MEMORY_REGION failed")?;
-    // SAFETY: The mapping stays alive as long as the GuestMemory.
-    let memory = unsafe { GuestMemory::new(ram.base, memory_size, ram) };
+    // SAFETY: The GuestMemory holds a reference to the mapping.
+    let memory = unsafe { GuestMemory::new(mapping.base, memory_size, mapping.clone()) };
 
     let supported_cpuid = kvm
         .get_supported_cpuid(KVM_MAX_CPUID_ENTRIES)
@@ -165,6 +178,7 @@ pub(crate) fn create(memory_size: u64) -> Result<(Hypervisor, GuestMemory)> {
         Hypervisor {
             vm,
             supported_cpuid,
+            mapping,
         },
         memory,
     ))
@@ -256,6 +270,7 @@ impl HypervisorOps for Hypervisor {
             kicker,
             incomplete: None,
             mmio_read: None,
+            _mapping: self.mapping.clone(),
         })
     }
 
@@ -355,6 +370,8 @@ pub struct Vcpu {
     incomplete: Option<Incomplete>,
     /// The size of an MMIO read that midgard completes.
     mmio_read: Option<u8>,
+    /// Declared after `fd`, such that the vCPU (and thus maybe the VM) is destroyed first.
+    _mapping: Arc<Mapping>,
 }
 
 /// An exit that needs a [`Completion`].

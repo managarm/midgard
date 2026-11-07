@@ -1,6 +1,8 @@
 //! Guest RAM: one contiguous region at guest-physical address zero that is also mapped
 //! into our own address space. The backend allocates it (see [`crate::create`]).
 
+use std::sync::Arc;
+
 use thiserror::Error;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
@@ -24,7 +26,7 @@ pub struct GuestMemory {
 
 enum Owner {
     /// The backend's mapping of the VM's RAM.
-    Backend(#[allow(dead_code)] imp::Ram),
+    Backend(#[allow(dead_code)] Arc<imp::Mapping>),
     /// Memory that no VM uses (see [`GuestMemory::detached`]).
     Heap(#[allow(dead_code)] Box<[u8]>),
 }
@@ -38,12 +40,12 @@ unsafe impl Sync for GuestMemory {}
 
 impl GuestMemory {
     /// # Safety
-    /// `base` must point to `size` bytes of memory that stay mapped while `ram` lives.
-    pub(crate) unsafe fn new(base: *mut u8, size: u64, ram: imp::Ram) -> Self {
+    /// `base` must point to `size` bytes of memory that stay mapped while `mapping` lives.
+    pub(crate) unsafe fn new(base: *mut u8, size: u64, mapping: Arc<imp::Mapping>) -> Self {
         Self {
             base,
             size,
-            _owner: Owner::Backend(ram),
+            _owner: Owner::Backend(mapping),
         }
     }
 
