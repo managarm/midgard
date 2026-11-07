@@ -17,9 +17,10 @@ use midgard_protocol::machine::MachineConfig;
 use midgard_protocol::param;
 
 use crate::board::Board;
-use crate::host::image;
+use crate::host::{image, net};
 use crate::logging::log;
 use crate::virtio::block::{self, Block};
+use crate::virtio::net::VirtioNet;
 use crate::virtio::vsock::{Vsock, VsockStream};
 use crate::virtio::{DeviceList, DeviceRef};
 use crate::{acpi, boot, clock, platform, vcpu, virtio};
@@ -55,6 +56,9 @@ fn validate(config: &MachineConfig) -> Result<()> {
 struct Devices {
     list: DeviceList,
     vsock: Option<DeviceRef<Vsock>>,
+    /// The virtio-net device and the frames for the network stack (which starts once
+    /// the VM exists).
+    network: Option<(DeviceRef<VirtioNet>, async_channel::Receiver<Vec<u8>>)>,
     /// The block devices and their host side (which starts once the VM exists).
     disks: Vec<(DeviceRef<Block>, block::Backend)>,
 }
@@ -63,6 +67,10 @@ fn create_devices(config: &MachineConfig) -> Result<Devices> {
     let mut list = DeviceList::default();
     // The agent talks to us over vsock.
     let vsock = config.agent.is_some().then(|| list.add(Vsock::default()));
+    let network = {
+        let (handle, from_guest) = net::channel();
+        Some((list.add(VirtioNet::new(net::GUEST_MAC, handle)), from_guest))
+    };
     let mut disks = Vec::new();
     for (index, disk) in config.disks.iter().enumerate() {
         let image = image::open(&disk.path, disk.read_only)
@@ -77,7 +85,12 @@ fn create_devices(config: &MachineConfig) -> Result<Devices> {
             platform::VIRTIO_IRQS.len()
         );
     }
-    Ok(Devices { list, vsock, disks })
+    Ok(Devices {
+        list,
+        vsock,
+        network,
+        disks,
+    })
 }
 
 /// The guest kernel's command line.
@@ -90,6 +103,9 @@ fn kernel_cmdline(config: &MachineConfig, devices: &Devices) -> String {
             "virtio_mmio.device={}K@{base:#x}:{irq}",
             virtio::MMIO_SIZE >> 10
         ));
+    }
+    if devices.network.is_some() {
+        cmdline.push(net::kernel_parameter());
     }
     let explicit_root = config
         .cmdline
@@ -405,6 +421,14 @@ pub fn start(config: &MachineConfig, console: Box<dyn Write + Send>) -> Result<M
         config.memory >> 20,
     );
     let executor = Arc::new(Executor::new());
+    if let Some((device, from_guest)) = devices.network {
+        let board = board.clone();
+        net::spawn(&executor, from_guest, move |frames| {
+            board.with_device(device, |net, queues, memory| {
+                ((), net.deliver(frames, queues, memory))
+            });
+        });
+    }
     let disks = (devices.disks.into_iter())
         .map(|(device, backend)| block::start(&executor, board.clone(), device, backend))
         .collect();
