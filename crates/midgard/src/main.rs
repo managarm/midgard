@@ -4,7 +4,8 @@
 //! asks midgard to run it (see [`midgard_protocol::control`]).
 //!
 //! The connections to bifrost are tasks on one executor ([`EXECUTOR`], on the main
-//! thread). Each VM runs on a thread of its own, which reports to the connection's task
+//! thread). Each VM has a thread of its own that starts it and waits for it to stop
+//! (its vCPUs have threads of their own), which reports to the connection's task
 //! through a channel (see [`Event`]).
 
 use std::io::{self, Write};

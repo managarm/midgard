@@ -2,10 +2,12 @@
 
 use std::fmt;
 use std::io::Write;
+use std::panic::{self, AssertUnwindSafe};
 use std::path::Path;
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Weak, mpsc};
+use std::thread::JoinHandle;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use midgard_protocol::machine::MachineConfig;
 
 use crate::board::Board;
@@ -42,14 +44,16 @@ fn read(path: &Path, what: &str) -> Result<Vec<u8>> {
     std::fs::read(path).with_context(|| format!("failed to read {what} {path:?}"))
 }
 
-/// A running VM, owned by the thread that drives it.
+/// A running VM, owned by the thread that waits for it.
 ///
-/// The VM has a single vCPU, which [`Machine::run_until_stopped`] runs on this thread.
-/// Dropping the `Machine` after the guest stopped releases the VM. To interact with the
-/// VM from elsewhere, take a [`MachineHandle`].
+/// The vCPUs run on their own threads; [`Machine::run_until_stopped`] waits for them.
+/// Dropping the `Machine` stops the VM (if it still runs) and releases it. To interact
+/// with the VM from elsewhere, take a [`MachineHandle`].
 pub struct Machine {
     board: Arc<Board>,
-    vcpu: vcpu::Vcpu,
+    threads: Vec<JoinHandle<()>>,
+    /// Receives the result of each vCPU that stops (the VM is done with the first one).
+    stopped: mpsc::Receiver<Result<Stop>>,
 }
 
 impl Machine {
@@ -60,12 +64,23 @@ impl Machine {
         }
     }
 
-    /// Runs the vCPU on this thread until the guest stops (or the vCPU fails); returns
-    /// why. Flushes the console before returning.
+    /// Waits until the guest stops (or a vCPU fails); returns why. Flushes the console
+    /// before returning.
     pub fn run_until_stopped(&mut self) -> Result<Stop> {
-        let result = self.vcpu.run();
+        // Each vCPU thread sends its result before it exits.
+        let result = self.stopped.recv().expect("all vCPU threads exited");
         self.board.flush_console();
         result
+    }
+}
+
+impl Drop for Machine {
+    fn drop(&mut self) {
+        self.board.stop();
+        for thread in self.threads.drain(..) {
+            let _ = thread.join();
+        }
+        self.board.flush_console();
     }
 }
 
@@ -116,9 +131,37 @@ impl fmt::Display for Stop {
     }
 }
 
+/// Starts a thread for each vCPU. The VM stops as soon as one vCPU stops (e.g., because
+/// the guest reset it): that one stops the others, after it sent its result.
+fn spawn_vcpus(board: Arc<Board>, vcpus: Vec<vcpu::Vcpu>) -> Result<Machine> {
+    let (sender, stopped) = mpsc::channel();
+    // If a thread cannot be spawned, dropping the machine stops the others.
+    let mut machine = Machine {
+        board,
+        threads: Vec::new(),
+        stopped,
+    };
+    for (id, mut vcpu) in vcpus.into_iter().enumerate() {
+        let sender = sender.clone();
+        let board = machine.board.clone();
+        let thread = std::thread::Builder::new()
+            .name(format!("vcpu{id}"))
+            .spawn(move || {
+                // A panic stops the VM like an error does (the panic hook printed it).
+                let result = panic::catch_unwind(AssertUnwindSafe(|| vcpu.run()))
+                    .unwrap_or_else(|_| Err(anyhow!("vCPU {id} panicked")));
+                let _ = sender.send(result);
+                board.stop();
+            })
+            .context("failed to spawn a vCPU thread")?;
+        machine.threads.push(thread);
+    }
+    Ok(machine)
+}
+
 /// Boots the VM that `config` describes. The guest's console output (the serial port)
-/// goes to `console`. The caller must then drive the VM with
-/// [`Machine::run_until_stopped`].
+/// goes to `console`. The vCPUs start running on their own threads before this returns;
+/// the caller then waits for the VM with [`Machine::run_until_stopped`].
 pub fn start(config: &MachineConfig, console: Box<dyn Write + Send>) -> Result<Machine> {
     validate(config)?;
     let cmdline = kernel_cmdline(config);
@@ -137,13 +180,13 @@ pub fn start(config: &MachineConfig, console: Box<dyn Write + Send>) -> Result<M
     acpi::write(&memory, platform::ACPI_TABLES, 1).context("failed to write the ACPI tables")?;
 
     let board = Arc::new(Board::new(memory, 1, tsc_hz, hypervisor, console));
-    let mut vcpu = vcpu::Vcpu::new(board.clone(), 0)?;
-    vcpu.set_registers(&boot::entry_registers(&entry))?;
+    let mut vcpus = vec![vcpu::Vcpu::new(board.clone(), 0)?];
+    vcpus[0].set_registers(&boot::entry_registers(&entry))?;
 
     log!(
         "booting {} with {} MiB of memory: {cmdline}",
         config.kernel.display(),
         config.memory >> 20,
     );
-    Ok(Machine { board, vcpu })
+    spawn_vcpus(board, vcpus)
 }

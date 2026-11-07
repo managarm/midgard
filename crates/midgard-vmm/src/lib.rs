@@ -7,9 +7,10 @@
 //! power off.
 //!
 //! [`start`] boots a guest and returns a [`Machine`], which the calling thread owns and
-//! drives. Everything else that wants to talk to the running VM (e.g., the daemon's
-//! connection tasks) holds a [`MachineHandle`]. The guest's hardware itself (RAM,
-//! devices, I/O routing) is private to this crate.
+//! waits for (each vCPU runs on a thread of its own). Everything else that wants to
+//! talk to the running VM (e.g., the daemon's connection tasks) holds a
+//! [`MachineHandle`]. The guest's hardware itself (RAM, devices, I/O routing) is
+//! private to this crate.
 
 #![warn(unreachable_pub)]
 
