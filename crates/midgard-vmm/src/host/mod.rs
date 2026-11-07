@@ -3,3 +3,4 @@
 
 pub(crate) mod image;
 pub(crate) mod net;
+pub(crate) mod ping;

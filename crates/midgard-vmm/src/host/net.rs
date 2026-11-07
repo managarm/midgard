@@ -5,7 +5,9 @@
 //! loopback); 10.0.2.3 forwards DNS to the host's resolver. smoltcp answers ARP,
 //! reassembles and fragments IP packets, and terminates the guest's TCP connections and
 //! UDP flows under their original destination addresses ("any IP"); we make the same
-//! connections and send the same datagrams from the host and copy the data.
+//! connections and send the same datagrams from the host and copy the data. Pings go
+//! through the host's ICMP sockets (see [`super::ping`]); midgard answers those to
+//! 10.0.2.2 and 10.0.2.3 itself.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
@@ -22,14 +24,15 @@ use async_io::{Async, Timer};
 use futures_lite::{StreamExt, future};
 
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
-use smoltcp::phy::{self, DeviceCapabilities, Medium};
-use smoltcp::socket::{tcp, udp};
+use smoltcp::phy::{self, ChecksumCapabilities, DeviceCapabilities, Medium};
+use smoltcp::socket::{raw, tcp, udp};
 use smoltcp::time::Instant;
 use smoltcp::wire::{
-    EthernetAddress, EthernetFrame, EthernetProtocol, HardwareAddress, IpAddress, IpCidr,
-    IpEndpoint, IpProtocol, Ipv4Packet, TcpPacket,
+    EthernetAddress, EthernetFrame, EthernetProtocol, HardwareAddress, Icmpv4Packet, Icmpv4Repr,
+    IpAddress, IpCidr, IpEndpoint, IpProtocol, IpVersion, Ipv4Packet, Ipv4Repr, TcpPacket,
 };
 
+use crate::host::ping::PingSocket;
 use crate::logging::{ReportOnce, log};
 
 pub(crate) const GUEST_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 15);
@@ -55,7 +58,11 @@ const TCP_TIMEOUT: Duration = Duration::from_secs(60);
 /// a datagram can be almost 64 KiB large).
 const UDP_BUFFER: usize = 256 * 1024;
 const UDP_PACKETS: usize = 64;
-const UDP_IDLE: Duration = Duration::from_secs(60);
+/// The buffers of smoltcp's socket for ICMP (in each direction).
+const ICMP_BUFFER: usize = 256 * 1024;
+const ICMP_PACKETS: usize = 64;
+/// UDP flows and pings end after they were idle for this long.
+const FLOW_IDLE: Duration = Duration::from_secs(60);
 /// DNS flows end sooner (like slirp's SO_EXPIREFAST): there is one per query, as resolvers
 /// pick a new port for each.
 const DNS_IDLE: Duration = Duration::from_secs(10);
@@ -65,7 +72,7 @@ const MAX_DATAGRAM: usize = 65535;
 /// The frames from the guest that smoltcp gets before we empty its sockets (such that
 /// their buffers do not overflow).
 const BATCH: usize = 32;
-/// The longest time that the stack sleeps (it expires idle UDP flows when it wakes up).
+/// The longest time that the stack sleeps (it expires idle flows when it wakes up).
 const MAX_WAIT: Duration = Duration::from_secs(1);
 
 /// The part of the stack that the virtio-net device talks to.
@@ -248,6 +255,8 @@ enum Problem {
     UdpSocket,
     SendDatagram,
     ReceiveDatagram,
+    PingSocket,
+    ReceivePing,
 }
 
 /// Logs a [`Problem`] the first time that it occurs.
@@ -257,6 +266,64 @@ macro_rules! report {
             log!("{} (further errors are not reported)", format_args!($($arg)*));
         }
     };
+}
+
+/// The pings of the guest with one identifier to one destination, and the host socket
+/// that forwards them.
+struct PingFlow {
+    socket: PingSocket,
+    /// The guest's address (where the replies go).
+    guest: Ipv4Addr,
+    last_used: std::time::Instant,
+}
+
+/// An echo request of the guest.
+struct EchoRequest {
+    guest: Ipv4Addr,
+    destination: Ipv4Addr,
+    ident: u16,
+    seq_no: u16,
+    data: Vec<u8>,
+}
+
+/// The echo request in an IP packet (from smoltcp's raw socket).
+fn parse_echo_request(packet: &[u8]) -> Option<EchoRequest> {
+    let ip = Ipv4Packet::new_checked(packet).ok()?;
+    let icmp = Icmpv4Packet::new_checked(ip.payload()).ok()?;
+    match Icmpv4Repr::parse(&icmp, &ChecksumCapabilities::default()).ok()? {
+        Icmpv4Repr::EchoRequest {
+            ident,
+            seq_no,
+            data,
+        } => Some(EchoRequest {
+            guest: ip.src_addr(),
+            destination: ip.dst_addr(),
+            ident,
+            seq_no,
+            data: data.to_vec(),
+        }),
+        _ => None,
+    }
+}
+
+/// An IP packet with an ICMP message from `source` to `destination`.
+fn icmp_packet(source: Ipv4Addr, destination: Ipv4Addr, icmp: &Icmpv4Repr) -> Vec<u8> {
+    let checksums = ChecksumCapabilities::default();
+    let ip = Ipv4Repr {
+        src_addr: source,
+        dst_addr: destination,
+        next_header: IpProtocol::Icmp,
+        payload_len: icmp.buffer_len(),
+        hop_limit: 64,
+    };
+    let mut packet = vec![0u8; ip.buffer_len() + icmp.buffer_len()];
+    let mut ip_packet = Ipv4Packet::new_unchecked(&mut packet[..]);
+    ip.emit(&mut ip_packet, &checksums);
+    icmp.emit(
+        &mut Icmpv4Packet::new_unchecked(ip_packet.payload_mut()),
+        &checksums,
+    );
+    packet
 }
 
 struct UserNet {
@@ -276,6 +343,11 @@ struct UserNet {
     /// addresses).
     udp_ports: HashMap<u16, SocketHandle>,
     udp: HashMap<FlowKey, UdpFlow>,
+    /// smoltcp's socket for ICMP: it receives the guest's ICMP messages and sends ours
+    /// (under any source address).
+    icmp_socket: SocketHandle,
+    /// By identifier and destination.
+    pings: HashMap<(u16, Ipv4Addr), PingFlow>,
     dns_server: Ipv4Addr,
     scratch: Vec<u8>,
     reported: ReportOnce<Problem>,
@@ -310,6 +382,19 @@ impl UserNet {
         // Accept packets for all addresses (the guest's connections to the world).
         iface.set_any_ip(true);
         let _ = iface.routes_mut().add_default_ipv4_route(HOST_IP);
+        let mut sockets = SocketSet::new(Vec::new());
+        let icmp_socket = sockets.add(raw::Socket::new(
+            Some(IpVersion::Ipv4),
+            Some(IpProtocol::Icmp),
+            raw::PacketBuffer::new(
+                vec![raw::PacketMetadata::EMPTY; ICMP_PACKETS],
+                vec![0u8; ICMP_BUFFER],
+            ),
+            raw::PacketBuffer::new(
+                vec![raw::PacketMetadata::EMPTY; ICMP_PACKETS],
+                vec![0u8; ICMP_BUFFER],
+            ),
+        ));
         Self {
             from_guest: Box::pin(from_guest),
             incoming: Vec::new(),
@@ -317,12 +402,14 @@ impl UserNet {
             deliver,
             frames,
             iface,
-            sockets: SocketSet::new(Vec::new()),
+            sockets,
             connecting: HashMap::new(),
             tcp: HashMap::new(),
             tcp_keys: HashMap::new(),
             udp_ports: HashMap::new(),
             udp: HashMap::new(),
+            icmp_socket,
+            pings: HashMap::new(),
             dns_server: {
                 let server = host_dns_server();
                 log!("forwarding DNS to {server}");
@@ -355,6 +442,7 @@ impl UserNet {
                     .poll(Instant::now(), &mut self.frames, &mut self.sockets);
                 self.pump_tcp();
                 self.pump_udp();
+                self.pump_icmp();
                 if incoming.peek().is_none() {
                     break;
                 }
@@ -396,6 +484,11 @@ impl UserNet {
             }
         }
         for flow in self.udp.values() {
+            if flow.socket.poll_readable(cx).is_ready() {
+                ready = true;
+            }
+        }
+        for flow in self.pings.values() {
             if flow.socket.poll_readable(cx).is_ready() {
                 ready = true;
             }
@@ -702,7 +795,7 @@ impl UserNet {
             let idle = if destination.port() == DNS_PORT {
                 DNS_IDLE
             } else {
-                UDP_IDLE
+                FLOW_IDLE
             };
             now.duration_since(flow.last_used) < idle
         });
@@ -714,6 +807,106 @@ impl UserNet {
             }
             used
         });
+    }
+
+    /// Sends an ICMP message to the guest (smoltcp fills in the Ethernet header and
+    /// fragments it if necessary).
+    fn send_icmp(&mut self, source: Ipv4Addr, guest: Ipv4Addr, icmp: &Icmpv4Repr) {
+        let packet = icmp_packet(source, guest, icmp);
+        // Without room in smoltcp's buffer, the message is lost.
+        let _ = self
+            .sockets
+            .get_mut::<raw::Socket>(self.icmp_socket)
+            .send_slice(&packet);
+    }
+
+    fn pump_icmp(&mut self) {
+        let now = std::time::Instant::now();
+        // Guest -> host.
+        let mut requests = Vec::new();
+        let socket = self.sockets.get_mut::<raw::Socket>(self.icmp_socket);
+        while let Ok(packet) = socket.recv() {
+            requests.extend(parse_echo_request(packet));
+        }
+        for request in requests {
+            self.ping(request, now);
+        }
+        // Host -> guest.
+        let mut replies = Vec::new();
+        for (&(ident, destination), flow) in &mut self.pings {
+            loop {
+                match flow.socket.recv(&mut self.scratch) {
+                    Ok(Some(reply)) if reply.source == destination => {
+                        flow.last_used = now;
+                        replies.push((destination, flow.guest, ident, reply));
+                    }
+                    Ok(_) => {}
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(error) => {
+                        report!(
+                            self.reported,
+                            Problem::ReceivePing,
+                            "receiving ICMP from {destination}: {error}"
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+        for (destination, guest, ident, reply) in replies {
+            let icmp = Icmpv4Repr::EchoReply {
+                ident,
+                seq_no: reply.seq_no,
+                data: &reply.data,
+            };
+            self.send_icmp(destination, guest, &icmp);
+        }
+        self.pings
+            .retain(|_, flow| now.duration_since(flow.last_used) < FLOW_IDLE);
+    }
+
+    /// Answers an echo request of the guest, or forwards it to its destination.
+    fn ping(&mut self, request: EchoRequest, now: std::time::Instant) {
+        let EchoRequest {
+            guest,
+            destination,
+            ident,
+            seq_no,
+            ref data,
+        } = request;
+        if matches!(destination, HOST_IP | DNS_IP) {
+            let icmp = Icmpv4Repr::EchoReply {
+                ident,
+                seq_no,
+                data,
+            };
+            self.send_icmp(destination, guest, &icmp);
+            return;
+        }
+        let key = (ident, destination);
+        if !self.pings.contains_key(&key) {
+            let socket = match PingSocket::new() {
+                Ok(socket) => socket,
+                Err(error) => {
+                    report!(
+                        self.reported,
+                        Problem::PingSocket,
+                        "cannot forward pings: {error}"
+                    );
+                    return;
+                }
+            };
+            let flow = PingFlow {
+                socket,
+                guest,
+                last_used: now,
+            };
+            self.pings.insert(key, flow);
+        }
+        let flow = self.pings.get_mut(&key).unwrap();
+        flow.last_used = now;
+        // If the host cannot send it, the guest sees no reply.
+        let _ = flow.socket.send(destination, ident, seq_no, data);
     }
 }
 
@@ -800,6 +993,68 @@ mod tests {
             let buffer = || tcp::SocketBuffer::new(vec![0u8; TCP_BUFFER]);
             self.sockets.add(tcp::Socket::new(buffer(), buffer()))
         }
+
+        fn icmp_socket(&mut self) -> SocketHandle {
+            let buffer =
+                || raw::PacketBuffer::new(vec![raw::PacketMetadata::EMPTY; 8], vec![0u8; 4096]);
+            self.sockets.add(raw::Socket::new(
+                Some(IpVersion::Ipv4),
+                Some(IpProtocol::Icmp),
+                buffer(),
+                buffer(),
+            ))
+        }
+    }
+
+    /// Pings `destination` from the guest and checks the reply.
+    fn ping(destination: Ipv4Addr) {
+        let mut guest = Guest::new();
+        let handle = guest.icmp_socket();
+        let request = Icmpv4Repr::EchoRequest {
+            ident: 0x1234,
+            seq_no: 7,
+            data: b"data",
+        };
+        guest
+            .sockets
+            .get_mut::<raw::Socket>(handle)
+            .send_slice(&icmp_packet(GUEST_IP, destination, &request))
+            .unwrap();
+        guest.run_until(|guest| {
+            let socket = guest.sockets.get_mut::<raw::Socket>(handle);
+            let Ok(packet) = socket.recv() else {
+                return false;
+            };
+            let ip = Ipv4Packet::new_checked(packet).unwrap();
+            let icmp = Icmpv4Packet::new_checked(ip.payload()).unwrap();
+            let reply = Icmpv4Repr::parse(&icmp, &ChecksumCapabilities::default()).unwrap();
+            assert_eq!(ip.src_addr(), destination);
+            assert_eq!(
+                reply,
+                Icmpv4Repr::EchoReply {
+                    ident: 0x1234,
+                    seq_no: 7,
+                    data: b"data",
+                }
+            );
+            true
+        });
+    }
+
+    #[test]
+    fn ping_the_gateway() {
+        ping(HOST_IP);
+    }
+
+    #[test]
+    fn forwarded_ping() {
+        // The host may not let us create ping sockets (on Linux, see
+        // net.ipv4.ping_group_range).
+        if PingSocket::new().is_err() {
+            eprintln!("skipped: no ping sockets");
+            return;
+        }
+        ping(Ipv4Addr::LOCALHOST);
     }
 
     /// Exchanges a datagram of `size` bytes with a UDP socket on the host's loopback (as
