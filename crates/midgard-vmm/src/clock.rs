@@ -1,7 +1,7 @@
 //! Host time: the TSC (the guest's TSC is the host's TSC) and the host's monotonic
 //! clock.
 
-pub fn rdtsc() -> u64 {
+pub(crate) fn rdtsc() -> u64 {
     #[cfg(target_arch = "x86_64")]
     #[allow(unused_unsafe)]
     // SAFETY: RDTSC has no side effects.
@@ -12,7 +12,7 @@ pub fn rdtsc() -> u64 {
 
 /// Nanoseconds since the host booted (CLOCK_MONOTONIC).
 #[cfg(not(target_os = "managarm"))]
-pub fn host_ns() -> u64 {
+pub(crate) fn host_ns() -> u64 {
     let mut time = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,
@@ -30,7 +30,7 @@ fn kernel_tsc_hz() -> Option<u64> {
 
 /// Determines the TSC frequency: exactly from the kernel's clock if possible
 /// (then kvmclock agrees with helGetClock()), otherwise by measuring it.
-pub fn calibrate() -> u64 {
+pub(crate) fn calibrate() -> u64 {
     if let Some(hz) = kernel_tsc_hz() {
         return hz;
     }

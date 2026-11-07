@@ -6,6 +6,8 @@
 //! hypervisor), kvmclock and a 16550A UART. Minimal ACPI tables describe the CPU and
 //! power off.
 
+#![warn(unreachable_pub)]
+
 mod acpi;
 mod boot;
 mod clock;

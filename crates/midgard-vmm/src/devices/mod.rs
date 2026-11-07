@@ -2,12 +2,12 @@
 //! Their registers are byte-wide; [`read_bytes`] and [`write_bytes`] split wider
 //! accesses.
 
-pub mod pm1;
-pub mod serial;
+pub(crate) mod pm1;
+pub(crate) mod serial;
 
 /// Reads `size` bytes at `offset` of a device with `len` byte-wide registers, one
 /// register per byte (little endian). Bytes past the device read as 0xFF.
-pub fn read_bytes(len: u16, offset: u16, size: u32, mut read: impl FnMut(u16) -> u8) -> u32 {
+pub(crate) fn read_bytes(len: u16, offset: u16, size: u32, mut read: impl FnMut(u16) -> u8) -> u32 {
     let mut value = 0u32;
     for i in 0..size {
         let offset = offset + i as u16;
@@ -19,7 +19,13 @@ pub fn read_bytes(len: u16, offset: u16, size: u32, mut read: impl FnMut(u16) ->
 
 /// Writes `size` bytes at `offset` of a device with `len` byte-wide registers, one
 /// register per byte (little endian). Bytes past the device are dropped.
-pub fn write_bytes(len: u16, offset: u16, size: u32, value: u32, mut write: impl FnMut(u16, u8)) {
+pub(crate) fn write_bytes(
+    len: u16,
+    offset: u16,
+    size: u32,
+    value: u32,
+    mut write: impl FnMut(u16, u8),
+) {
     for i in 0..size {
         let offset = offset + i as u16;
         if offset < len {

@@ -131,14 +131,14 @@ const _: () = {
 };
 
 /// The register state in which the guest starts.
-pub struct EntryState {
+pub(crate) struct EntryState {
     pub rip: u64,
     pub rsi: u64,
     pub cr3: u64,
 }
 
 /// Loads the kernel (and initrd) and writes all structures that the guest needs at entry.
-pub fn load(
+pub(crate) fn load(
     memory: &GuestMemory,
     kernel: &[u8],
     initrd: Option<&[u8]>,
@@ -293,7 +293,7 @@ fn segment(selector: u16, type_: u8, s: u8, l: u8, db: u8) -> Segment {
 
 /// The initial register state of the boot CPU: long mode with paging, the boot GDT
 /// and RSI pointing to the zero page.
-pub fn entry_registers(entry: &EntryState) -> Regs {
+pub(crate) fn entry_registers(entry: &EntryState) -> Regs {
     let mut regs = Regs::default();
     regs.basic.rip = entry.rip;
     regs.basic.rsi = entry.rsi;

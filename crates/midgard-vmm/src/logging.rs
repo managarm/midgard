@@ -12,15 +12,15 @@ macro_rules! log {
 
 /// Remembers which problems were reported, such that a guest that keeps doing something
 /// unsupported does not flood the log.
-pub struct ReportOnce<K>(Mutex<BTreeSet<K>>);
+pub(crate) struct ReportOnce<K>(Mutex<BTreeSet<K>>);
 
 impl<K: Ord> ReportOnce<K> {
-    pub const fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self(Mutex::new(BTreeSet::new()))
     }
 
     /// Returns true the first time that `key` is passed (the problem should be reported).
-    pub fn first(&self, key: K) -> bool {
+    pub(crate) fn first(&self, key: K) -> bool {
         self.0.lock().unwrap().insert(key)
     }
 }

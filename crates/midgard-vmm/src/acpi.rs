@@ -357,7 +357,7 @@ fn madt(num_cpus: u32) -> Vec<u8> {
 
 /// Writes the tables to `address`, with the RSDP first (16-byte aligned, such that Linux
 /// also finds it when it scans the BIOS area).
-pub fn write(memory: &GuestMemory, address: u64, num_cpus: u32) -> Result<(), MemoryError> {
+pub(crate) fn write(memory: &GuestMemory, address: u64, num_cpus: u32) -> Result<(), MemoryError> {
     let mut layout = Layout {
         base: address,
         bytes: vec![0u8; size_of::<Rsdp>()],

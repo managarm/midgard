@@ -34,7 +34,7 @@ enum Unsupported {
     Hypercall(u64),
 }
 
-pub struct Vcpu {
+pub(crate) struct Vcpu {
     id: u32,
     backend: midgard_hv::Vcpu,
     vm: Arc<Vm>,
@@ -46,7 +46,7 @@ pub struct Vcpu {
 
 impl Vcpu {
     /// Creates the vCPU. vCPU 0 is the BSP; the others wait for a startup IPI.
-    pub fn new(vm: Arc<Vm>, id: u32) -> Result<Self> {
+    pub(crate) fn new(vm: Arc<Vm>, id: u32) -> Result<Self> {
         let backend = vm
             .hypervisor()
             .create_vcpu(id, &cpuid::table(id, vm.num_cpus))?;
@@ -62,12 +62,12 @@ impl Vcpu {
         })
     }
 
-    pub fn set_registers(&mut self, regs: &Regs) -> Result<()> {
+    pub(crate) fn set_registers(&mut self, regs: &Regs) -> Result<()> {
         self.backend.set_regs(regs)
     }
 
     /// Runs the vCPU until the guest stops it.
-    pub fn run(&mut self) -> Result<Stop> {
+    pub(crate) fn run(&mut self) -> Result<Stop> {
         let mut completion = None;
         loop {
             let exit = self.backend.run(completion.take())?;

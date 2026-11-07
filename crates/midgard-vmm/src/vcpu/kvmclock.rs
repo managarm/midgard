@@ -57,7 +57,7 @@ fn time_scale(scaled_hz: u64, base_hz: u64) -> (i8, u32) {
 }
 
 /// Per-vCPU kvmclock state.
-pub struct Kvmclock {
+pub(crate) struct Kvmclock {
     /// Converts TSC ticks to nanoseconds (see [`time_scale`]).
     tsc_shift: i8,
     tsc_to_system_mul: u32,
@@ -68,7 +68,7 @@ pub struct Kvmclock {
 }
 
 impl Kvmclock {
-    pub fn new(tsc_hz: u64) -> Self {
+    pub(crate) fn new(tsc_hz: u64) -> Self {
         let (tsc_shift, tsc_to_system_mul) = time_scale(1_000_000_000, tsc_hz);
         Self {
             tsc_shift,
@@ -79,11 +79,11 @@ impl Kvmclock {
         }
     }
 
-    pub fn msr(&self) -> u64 {
+    pub(crate) fn msr(&self) -> u64 {
         self.msr
     }
 
-    pub fn set_msr(&mut self, memory: &GuestMemory, msr: u64) -> Result<(), MemoryError> {
+    pub(crate) fn set_msr(&mut self, memory: &GuestMemory, msr: u64) -> Result<(), MemoryError> {
         self.msr = msr;
         self.published_at = None;
         self.update(memory)
@@ -91,7 +91,7 @@ impl Kvmclock {
 
     /// Re-publishes the time structure if it is outdated, such that errors in the
     /// TSC frequency do not accumulate. Must only be called while the vCPU does not run.
-    pub fn update(&mut self, memory: &GuestMemory) -> Result<(), MemoryError> {
+    pub(crate) fn update(&mut self, memory: &GuestMemory) -> Result<(), MemoryError> {
         const REFRESH_NS: u64 = 1_000_000_000;
         if self.msr & SYSTEM_TIME_ENABLE == 0 {
             return Ok(());
@@ -122,7 +122,7 @@ impl Kvmclock {
 }
 
 /// Writes struct pvclock_wall_clock: the wall clock time at which the system time was zero.
-pub fn write_wall_clock(memory: &GuestMemory, address: u64) -> Result<(), MemoryError> {
+pub(crate) fn write_wall_clock(memory: &GuestMemory, address: u64) -> Result<(), MemoryError> {
     let wall_ns = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)

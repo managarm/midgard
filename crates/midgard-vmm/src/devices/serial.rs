@@ -3,7 +3,7 @@
 use std::collections::VecDeque;
 use std::io::Write;
 
-pub const NUM_PORTS: u16 = 8;
+pub(crate) const NUM_PORTS: u16 = 8;
 
 const LCR_DLAB: u8 = 1 << 7;
 const MCR_LOOP: u8 = 1 << 4;
@@ -21,7 +21,7 @@ const IIR_FIFO_ENABLED: u8 = 0xC0;
 /// DCD, DSR, CTS.
 const MSR_CONNECTED: u8 = 0xB0;
 
-pub struct Serial {
+pub(crate) struct Serial {
     ier: u8,
     lcr: u8,
     mcr: u8,
@@ -37,7 +37,7 @@ pub struct Serial {
 }
 
 impl Serial {
-    pub fn new(output: Box<dyn Write + Send>) -> Self {
+    pub(crate) fn new(output: Box<dyn Write + Send>) -> Self {
         Self {
             ier: 0,
             lcr: 0,
@@ -53,12 +53,12 @@ impl Serial {
     }
 
     /// The level of the interrupt line.
-    pub fn irq_level(&self) -> bool {
+    pub(crate) fn irq_level(&self) -> bool {
         (self.ier & IER_RDI != 0 && !self.input.is_empty())
             || (self.ier & IER_THRI != 0 && self.thr_pending)
     }
 
-    pub fn read(&mut self, offset: u16) -> u8 {
+    pub(crate) fn read(&mut self, offset: u16) -> u8 {
         let dlab = self.lcr & LCR_DLAB != 0;
         match offset {
             0 if dlab => self.dll,
@@ -99,7 +99,7 @@ impl Serial {
         }
     }
 
-    pub fn write(&mut self, offset: u16, value: u8) {
+    pub(crate) fn write(&mut self, offset: u16, value: u8) {
         let dlab = self.lcr & LCR_DLAB != 0;
         match offset {
             0 if dlab => self.dll = value,
@@ -134,7 +134,7 @@ impl Serial {
         }
     }
 
-    pub fn flush(&mut self) {
+    pub(crate) fn flush(&mut self) {
         let _ = self.output.flush();
     }
 }

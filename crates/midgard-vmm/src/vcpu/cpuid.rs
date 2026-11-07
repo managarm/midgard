@@ -96,7 +96,7 @@ fn xsave_compacted_size(xcr0: u64) -> u32 {
 /// The CPUID table of a vCPU. The bits that depend on the vCPU's state (OSXSAVE, the
 /// APIC's enable bit and the XSAVE area sizes) are those of the reset state; the
 /// hypervisor keeps them up to date.
-pub fn table(apic_id: u32, num_cpus: u32) -> Vec<CpuidEntry> {
+pub(crate) fn table(apic_id: u32, num_cpus: u32) -> Vec<CpuidEntry> {
     let mut entries = Vec::new();
     let mut push = |function: u32, index: u32, significant_index: bool| {
         let [eax, ebx, ecx, edx] = emulate(function, index, apic_id, num_cpus);
