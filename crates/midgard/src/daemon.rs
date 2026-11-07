@@ -254,10 +254,7 @@ impl Instances {
 fn run_instance(name: &str, running: &Running) {
     let reason = match boot_instance(name, running) {
         Ok(reason) => reason,
-        Err(error) => format!(
-            "{error:#} (its console: {})",
-            runtime::console_log(name).display()
-        ),
+        Err(error) => format!("{error:#} (its console: bifrost log {name})"),
     };
     log!("{name}: {reason}");
     running.set(State::Gone(format!("{name}: {reason}")));

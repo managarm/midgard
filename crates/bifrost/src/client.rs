@@ -1,9 +1,9 @@
 //! Talking to midgard (on its socket, see [`midgard_protocol::control`]): runs commands
-//! (or a login shell) in a VM instance and stops VMs. midgard starts an instance's VM
+//! (or a login shell) in a VM instance, stops VMs and shows their console logs. midgard starts an instance's VM
 //! for the first session with it; the VM stays up for later commands.
 
 use std::fs::File;
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -59,6 +59,46 @@ fn ask(request: control::Request) -> Result<control::Response> {
         Some(control::Response::Error(message)) => bail!("{message}"),
         Some(response) => Ok(response),
         None => bail!("midgard closed the connection"),
+    }
+}
+
+/// Prints the console log of the VM of `name`; with `follow`, keeps printing what is
+/// written to it (from the start again when its VM starts again).
+pub fn log(name: &str, follow: bool) -> Result<i32> {
+    let path = runtime::console_log(name);
+    let mut file = match File::open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            bail!("{name} has no console log (it did not run since the host booted)")
+        }
+        Err(error) => return Err(error).with_context(|| format!("failed to open {path:?}")),
+    };
+    let mut stdout = io::stdout().lock();
+    let mut buffer = vec![0u8; 64 * 1024];
+    let mut position = 0u64;
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count > 0 {
+            position += count as u64;
+            match stdout
+                .write_all(&buffer[..count])
+                .and_then(|()| stdout.flush())
+            {
+                Ok(()) => continue,
+                // E.g., `bifrost log | head`.
+                Err(error) if error.kind() == io::ErrorKind::BrokenPipe => return Ok(0),
+                Err(error) => return Err(error.into()),
+            }
+        }
+        if !follow {
+            return Ok(0);
+        }
+        // The VM's next start truncates the log.
+        if file.metadata()?.len() < position {
+            file.rewind()?;
+            position = 0;
+        }
+        std::thread::sleep(Duration::from_millis(200));
     }
 }
 
