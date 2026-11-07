@@ -63,6 +63,7 @@ pub(crate) struct Ram {
 
 // SAFETY: The mapping is only accessed through raw pointers.
 unsafe impl Send for Ram {}
+// SAFETY: Ram has no methods that take `&self`; it only unmaps the memory on drop.
 unsafe impl Sync for Ram {}
 
 impl Drop for Ram {

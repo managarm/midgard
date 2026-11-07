@@ -32,6 +32,8 @@ enum Owner {
 // SAFETY: Guest memory is shared with the guest (which runs concurrently anyway);
 // we only access it through raw pointers.
 unsafe impl Send for GuestMemory {}
+// SAFETY: All accessors take `&self` and go through raw pointers, so concurrent calls
+// are no different from the guest accessing the memory concurrently.
 unsafe impl Sync for GuestMemory {}
 
 impl GuestMemory {
