@@ -13,7 +13,11 @@ exclude = ["crates/midgard-init"]
 
 [workspace.dependencies]
 anyhow = "1.0"
+async-channel = "2.5.0"
+async-executor = "1.14.1"
+async-io = "2.6.0"
 clap = { version = "4.6.7", features = ["derive"] }
+futures-lite = "2.6.1"
 libc = "0.2"
 thiserror = "2"
 zerocopy = { version = "0.8", features = ["derive"] }

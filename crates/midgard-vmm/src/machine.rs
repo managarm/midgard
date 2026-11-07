@@ -89,5 +89,6 @@ pub fn describe(stop: Stop) -> &'static str {
     match stop {
         Stop::Reset => "the guest reset the machine",
         Stop::PowerOff => "the guest powered off",
+        Stop::Requested => "the VM was stopped",
     }
 }

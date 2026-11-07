@@ -7,6 +7,10 @@ license = "MIT"
 
 [dependencies]
 anyhow.workspace = true
+async-channel.workspace = true
+async-executor.workspace = true
+async-io.workspace = true
 clap.workspace = true
-midgard-protocol.workspace = true
+libc.workspace = true
+midgard-protocol = { workspace = true, features = ["async"] }
 midgard-vmm.workspace = true

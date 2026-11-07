@@ -1,60 +1,211 @@
-//! midgard: runs Linux in lightweight VMs on managarm (see [`midgard_vmm`]). bifrost
-//! decides how a VM looks and launches midgard with its configuration (see
-//! [`midgard_protocol`]); `bifrost --boot` runs a VM in the foreground.
+//! midgard: runs Linux in lightweight VMs on managarm (see [`midgard_vmm`]). It is a
+//! daemon that systemd starts through socket activation (see the unit files in
+//! `systemd/`) once bifrost connects to its socket; bifrost decides how a VM looks and
+//! asks midgard to run it (see [`midgard_protocol::control`]).
+//!
+//! The connections to bifrost are tasks on one executor ([`EXECUTOR`], on the main
+//! thread). Each VM runs on a thread of its own, which reports to the connection's task
+//! through a channel (see [`Event`]).
 
-use std::fs::File;
+use std::io::{self, Write};
 use std::os::fd::{FromRawFd, RawFd};
+use std::os::unix::fs::DirBuilderExt;
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::sync::Arc;
 
-use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
-use midgard_protocol::MachineConfig;
-use midgard_vmm::{log, machine};
+use anyhow::{Context, Result, bail};
+use async_executor::Executor;
+use async_io::Async;
+use clap::Parser;
+use midgard_protocol::control::{Request, Response};
+use midgard_protocol::nonblocking::{read_message, write_message};
+use midgard_protocol::{MachineConfig, runtime};
+use midgard_vmm::{Vm, log, machine};
 
-/// Runs Linux VMs (bifrost launches it).
+/// The daemon that runs Linux VMs for bifrost (systemd starts it when bifrost connects
+/// to its socket).
 #[derive(Parser)]
 #[command(version)]
-struct Cli {
-    #[command(subcommand)]
-    command: Command,
+struct Cli {}
+
+/// Runs the connections to bifrost.
+static EXECUTOR: Executor<'static> = Executor::new();
+
+/// The first file descriptor that systemd passes (see sd_listen_fds(3)).
+const LISTEN_FDS_START: RawFd = 3;
+/// Console output that we buffer (in messages) before the guest has to wait for bifrost.
+const CONSOLE_QUEUE: usize = 256;
+
+/// The socket that systemd passes us (socket activation), if it does.
+fn systemd_listener() -> Result<Option<UnixListener>> {
+    let pid = std::env::var("LISTEN_PID").ok();
+    let fds = std::env::var("LISTEN_FDS").ok();
+    if pid.and_then(|pid| pid.parse::<u32>().ok()) != Some(std::process::id()) {
+        return Ok(None);
+    }
+    // SAFETY: We have not started any threads yet.
+    unsafe {
+        std::env::remove_var("LISTEN_PID");
+        std::env::remove_var("LISTEN_FDS");
+        std::env::remove_var("LISTEN_FDNAMES");
+    }
+    if fds.as_deref() != Some("1") {
+        bail!("systemd must pass exactly one socket (LISTEN_FDS={fds:?})");
+    }
+    // Do not leak the socket into processes that we start.
+    // SAFETY: fcntl() only takes a file descriptor.
+    if unsafe { libc::fcntl(LISTEN_FDS_START, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+        return Err(io::Error::last_os_error()).context("the socket from systemd is invalid");
+    }
+    // SAFETY: systemd passes us the listening socket; nothing else uses it.
+    Ok(Some(unsafe { UnixListener::from_raw_fd(LISTEN_FDS_START) }))
 }
 
-#[derive(Subcommand)]
-enum Command {
-    /// Boot a VM in the foreground (for `bifrost --boot`)
-    Boot {
-        /// The file descriptor on which bifrost passes the VM's configuration
-        #[arg(long, value_name = "FD", value_parser = clap::value_parser!(RawFd).range(3..))]
-        config_fd: RawFd,
-    },
+/// Listens on our socket ourselves (if midgard runs without systemd).
+fn own_listener() -> Result<UnixListener> {
+    let socket = runtime::daemon_socket();
+    if UnixStream::connect(&socket).is_ok() {
+        bail!("midgard is running already ({})", socket.display());
+    }
+    if let Some(dir) = socket.parent() {
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+            .with_context(|| format!("failed to create {}", dir.display()))?;
+    }
+    let _ = std::fs::remove_file(&socket);
+    UnixListener::bind(&socket).with_context(|| format!("failed to listen on {}", socket.display()))
 }
 
-/// Reads the VM's configuration from the file descriptor that bifrost passed.
-fn read_config(fd: RawFd) -> Result<MachineConfig> {
-    // SAFETY: bifrost passes the file descriptor to us; nothing else uses it.
-    let mut file = unsafe { File::from_raw_fd(fd) };
-    midgard_protocol::read_message(&mut file)
-        .context("failed to read the VM configuration")?
-        .context("bifrost did not pass a VM configuration")
+/// What a VM's thread tells the task of its connection.
+enum Event {
+    /// The VM exists (its console may have written before).
+    Started(Arc<Vm>),
+    /// Output of the VM's console.
+    Console(Vec<u8>),
+    /// The VM stopped (why), or did not start.
+    Stopped(Result<String>),
 }
 
-/// Boots a VM with its console on stdin / stdout.
-fn boot(config_fd: RawFd) -> Result<()> {
-    let config = read_config(config_fd)?;
-    let machine = machine::start(&config, Box::new(std::io::stdout()))?;
-    let vm = machine.vm.clone();
-    let result = machine.run();
-    vm.flush_console();
-    log!("{}", machine::describe(result?));
+/// The VM's console: [`Event::Console`]s for the connection's task. The guest waits
+/// while the queue is full (like for a slow serial line).
+struct Console(async_channel::Sender<Event>);
+
+impl Write for Console {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        self.0
+            .send_blocking(Event::Console(data.to_vec()))
+            .map_err(|_| io::ErrorKind::BrokenPipe)?;
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Runs a VM on this (its own) thread until it stops.
+fn run_vm(config: &MachineConfig, events: async_channel::Sender<Event>) {
+    let console = Console(events.clone());
+    let result = machine::start(config, Box::new(console)).and_then(|machine| {
+        let vm = machine.vm.clone();
+        let _ = events.send_blocking(Event::Started(vm.clone()));
+        let result = machine.run();
+        vm.flush_console();
+        Ok(machine::describe(result?).to_string())
+    });
+    let _ = events.send_blocking(Event::Stopped(result));
+}
+
+/// Stops the VM when bifrost closes the connection.
+async fn watch(stream: Arc<Async<UnixStream>>, vm: Arc<Vm>) {
+    let _ = read_message::<Request>(&mut &*stream).await;
+    vm.stop();
+}
+
+/// Runs a VM until it stops (or bifrost goes away); returns why it stopped.
+async fn boot(stream: &Arc<Async<UnixStream>>, config: MachineConfig) -> Result<String> {
+    let (sender, events) = async_channel::bounded(CONSOLE_QUEUE);
+    std::thread::Builder::new()
+        .name("vm".into())
+        .spawn(move || run_vm(&config, sender))
+        .context("failed to start the VM's thread")?;
+    let mut watcher = None;
+    while let Ok(event) = events.recv().await {
+        match event {
+            Event::Started(vm) => watcher = Some(EXECUTOR.spawn(watch(stream.clone(), vm))),
+            Event::Console(mut data) => {
+                // Send what has piled up in one message.
+                while let Ok(Event::Console(more)) = events.try_recv() {
+                    data.extend_from_slice(&more);
+                }
+                // If bifrost is gone, the watcher stops the VM.
+                let _ = write_message(&mut &**stream, &Response::Console(data)).await;
+            }
+            Event::Stopped(result) => {
+                drop(watcher);
+                return result;
+            }
+        }
+    }
+    bail!("the VM's thread exited")
+}
+
+/// Serves one connection from bifrost.
+async fn serve(stream: Async<UnixStream>) -> Result<()> {
+    let stream = Arc::new(stream);
+    let Some(request) = read_message::<Request>(&mut &*stream).await? else {
+        return Ok(());
+    };
+    let response = match request {
+        Request::Boot(config) => {
+            let kernel = config.kernel.display().to_string();
+            match boot(&stream, config).await {
+                Ok(reason) => {
+                    log!("{kernel}: {reason}");
+                    Response::Stopped(reason)
+                }
+                Err(error) => {
+                    log!("{kernel}: {error:#}");
+                    Response::Error(format!("{error:#}"))
+                }
+            }
+        }
+    };
+    // bifrost may be gone already (which stopped the VM).
+    let _ = write_message(&mut &*stream, &response).await;
     Ok(())
 }
 
-fn main() {
-    let cli = Cli::parse();
-    let result = match cli.command {
-        Command::Boot { config_fd } => boot(config_fd),
-    };
-    if let Err(error) = result {
-        log!("{error:#}");
-        std::process::exit(1);
+/// Accepts connections from bifrost; each one becomes a task.
+async fn accept(listener: Async<UnixListener>) {
+    loop {
+        match listener.accept().await {
+            Ok((stream, _)) => EXECUTOR
+                .spawn(async move {
+                    if let Err(error) = serve(stream).await {
+                        log!("{error:#}");
+                    }
+                })
+                .detach(),
+            Err(error) => log!("failed to accept a connection: {error}"),
+        }
     }
+}
+
+fn main() {
+    Cli::parse();
+    let listener = systemd_listener()
+        .transpose()
+        .unwrap_or_else(own_listener)
+        .and_then(|listener| Ok(Async::new(listener)?));
+    let listener = match listener {
+        Ok(listener) => listener,
+        Err(error) => {
+            log!("{error:#}");
+            std::process::exit(1);
+        }
+    };
+    async_io::block_on(EXECUTOR.run(accept(listener)));
 }

@@ -1,0 +1,13 @@
+# The socket that bifrost connects to; the first connection starts midgard.service.
+# See midgard.service for how to install both.
+
+[Unit]
+Description=midgard VM daemon socket
+
+[Socket]
+ListenStream=%t/midgard/midgard.sock
+SocketMode=0600
+DirectoryMode=0700
+
+[Install]
+WantedBy=sockets.target

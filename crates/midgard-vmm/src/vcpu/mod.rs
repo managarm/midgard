@@ -50,6 +50,7 @@ impl Vcpu {
         let backend = vm
             .hypervisor()
             .create_vcpu(id, &cpuid::table(id, vm.num_cpus))?;
+        vm.add_kicker(backend.kicker());
         let kvmclock = Kvmclock::new(vm.tsc_hz);
         Ok(Self {
             id,
@@ -92,7 +93,8 @@ impl Vcpu {
             } => self.port_io(port, size, input, string, data)?,
             Exit::Rdmsr { index } => Handled::Complete(self.rdmsr(index)?),
             Exit::Wrmsr { index, value } => Handled::Complete(self.wrmsr(index, value)?),
-            // E.g., a signal interrupted the run.
+            // E.g., a signal interrupted the run, or the VM stops.
+            Exit::Kicked if self.vm.stopping() => Handled::Stop(Stop::Requested),
             Exit::Kicked => {
                 // A failure was reported when the guest set the MSR.
                 let _ = self.kvmclock.update(&self.vm.memory);

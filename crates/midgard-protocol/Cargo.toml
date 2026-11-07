@@ -2,9 +2,14 @@
 name = "midgard-protocol"
 version = "0.1.0"
 edition = "2024"
-description = "The interface between bifrost and midgard (the VMs' configuration and how it is sent)"
+description = "The interface between bifrost and midgard (the VMs' configuration and the control protocol)"
 license = "MIT"
 
+[features]
+# Message I/O on futures' AsyncRead / AsyncWrite.
+async = ["dep:futures-lite"]
+
 [dependencies]
+futures-lite = { version = "2.6", optional = true }
 postcard = { version = "1.1", features = ["use-std"] }
 serde = { version = "1.0", features = ["derive"] }

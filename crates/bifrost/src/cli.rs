@@ -69,7 +69,7 @@ pub struct Actions {
     #[arg(long)]
     log: bool,
 
-    /// Boot a VM in the foreground, with its console on stdin / stdout (for debugging)
+    /// Boot a VM in the foreground, with its console on stdout (for debugging)
     #[arg(long, conflicts_with = "distro", group = "sized")]
     boot: bool,
 }

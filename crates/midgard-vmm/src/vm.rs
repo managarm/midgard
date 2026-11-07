@@ -5,7 +5,7 @@ use std::io::Write;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use midgard_hv::{GuestMemory, Hypervisor};
+use midgard_hv::{GuestMemory, Hypervisor, Kicker};
 
 use crate::devices::pm1::{self, Pm1};
 use crate::devices::serial::{self, Serial};
@@ -21,6 +21,8 @@ pub enum Stop {
     Reset,
     /// The guest entered S5 (ACPI poweroff).
     PowerOff,
+    /// We stopped the VM (see [`Vm::stop`]).
+    Requested,
 }
 
 /// Problems that are reported once (see [`ReportOnce`]).
@@ -44,6 +46,10 @@ pub struct Vm {
     /// The level of the serial port's interrupt line.
     serial_irq: AtomicBool,
     pm1: Mutex<Pm1>,
+    /// The vCPUs' kickers (see [`Vm::stop`]).
+    kickers: Mutex<Vec<Kicker>>,
+    /// [`Vm::stop`] was called.
+    stopping: AtomicBool,
     reported: ReportOnce<Unhandled>,
 }
 
@@ -64,6 +70,8 @@ impl Vm {
             serial: Mutex::new(Serial::new(console)),
             serial_irq: AtomicBool::new(false),
             pm1: Mutex::new(Pm1::default()),
+            kickers: Mutex::new(Vec::new()),
+            stopping: AtomicBool::new(false),
             reported: ReportOnce::new(),
         }
     }
@@ -71,6 +79,24 @@ impl Vm {
     /// The VM in the hypervisor (e.g., for creating vCPUs).
     pub fn hypervisor(&self) -> &Hypervisor {
         &self.hypervisor
+    }
+
+    /// Lets [`Vm::stop`] kick a vCPU.
+    pub(crate) fn add_kicker(&self, kicker: Kicker) {
+        self.kickers.lock().unwrap().push(kicker);
+    }
+
+    /// Makes all vCPUs stop with [`Stop::Requested`] (from any thread).
+    pub fn stop(&self) {
+        self.stopping.store(true, Ordering::SeqCst);
+        for kicker in self.kickers.lock().unwrap().iter() {
+            kicker.kick();
+        }
+    }
+
+    /// Whether [`Vm::stop`] was called.
+    pub(crate) fn stopping(&self) -> bool {
+        self.stopping.load(Ordering::SeqCst)
     }
 
     fn set_irq_line(&self, pin: usize, level: bool) {

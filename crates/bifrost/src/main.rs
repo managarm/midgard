@@ -21,10 +21,10 @@ fn main() -> ExitCode {
         }
     };
     match cli.action() {
-        cli::Action::Boot => {
-            let Err(error) = boot::boot(&cli);
-            eprintln!("bifrost: {error:#}");
-        }
+        cli::Action::Boot => match boot::boot(&cli) {
+            Ok(()) => return ExitCode::SUCCESS,
+            Err(error) => eprintln!("bifrost: {error:#}"),
+        },
         action => eprintln!("bifrost: not implemented yet: {action:?}"),
     }
     ExitCode::from(EXIT_FAILURE)
