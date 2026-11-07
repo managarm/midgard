@@ -140,6 +140,7 @@ mod tests {
                 path: "/var/lib/midgard/alpine.qcow2".into(),
                 read_only: false,
             }],
+            network: true,
         };
         let mut stream = Vec::new();
         write_message(&mut stream, &config).unwrap();

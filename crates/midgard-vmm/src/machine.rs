@@ -67,10 +67,10 @@ fn create_devices(config: &MachineConfig) -> Result<Devices> {
     let mut list = DeviceList::default();
     // The agent talks to us over vsock.
     let vsock = config.agent.is_some().then(|| list.add(Vsock::default()));
-    let network = {
+    let network = config.network.then(|| {
         let (handle, from_guest) = net::channel();
-        Some((list.add(VirtioNet::new(net::GUEST_MAC, handle)), from_guest))
-    };
+        (list.add(VirtioNet::new(net::GUEST_MAC, handle)), from_guest)
+    });
     let mut disks = Vec::new();
     for (index, disk) in config.disks.iter().enumerate() {
         let image = image::open(&disk.path, disk.read_only)

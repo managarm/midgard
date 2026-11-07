@@ -48,6 +48,7 @@ fn config(boot: &BootArgs) -> Result<MachineConfig> {
         memory: boot.memory.unwrap_or(DEFAULT_MEMORY),
         cpus: boot.cpus.unwrap_or_else(default_cpus),
         disks,
+        network: !boot.no_network,
     })
 }
 
@@ -96,5 +97,6 @@ mod tests {
         assert_eq!(config.memory, DEFAULT_MEMORY);
         assert!((1..=DEFAULT_MAX_CPUS).contains(&config.cpus));
         assert!(config.disks.is_empty());
+        assert!(config.network);
     }
 }
