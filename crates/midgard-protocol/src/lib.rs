@@ -1,5 +1,5 @@
 //! The interface between bifrost (the CLI) and midgard (the VMM daemon): bifrost decides
-//! how a VM looks ([`MachineConfig`]) and asks midgard to run it (see [`control`]) on
+//! how a VM looks ([`machine::MachineConfig`]) and asks midgard to run it (see [`control`]) on
 //! midgard's socket (see [`runtime`]).
 //!
 //! Each message is a frame: a little-endian u32 length and the message in postcard.
@@ -13,10 +13,8 @@ use std::io::{self, Read, Write};
 use serde::{Serialize, de::DeserializeOwned};
 
 pub mod control;
-mod machine;
+pub mod machine;
 pub mod runtime;
-
-pub use machine::MachineConfig;
 
 /// Frames larger than this are rejected.
 pub const MAX_FRAME: usize = 1 << 20;
@@ -106,6 +104,7 @@ pub mod nonblocking {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::machine::MachineConfig;
 
     #[test]
     fn machine_config_round_trip() {

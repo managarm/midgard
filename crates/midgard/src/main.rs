@@ -18,8 +18,9 @@ use async_executor::Executor;
 use async_io::Async;
 use clap::Parser;
 use midgard_protocol::control::{Request, Response};
+use midgard_protocol::machine::MachineConfig;
 use midgard_protocol::nonblocking::{read_message, write_message};
-use midgard_protocol::{MachineConfig, runtime};
+use midgard_protocol::runtime;
 use midgard_vmm::MachineHandle;
 
 /// Prints a message (like `eprintln!`) with midgard's prefix; it goes to the console log.

@@ -3,7 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::MachineConfig;
+use crate::machine::MachineConfig;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Request {

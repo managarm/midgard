@@ -6,7 +6,7 @@ use std::path::Path;
 use std::sync::{Arc, Weak};
 
 use anyhow::{Context, Result, bail};
-use midgard_protocol::MachineConfig;
+use midgard_protocol::machine::MachineConfig;
 
 use crate::board::Board;
 use crate::logging::log;

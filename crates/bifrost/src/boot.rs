@@ -7,7 +7,8 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use midgard_protocol::control::{Request, Response};
-use midgard_protocol::{MachineConfig, runtime};
+use midgard_protocol::machine::MachineConfig;
+use midgard_protocol::runtime;
 
 use crate::cli::BootArgs;
 
