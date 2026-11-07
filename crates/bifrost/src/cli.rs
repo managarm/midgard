@@ -50,12 +50,11 @@ pub enum Action {
 
 #[derive(Debug, Args)]
 pub struct RunArgs {
-    /// The VM [default: the configured default VM]
-    #[arg(short = 'd', long, value_name = "NAME")]
-    pub distro: Option<String>,
+    /// The VM instance [default: alpine]
+    #[arg(long, value_name = "NAME")]
+    pub vm: Option<String>,
 
-    /// The working directory in the guest [default: the current working directory
-    /// through the shared directory mount]
+    /// The working directory in the guest [default: root's home directory]
     #[arg(short = 'C', long = "cd", value_name = "DIR")]
     pub cwd: Option<String>,
 
@@ -124,20 +123,18 @@ pub struct DeleteArgs {
 
 #[derive(Debug, Args)]
 pub struct ShutdownArgs {
-    /// The VM instance [default: the configured default VM]
-    #[arg(short = 'd', long, value_name = "NAME")]
-    pub distro: Option<String>,
+    /// The VM instance [default: alpine]
+    pub name: Option<String>,
 
     /// Stop all VM instances
-    #[arg(long, conflicts_with = "distro")]
+    #[arg(long, conflicts_with = "name")]
     pub all: bool,
 }
 
 #[derive(Debug, Args)]
 pub struct LogArgs {
-    /// The VM instance [default: the configured default VM]
-    #[arg(short = 'd', long, value_name = "NAME")]
-    pub distro: Option<String>,
+    /// The VM instance [default: alpine]
+    pub name: Option<String>,
 
     /// Keep printing as the console gets written to
     #[arg(short = 'f', long)]
@@ -150,9 +147,13 @@ pub struct BootArgs {
     #[arg(long, value_name = "FILE")]
     pub kernel: PathBuf,
 
-    /// An initrd
-    #[arg(long, value_name = "FILE")]
+    /// An initrd (instead of midgard-init)
+    #[arg(long, value_name = "FILE", conflicts_with = "agent")]
     pub initrd: Option<PathBuf>,
+
+    /// Boot midgard-init from FILE as the guest's agent
+    #[arg(long, value_name = "FILE")]
+    pub agent: Option<PathBuf>,
 
     /// Replace the base kernel parameters
     #[arg(long, value_name = "ARGS", allow_hyphen_values = true)]
@@ -205,7 +206,6 @@ impl RunArgs {
     }
 
     /// Whether the command runs on a pseudo terminal (`None`: decide from stdin / stdout).
-    #[expect(dead_code, reason = "the tty options are not wired up yet")]
     pub fn tty(&self) -> Option<bool> {
         if self.tty {
             Some(true)
@@ -263,10 +263,13 @@ mod tests {
 
     #[test]
     fn run() {
-        let cli = parse(&["-d", "alpine", "ls", "-la", "--color"]).unwrap();
+        let cli = parse(&["--vm", "dev", "ls", "-la", "--color"]).unwrap();
         assert!(cli.action.is_none());
-        assert_eq!(cli.run.distro.as_deref(), Some("alpine"));
+        assert_eq!(cli.run.vm.as_deref(), Some("dev"));
         assert_eq!(cli.run.command, ["ls", "-la", "--color"]);
+        // The VM is not an argument (that would be the command).
+        assert_eq!(parse(&["dev", "ls"]).unwrap().run.command, ["dev", "ls"]);
+        assert!(parse(&["-d", "dev", "ls"]).is_err());
     }
 
     #[test]
@@ -352,6 +355,16 @@ mod tests {
     }
 
     #[test]
+    fn boot_agent() {
+        let cli = parse(&["boot", "--kernel", "bzImage", "--agent", "midgard-init"]).unwrap();
+        let Some(Action::Boot(boot)) = cli.action else {
+            panic!("not boot: {:?}", cli.action);
+        };
+        assert_eq!(boot.agent, Some(PathBuf::from("midgard-init")));
+        assert!(parse(&["boot", "--kernel", "k", "--agent", "a", "--initrd", "i"]).is_err());
+    }
+
+    #[test]
     fn boot_needs_a_kernel() {
         assert!(parse(&["boot"]).is_err());
     }
@@ -375,8 +388,29 @@ mod tests {
     }
 
     #[test]
-    fn shutdown_all_conflicts_with_distro() {
+    fn shutdown() {
+        let cli = parse(&["shutdown", "dev"]).unwrap();
+        let Some(Action::Shutdown(shutdown)) = cli.action else {
+            panic!("not shutdown: {:?}", cli.action);
+        };
+        assert_eq!(shutdown.name.as_deref(), Some("dev"));
+        assert!(!shutdown.all);
         assert!(parse(&["shutdown", "--all"]).is_ok());
-        assert!(parse(&["shutdown", "--all", "-d", "alpine"]).is_err());
+        assert!(parse(&["shutdown", "--all", "dev"]).is_err());
+    }
+
+    #[test]
+    fn log() {
+        let cli = parse(&["log", "-f", "dev"]).unwrap();
+        let Some(Action::Log(log)) = cli.action else {
+            panic!("not log: {:?}", cli.action);
+        };
+        assert_eq!(log.name.as_deref(), Some("dev"));
+        assert!(log.follow);
+        let cli = parse(&["log"]).unwrap();
+        let Some(Action::Log(log)) = cli.action else {
+            panic!("not log: {:?}", cli.action);
+        };
+        assert_eq!(log.name, None);
     }
 }

@@ -2,7 +2,7 @@
 name = "midgard-protocol"
 version = "0.1.0"
 edition = "2024"
-description = "The interface between bifrost and midgard (the VMs' configuration and the control protocol)"
+description = "The interface between bifrost, midgard and its guest agent (the VMs' configuration, the control and session protocols and shared constants)"
 license = "MIT"
 
 [features]

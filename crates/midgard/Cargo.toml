@@ -11,6 +11,8 @@ async-channel.workspace = true
 async-executor.workspace = true
 async-io.workspace = true
 clap.workspace = true
+event-listener.workspace = true
+futures-lite.workspace = true
 libc.workspace = true
 midgard-protocol = { workspace = true, features = ["async"] }
 midgard-vmm.workspace = true

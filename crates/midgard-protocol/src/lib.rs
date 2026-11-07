@@ -1,10 +1,12 @@
-//! The interface between bifrost (the CLI) and midgard (the VMM daemon): bifrost decides
-//! how a VM looks ([`machine::MachineConfig`]) and asks midgard to run it (see [`control`]) on
-//! midgard's socket (see [`runtime`]).
+//! The interface between bifrost (the CLI), midgard (the VMM daemon) and the guest
+//! agent (midgard-init): bifrost decides how a VM looks ([`machine::MachineConfig`]) and
+//! asks midgard to run it (see [`control`]) on midgard's socket (see [`runtime`]);
+//! bifrost and the agent speak the session protocol (see [`session`]). It also has the
+//! constants that both sides of the VM need to agree on.
 //!
 //! Each message is a frame: a little-endian u32 length and the message in postcard.
-//! bifrost and midgard come from the same installation, so the encoding does not need
-//! to be self-describing.
+//! bifrost, midgard and the agent come from the same installation, so the encoding does
+//! not need to be self-describing.
 
 #![warn(unreachable_pub)]
 
@@ -15,6 +17,23 @@ use serde::{Serialize, de::DeserializeOwned};
 pub mod control;
 pub mod machine;
 pub mod runtime;
+pub mod session;
+
+/// The vsock CID of the host (midgard itself).
+pub const HOST_CID: u32 = 2;
+/// The vsock CID of the guest.
+pub const GUEST_CID: u32 = 3;
+
+/// The vsock port that the agent listens on.
+pub const AGENT_PORT: u32 = 1024;
+
+/// Kernel parameters that midgard passes to the agent.
+pub mod param {
+    /// The root file system's device.
+    pub const ROOT: &str = "midgard.root";
+    /// The root file system's type (default: ext4).
+    pub const ROOT_FSTYPE: &str = "midgard.rootfstype";
+}
 
 /// Frames larger than this are rejected.
 pub const MAX_FRAME: usize = 1 << 20;
@@ -105,12 +124,14 @@ pub mod nonblocking {
 mod tests {
     use super::*;
     use crate::machine::{Disk, MachineConfig};
+    use crate::session::{Exec, Request, Response, WindowSize};
 
     #[test]
     fn machine_config_round_trip() {
         let config = MachineConfig {
             kernel: "/boot/bzImage".into(),
-            initrd: Some("/boot/initrd".into()),
+            initrd: None,
+            agent: Some("/usr/lib/midgard/midgard-init".into()),
             cmdline: None,
             append: vec!["quiet".into(), "loglevel=3".into()],
             memory: 2 << 30,
@@ -133,6 +154,9 @@ mod tests {
         let responses = [
             control::Response::Console(b"Linux version".to_vec()),
             control::Response::Stopped("the guest powered off".into()),
+            control::Response::Starting,
+            control::Response::Ready,
+            control::Response::Running(vec!["alpine".into()]),
             control::Response::Error("no such file".into()),
         ];
         for response in &responses {
@@ -145,6 +169,17 @@ mod tests {
     }
 
     #[test]
+    fn control_requests() {
+        let mut stream = Vec::new();
+        let request = control::Request::Session {
+            name: "alpine".into(),
+            start: true,
+        };
+        write_message(&mut stream, &request).unwrap();
+        assert_eq!(read_message(&mut stream.as_slice()).unwrap(), Some(request));
+    }
+
+    #[test]
     fn truncated_frames() {
         let mut stream = Vec::new();
         write_message(&mut stream, &42u32).unwrap();
@@ -152,5 +187,57 @@ mod tests {
             let error = read_message::<u32>(&mut &stream[..length]).unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
         }
+    }
+
+    fn round_trip_request(request: Request) {
+        let mut buffer = Vec::new();
+        write_message(&mut buffer, &request).unwrap();
+        let mut reader = &buffer[..];
+        assert_eq!(read_message(&mut reader).unwrap(), Some(request));
+        assert_eq!(read_message::<Request>(&mut reader).unwrap(), None);
+    }
+
+    fn round_trip_response(response: Response) {
+        let mut buffer = Vec::new();
+        write_message(&mut buffer, &response).unwrap();
+        assert_eq!(read_message(&mut &buffer[..]).unwrap(), Some(response));
+    }
+
+    #[test]
+    fn session_requests() {
+        round_trip_request(Request::Exec(Exec {
+            argv: vec!["ls".into(), "-l".into()],
+            env: vec![("TERM".into(), "xterm".into())],
+            cwd: Some("/root".into()),
+            tty: Some(WindowSize { rows: 24, cols: 80 }),
+        }));
+        round_trip_request(Request::Stdin(b"hello".to_vec()));
+        round_trip_request(Request::StdinEof);
+        round_trip_request(Request::Resize(WindowSize { rows: 1, cols: 2 }));
+        round_trip_request(Request::Signal(15));
+        round_trip_request(Request::Shutdown);
+        round_trip_request(Request::Ping);
+    }
+
+    #[test]
+    fn session_responses() {
+        round_trip_response(Response::Started { pid: 42 });
+        round_trip_response(Response::Stdout(vec![0, 1, 2]));
+        round_trip_response(Response::Exited {
+            code: None,
+            signal: Some(9),
+        });
+        round_trip_response(Response::Error("no such file".into()));
+        round_trip_response(Response::Pong);
+    }
+
+    #[test]
+    fn rejects_garbage() {
+        // A frame whose payload is not a request.
+        assert!(read_message::<Request>(&mut &[1u8, 0, 0, 0, 99][..]).is_err());
+        // A truncated frame.
+        assert!(read_message::<Request>(&mut &[8u8, 0, 0, 0, 0][..]).is_err());
+        // Too large.
+        assert!(read_message::<Request>(&mut &[0u8, 0, 0, 0x7F][..]).is_err());
     }
 }

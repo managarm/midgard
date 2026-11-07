@@ -15,6 +15,8 @@ use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout};
 
 use crate::platform::{ACPI_TABLES, HIGH_MEMORY, LEGACY_HOLE};
 
+pub(crate) mod initramfs;
+
 // Guest-physical layout of the boot structures (all below 1 MiB).
 const GDT_ADDRESS: u64 = 0x500;
 const ZERO_PAGE_ADDRESS: u64 = 0x7000;
