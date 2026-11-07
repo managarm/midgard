@@ -45,3 +45,6 @@ const _: () = {
     assert!(IOAPIC_BASE + IOAPIC_SIZE <= LAPIC_BASE);
     assert!(LAPIC_BASE + LAPIC_SIZE <= midgard_hv::RESERVED_BASE);
 };
+
+/// The most vCPUs: the guest kernel's NR_CPUS (APIC IDs are also 8 bits in the MADT).
+pub(crate) const MAX_CPUS: u32 = 64;

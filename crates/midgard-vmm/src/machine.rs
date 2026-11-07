@@ -20,6 +20,12 @@ const BASE_CMDLINE: &str = "pci=off reboot=k panic=-1";
 
 /// Checks that midgard can run the VM.
 fn validate(config: &MachineConfig) -> Result<()> {
+    if config.cpus == 0 || config.cpus > platform::MAX_CPUS {
+        bail!(
+            "the number of vCPUs must be between 1 and {}",
+            platform::MAX_CPUS
+        );
+    }
     if !config.memory.is_multiple_of(4096) || config.memory < (64 << 20) {
         bail!("guest memory must be a multiple of 4 KiB and at least 64 MiB");
     }
@@ -177,15 +183,20 @@ pub fn start(config: &MachineConfig, console: Box<dyn Write + Send>) -> Result<M
     let (hypervisor, memory) = midgard_hv::create(config.memory)?;
     let entry = boot::load(&memory, &kernel, initrd.as_deref(), &cmdline)?;
     drop((kernel, initrd));
-    acpi::write(&memory, platform::ACPI_TABLES, 1).context("failed to write the ACPI tables")?;
+    acpi::write(&memory, platform::ACPI_TABLES, config.cpus)
+        .context("failed to write the ACPI tables")?;
 
-    let board = Arc::new(Board::new(memory, 1, tsc_hz, hypervisor, console));
-    let mut vcpus = vec![vcpu::Vcpu::new(board.clone(), 0)?];
+    let board = Arc::new(Board::new(memory, config.cpus, tsc_hz, hypervisor, console));
+    let mut vcpus = Vec::new();
+    for id in 0..config.cpus {
+        vcpus.push(vcpu::Vcpu::new(board.clone(), id)?);
+    }
     vcpus[0].set_registers(&boot::entry_registers(&entry))?;
 
     log!(
-        "booting {} with {} MiB of memory: {cmdline}",
+        "booting {} with {} vCPU(s) and {} MiB of memory: {cmdline}",
         config.kernel.display(),
+        config.cpus,
         config.memory >> 20,
     );
     spawn_vcpus(board, vcpus)

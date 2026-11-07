@@ -17,4 +17,6 @@ pub struct MachineConfig {
     pub append: Vec<String>,
     /// The guest's RAM in bytes.
     pub memory: u64,
+    /// The number of vCPUs.
+    pub cpus: u32,
 }

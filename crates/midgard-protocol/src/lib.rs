@@ -114,6 +114,7 @@ mod tests {
             cmdline: None,
             append: vec!["quiet".into(), "loglevel=3".into()],
             memory: 2 << 30,
+            cpus: 4,
         };
         let mut stream = Vec::new();
         write_message(&mut stream, &config).unwrap();

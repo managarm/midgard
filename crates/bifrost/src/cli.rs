@@ -164,6 +164,10 @@ pub struct BootArgs {
     /// The VM's memory, e.g. 2G
     #[arg(long, value_name = "SIZE", value_parser = parse_size)]
     pub memory: Option<u64>,
+
+    /// The number of vCPUs [default: the host's CPUs, up to 8]
+    #[arg(long, value_name = "N")]
+    pub cpus: Option<u32>,
 }
 
 impl Cli {
@@ -283,6 +287,7 @@ mod tests {
     fn boot() {
         let cli = parse(&[
             "boot", "--kernel", "bzImage", "--append", "quiet", "--append", "-v", "--memory", "2G",
+            "--cpus", "4",
         ])
         .unwrap();
         let Some(Action::Boot(boot)) = cli.action else {
@@ -291,6 +296,7 @@ mod tests {
         assert_eq!(boot.kernel, PathBuf::from("bzImage"));
         assert_eq!(boot.append, ["quiet", "-v"]);
         assert_eq!(boot.memory, Some(2 << 30));
+        assert_eq!(boot.cpus, Some(4));
     }
 
     #[test]
