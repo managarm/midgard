@@ -168,6 +168,8 @@ def enter_chroot(args):
     def mount(*args):
         run("mount", *args)
 
+    # The root is a mount point (pacman checks the free space of the mount points).
+    mount("--bind", root, root)
     for directory in ["proc", "dev", "run", "tmp"]:
         (root / directory).mkdir(mode=0o755, exist_ok=True)
     mount("-t", "proc", "proc", root / "proc")

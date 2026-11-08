@@ -1,0 +1,9 @@
+#!/bin/sh
+# Creates midgard's default user, whose systemd instance starts at boot (the user
+# lingers), as sessions run in it (midgard-init runs this as root before init on every
+# boot: `user-setup`).
+set -eu
+user=$1
+id "$user" >/dev/null 2>&1 || useradd -m -s /bin/bash "$user"
+mkdir -p /var/lib/systemd/linger
+touch "/var/lib/systemd/linger/$user"
