@@ -27,6 +27,11 @@ pub const GUEST_CID: u32 = 3;
 /// The vsock port that the agent listens on.
 pub const AGENT_PORT: u32 = 1024;
 
+/// The virtio-fs tag of the host's shared directory.
+pub const SHARE_TAG: &str = "managarm";
+/// Where the agent mounts the shared directory.
+pub const SHARE_MOUNT: &str = "/mnt/managarm";
+
 /// Kernel parameters that midgard passes to the agent.
 pub mod param {
     /// The root file system's device.
@@ -141,6 +146,7 @@ mod tests {
                 read_only: false,
             }],
             network: true,
+            share: Some("/".into()),
         };
         let mut stream = Vec::new();
         write_message(&mut stream, &config).unwrap();

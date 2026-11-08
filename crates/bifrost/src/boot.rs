@@ -49,6 +49,11 @@ fn config(boot: &BootArgs) -> Result<MachineConfig> {
         cpus: boot.cpus.unwrap_or_else(default_cpus),
         disks,
         network: !boot.no_network,
+        share: match (&boot.share, boot.no_share) {
+            (_, true) => None,
+            (Some(share), false) => Some(absolute(share)?),
+            (None, false) => Some("/".into()),
+        },
     })
 }
 
@@ -98,5 +103,6 @@ mod tests {
         assert!((1..=DEFAULT_MAX_CPUS).contains(&config.cpus));
         assert!(config.disks.is_empty());
         assert!(config.network);
+        assert_eq!(config.share, Some("/".into()));
     }
 }
