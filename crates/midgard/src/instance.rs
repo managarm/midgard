@@ -22,6 +22,11 @@
 //! # `{user}`).
 //! launcher = "wrapper"
 //! wrapper = ["runuser", "-l", "{user}", "-s", "{helper}"]
+//! # Who starts the Wayland display for the guest's Wayland clients (with midgard's
+//! # guest-waypipe): "agent" (default: the agent, for the default user), "systemd" (the
+//! # users' systemd instances) or "guest" (the guest runs `/run/midgard/midgard-init
+//! # waypipe` as the user itself).
+//! display = "systemd"
 //! ```
 //!
 //! The settings describe the disk's contents, so they will be part of the templates that
@@ -30,7 +35,7 @@
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
-use midgard_protocol::guest::{GuestConfig, Launcher, Ready};
+use midgard_protocol::guest::{Display, GuestConfig, Launcher, Ready};
 use midgard_protocol::machine::{Disk, MachineConfig};
 use serde::Deserialize;
 
@@ -85,6 +90,7 @@ struct GuestSettings {
     user_setup: Option<Vec<String>>,
     launcher: Option<LauncherSetting>,
     wrapper: Option<Vec<String>>,
+    display: Option<DisplaySetting>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -101,6 +107,14 @@ enum LauncherSetting {
     Direct,
     Systemd,
     Wrapper,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum DisplaySetting {
+    Agent,
+    Systemd,
+    Guest,
 }
 
 impl GuestSettings {
@@ -143,12 +157,24 @@ impl GuestSettings {
             }
             (None | Some(LauncherSetting::Direct), None) => Launcher::Direct,
         };
+        let display = match self.display {
+            None | Some(DisplaySetting::Agent) => Display::Agent,
+            Some(DisplaySetting::Systemd) => {
+                if self.init.is_none() {
+                    bail!("display = \"systemd\" needs init");
+                }
+                Display::Systemd
+            }
+            Some(DisplaySetting::Guest) => Display::Guest,
+        };
         Ok(GuestConfig {
             init: self.init.clone(),
             ready,
             user: self.user.clone(),
             user_setup: self.user_setup.clone(),
             launcher,
+            display,
+            waypipe_debug: false,
         })
     }
 }
@@ -195,6 +221,7 @@ pub fn config(name: &str) -> Result<MachineConfig> {
         network: true,
         share: Some("/".into()),
         guest: guest_config(&paths::instance_file(name))?,
+        waypipe: paths::guest_waypipe(),
     })
 }
 
@@ -222,10 +249,12 @@ mod tests {
             user = "alice"
             launcher = "wrapper"
             wrapper = ["runuser", "-l", "{user}", "-s", "{helper}"]
+            display = "guest"
             "#,
         )
         .unwrap();
         assert_eq!(config.user.as_deref(), Some("alice"));
+        assert_eq!(config.display, Display::Guest);
         assert!(matches!(config.launcher, Launcher::Wrapper(argv) if argv.len() == 5));
         for invalid in [
             "[guest]\ninit = \"sbin/init\"",
@@ -237,6 +266,7 @@ mod tests {
             "[guest]\nwrapper = [\"{helper}\"]",
             "[guest]\nuser = \"alice\"\nuser-setup = []",
             "[guest]\nuser-setup = [\"/setup\"]",
+            "[guest]\ndisplay = \"systemd\"",
             "[guest]\nunknown = 1",
             "[other]",
         ] {

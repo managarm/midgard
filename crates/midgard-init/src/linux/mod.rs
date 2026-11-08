@@ -1,6 +1,7 @@
 //! Boot: mount the root file system, move into it, start the distribution's init (if
 //! the guest configuration names one) and serve sessions.
 
+mod display;
 mod launcher;
 mod process;
 mod ready;
@@ -19,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use async_io::{Async, Timer};
-use midgard_protocol::guest::{CONFIG_FILE, GuestConfig};
+use midgard_protocol::guest::{CONFIG_FILE, Display, GuestConfig};
 use midgard_protocol::{AGENT_PORT, SHARE_MOUNT, SHARE_TAG, param};
 use sys::{Error, mount};
 
@@ -80,6 +81,8 @@ pub fn main() {
     let result = match mode.as_deref() {
         None | Some("exec") => launcher::helper(),
         Some("ready") => ready::notify().map_err(|error| error.to_string()),
+        Some("waypipe") => display::server(std::env::args().nth(2)),
+        Some("pause") => display::pause(),
         Some(mode) => Err(format!("unknown mode {mode:?} (the agent runs as PID 1)")),
     };
     if let Err(error) = result {
@@ -109,6 +112,7 @@ fn boot() -> Result<()> {
         .with_context(|| format!("no {}= parameter", param::ROOT))?;
     let fstype = parameter(&cmdline, param::ROOT_FSTYPE).unwrap_or_else(|| "ext4".into());
     let config = load_config();
+    let waypipe = display::load();
 
     // The disk shows up once its driver probed it.
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -138,6 +142,11 @@ fn boot() -> Result<()> {
     install_helper();
     let config = CONFIG.get_or_init(|| config);
     user_setup(config);
+    if let Some(waypipe) = &waypipe {
+        display::install(waypipe, config);
+    }
+    let agent_display = waypipe.is_some() && config.display == Display::Agent;
+    drop(waypipe);
     let watcher = ready::Watcher::new(config.ready);
 
     // With the distribution's init, it becomes PID 1 and we continue as its child. We
@@ -151,7 +160,7 @@ fn boot() -> Result<()> {
                 // SAFETY: setsid() has no preconditions; it detaches us from init's
                 // session and process group.
                 unsafe { libc::setsid() };
-                if let Err(error) = agent(watcher) {
+                if let Err(error) = agent(watcher, agent_display) {
                     log!("{error:#}");
                 }
                 std::process::exit(1);
@@ -159,7 +168,7 @@ fn boot() -> Result<()> {
             _ => exec_init(init),
         }
     }
-    agent(watcher)
+    agent(watcher, agent_display)
 }
 
 /// Reads the guest configuration from the initramfs (before we leave it).
@@ -213,14 +222,25 @@ fn user_setup(config: &GuestConfig) {
     }
 }
 
-/// Serves sessions (as PID 1 or as a child of the distribution's init). One thread runs
-/// everything (see [`rt`]).
-fn agent(watcher: ready::Watcher) -> Result<()> {
+/// Serves sessions (as PID 1 or as a child of the distribution's init) and runs the
+/// Wayland display for the default user (with `agent_display`, see [`Display::Agent`]).
+/// One thread runs everything (see [`rt`]).
+fn agent(watcher: ready::Watcher, agent_display: bool) -> Result<()> {
     // Before any thread starts (async-io starts one).
     reaper::block_sigchld();
     rt::block_on(async {
         rt::spawn(reaper::run()).detach();
-        rt::spawn(ready::watch(watcher)).detach();
+        // Sessions find the display running.
+        let display = async move {
+            if agent_display {
+                let name = config().user.as_deref().unwrap_or("root");
+                match users::lookup(name) {
+                    Ok(user) => display::start(&user).await,
+                    Err(error) => log!("{error}"),
+                }
+            }
+        };
+        rt::spawn(ready::watch(watcher, display)).detach();
         serve().await
     })
 }

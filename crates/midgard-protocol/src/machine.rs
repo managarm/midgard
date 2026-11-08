@@ -31,6 +31,9 @@ pub struct MachineConfig {
     pub share: Option<PathBuf>,
     /// How the agent sets up the guest (with the agent).
     pub guest: GuestConfig,
+    /// The guest's waypipe (with the agent), which forwards the guest's Wayland clients
+    /// to midgard (see [`crate::guest::Display`]).
+    pub waypipe: Option<PathBuf>,
 }
 
 /// A disk image (raw or qcow2) that the guest sees as a virtio block device.

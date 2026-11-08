@@ -3,12 +3,17 @@
 //!
 //! Each session becomes a vsock connection to the agent; midgard forwards the bytes
 //! without looking at them (bifrost and the agent speak midgard's session protocol).
+//!
+//! For Wayland forwarding, midgard runs `waypipe client` next to the compositor and
+//! connects each connection from the guest's waypipe (vsock port [`WAYPIPE_PORT`]) to it.
 
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io;
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -18,7 +23,7 @@ use event_listener::Event;
 use futures_lite::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, future};
 use midgard_protocol::nonblocking::{read_message, write_message};
 use midgard_protocol::session::{Request, Response};
-use midgard_protocol::{AGENT_PORT, control, runtime};
+use midgard_protocol::{AGENT_PORT, WAYPIPE_PORT, control, runtime};
 use midgard_vmm::{Machine, MachineHandle, VsockStream};
 
 use crate::instance;
@@ -81,11 +86,11 @@ async fn forward(client: Async<UnixStream>, machine: MachineHandle) {
             return;
         }
     };
-    proxy(client, guest).await;
+    proxy(client, guest, "session").await;
 }
 
 /// Copies bytes both ways until both sides are done.
-async fn proxy(host: Async<UnixStream>, guest: VsockStream) {
+async fn proxy(host: Async<UnixStream>, guest: VsockStream, name: &str) {
     let mut guest_writer = guest.try_clone();
     let mut guest_reader = guest;
     let upstream = async {
@@ -99,9 +104,10 @@ async fn proxy(host: Async<UnixStream>, guest: VsockStream) {
         result
     };
     let (upstream, downstream) = future::zip(upstream, downstream).await;
-    if downstream.1.is_some() || upstream.1.is_some() {
+    let failed = downstream.1.is_some() || upstream.1.is_some();
+    if failed || waypipe_debug() {
         log!(
-            "session connection closed: guest -> host {} bytes{}, host -> guest {} bytes{}",
+            "{name} connection closed: guest -> host {} bytes{}, host -> guest {} bytes{}",
             downstream.0,
             downstream
                 .1
@@ -134,6 +140,102 @@ async fn copy(
             return (total, Some(format!("write: {error}")));
         }
         total += count as u64;
+    }
+}
+
+/// The `waypipe client` for a VM instance's Wayland clients (see [`forward_waypipe`]).
+struct Gui {
+    waypipe: Child,
+    socket: PathBuf,
+}
+
+impl Drop for Gui {
+    fn drop(&mut self) {
+        let _ = self.waypipe.kill();
+        let _ = self.waypipe.wait();
+        let _ = std::fs::remove_file(&self.socket);
+    }
+}
+
+/// MIDGARD_WAYPIPE_DEBUG=1: both waypipes log debug messages.
+fn waypipe_debug() -> bool {
+    std::env::var_os("MIDGARD_WAYPIPE_DEBUG").is_some_and(|value| !value.is_empty() && value != "0")
+}
+
+/// Starts `waypipe client` on `socket` if we run in a Wayland session and have waypipe.
+fn start_waypipe(socket: PathBuf) -> Option<Gui> {
+    if std::env::var_os("WAYLAND_DISPLAY").is_none() {
+        log!("WAYLAND_DISPLAY is not set; Wayland forwarding is off");
+        return None;
+    }
+    let _ = std::fs::remove_file(&socket);
+    let program = std::env::var_os("MIDGARD_WAYPIPE").unwrap_or_else(|| "waypipe".into());
+    // No compression (the guest's waypipe has none) and no DMABUFs (shared memory only).
+    let mut command = Command::new(&program);
+    if waypipe_debug() {
+        command.arg("--debug");
+    }
+    command
+        .args(["--compress", "none", "--no-gpu", "--socket"])
+        .arg(&socket)
+        .arg("client")
+        .stdin(Stdio::null());
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: prctl() is async-signal-safe.
+        unsafe {
+            command.pre_exec(|| {
+                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+                Ok(())
+            });
+        }
+    }
+    match command.spawn() {
+        Ok(waypipe) => Some(Gui { waypipe, socket }),
+        Err(error) => {
+            log!("cannot run {program:?} ({error}); Wayland forwarding is off");
+            None
+        }
+    }
+}
+
+/// Connects each connection from the guest's waypipe to `waypipe client`.
+fn forward_waypipe(machine: &MachineHandle, gui: &Gui) {
+    let listener = match machine.vsock_listen(WAYPIPE_PORT) {
+        Ok(listener) => listener,
+        Err(error) => {
+            log!("cannot listen on vsock port {WAYPIPE_PORT}: {error}");
+            return;
+        }
+    };
+    let socket = gui.socket.clone();
+    let spawner = machine.clone();
+    machine.spawn(async move {
+        loop {
+            let guest = listener.accept().await;
+            let socket = socket.clone();
+            spawner.spawn(async move {
+                match connect_waypipe(&socket).await {
+                    Ok(host) => proxy(host, guest, "waypipe").await,
+                    Err(error) => log!("cannot connect to waypipe: {error}"),
+                }
+            });
+        }
+    });
+}
+
+/// Connects to `waypipe client`'s socket (which it creates soon after it started).
+async fn connect_waypipe(socket: &Path) -> io::Result<Async<UnixStream>> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match Async::<UnixStream>::connect(socket).await {
+            Ok(stream) => return Ok(stream),
+            Err(error) if Instant::now() > deadline => return Err(error),
+            Err(_) => {
+                Timer::after(Duration::from_millis(20)).await;
+            }
+        }
     }
 }
 
@@ -263,14 +365,27 @@ fn run_instance(name: &str, running: &Running) {
 /// Boots the VM of `name`, makes it ready for sessions and runs it until it stops;
 /// returns why it stopped.
 fn boot_instance(name: &str, running: &Running) -> Result<String> {
-    let config = instance::config(name)?;
+    let mut config = instance::config(name)?;
+    config.guest.waypipe_debug = waypipe_debug();
     let dir = runtime::runtime_dir(name);
     std::fs::create_dir_all(&dir).with_context(|| format!("failed to create {dir:?}"))?;
     let path = runtime::console_log(name);
     let console = File::create(&path).with_context(|| format!("failed to create {path:?}"))?;
 
+    // The guest gets a Wayland display only if we can forward its clients.
+    let gui = config
+        .waypipe
+        .is_some()
+        .then(|| start_waypipe(runtime::waypipe_socket(name)))
+        .flatten();
+    if gui.is_none() {
+        config.waypipe = None;
+    }
     let machine = midgard_vmm::start(&config, Box::new(console))?;
     let handle = machine.handle();
+    if let Some(gui) = &gui {
+        forward_waypipe(&handle, gui);
+    }
     if let Err(error) = machine.run(wait_for_agent(&machine)) {
         handle.stop();
         let _ = machine.run_until_stopped();
@@ -279,5 +394,7 @@ fn boot_instance(name: &str, running: &Running) -> Result<String> {
     log!("{name} is ready");
     running.set(State::Ready(handle));
 
-    Ok(machine.run_until_stopped()?.to_string())
+    let result = machine.run_until_stopped();
+    drop(gui);
+    Ok(result?.to_string())
 }

@@ -15,7 +15,7 @@ use midgard_protocol::session::{Exec, Request, Response, WindowSize};
 use super::launcher::{self, Signals};
 use super::process::{self, Stdio};
 use super::sys::{self, Error};
-use super::{PATH, log, ready, reaper, rt, users};
+use super::{PATH, display, log, ready, reaper, rt, users};
 
 /// How long we wait for output after the command exited (e.g., for background
 /// processes that keep the terminal open, we do not wait forever).
@@ -119,10 +119,14 @@ fn nonblocking(file: File) -> Result<Rc<Async<File>>, Error> {
         .map_err(|error| Error::io("registering a file descriptor", error))
 }
 
-async fn run(exec: Exec, stream: &Stream) -> Result<(), Error> {
+async fn run(mut exec: Exec, stream: &Stream) -> Result<(), Error> {
     let config = super::config();
     let name = exec.user.as_deref().or(config.user.as_deref());
     let user = users::lookup(name.unwrap_or("root"))?;
+    // The client's variables take precedence.
+    let mut env = display::session_environment(&user);
+    env.append(&mut exec.env);
+    exec.env = env;
     let cwd = exec
         .cwd
         .clone()

@@ -2,6 +2,7 @@
 //! sessions find its services running (e.g., D-Bus). The watcher ([`watch`]) learns it
 //! in the way that the guest configuration says; sessions [`wait`] for it.
 
+use std::future::Future;
 use std::io;
 use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -67,8 +68,9 @@ impl Watcher {
     }
 }
 
-/// Watches the guest boot (from the agent's start); see [`wait`].
-pub async fn watch(watcher: Watcher) {
+/// Watches the guest boot (from the agent's start); see [`wait`]. `then` runs once the
+/// guest booted, before sessions continue.
+pub async fn watch(watcher: Watcher, then: impl Future<Output = ()>) {
     let start = Instant::now();
     let booted = match watcher {
         Watcher::Immediately => None,
@@ -92,6 +94,7 @@ pub async fn watch(watcher: Watcher) {
         ),
         None => {}
     }
+    then.await;
     BOOTED.store(true, Ordering::SeqCst);
     BOOTED_EVENT.notify(usize::MAX);
 }

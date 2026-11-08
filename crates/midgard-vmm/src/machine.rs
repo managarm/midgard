@@ -61,6 +61,9 @@ fn validate(config: &MachineConfig) -> Result<()> {
     } else if config.guest.ready != Ready::Immediately {
         bail!("waiting for the guest to boot needs the distribution's init");
     }
+    if config.waypipe.is_some() && config.agent.is_none() {
+        bail!("the guest's waypipe needs the agent");
+    }
     Ok(())
 }
 
@@ -167,9 +170,14 @@ fn load_images(config: &MachineConfig) -> Result<(Vec<u8>, Option<Vec<u8>>)> {
         (Some(agent), _) => {
             let mut guest_config = Vec::new();
             midgard_protocol::write_message(&mut guest_config, &config.guest)?;
+            let waypipe = match &config.waypipe {
+                Some(path) => Some(read(path, "the guest's waypipe")?),
+                None => None,
+            };
             Some(boot::initramfs::build(
                 &read(agent, "the agent")?,
                 &guest_config,
+                waypipe.as_deref(),
             ))
         }
         (None, Some(path)) => Some(read(path, "the initrd")?),

@@ -29,6 +29,9 @@ pub const GUEST_CID: u32 = 3;
 /// The vsock port that the agent listens on.
 pub const AGENT_PORT: u32 = 1024;
 
+/// The host vsock port that the guest's waypipe connects to (once per Wayland client).
+pub const WAYPIPE_PORT: u32 = 1025;
+
 /// The virtio-fs tag of the host's shared directory.
 pub const SHARE_TAG: &str = "managarm";
 /// Where the agent mounts the shared directory.
@@ -130,7 +133,7 @@ pub mod nonblocking {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::guest::{GuestConfig, Launch, Launcher, Ready};
+    use crate::guest::{Display, GuestConfig, Launch, Launcher, Ready};
     use crate::machine::{Disk, MachineConfig};
     use crate::session::{Exec, Request, Response, WindowSize};
 
@@ -156,7 +159,10 @@ mod tests {
                 user: Some("alice".into()),
                 user_setup: Some(vec!["/etc/midgard/user-setup".into()]),
                 launcher: Launcher::Wrapper(vec!["runuser".into(), "{helper}".into()]),
+                display: Display::Systemd,
+                waypipe_debug: true,
             },
+            waypipe: Some("/usr/lib/midgard/guest-waypipe".into()),
         };
         let mut stream = Vec::new();
         write_message(&mut stream, &config).unwrap();

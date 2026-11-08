@@ -57,6 +57,7 @@ fn config(boot: &BootArgs) -> Result<MachineConfig> {
         },
         // The agent stays PID 1.
         guest: GuestConfig::default(),
+        waypipe: None,
     })
 }
 

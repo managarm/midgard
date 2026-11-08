@@ -23,6 +23,31 @@ pub struct GuestConfig {
     pub user_setup: Option<Vec<String>>,
     /// How the agent runs the commands of sessions.
     pub launcher: Launcher,
+    /// Who starts the Wayland display that forwards the guest's Wayland clients to the
+    /// host (if midgard gives the guest a waypipe).
+    pub display: Display,
+    /// The guest's waypipe logs debug messages.
+    pub waypipe_debug: bool,
+}
+
+/// Who starts the guest's Wayland display: a waypipe server that runs as a user and
+/// listens on `$XDG_RUNTIME_DIR/wayland-0` (or another socket).
+/// `/run/midgard/midgard-init waypipe [<socket>]` runs it (with the right options; it
+/// connects to [`crate::WAYPIPE_PORT`] for each client).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum Display {
+    /// The agent, for the default user (on a socket in /run/midgard). Sessions of that
+    /// user get `WAYLAND_DISPLAY` and `XDG_RUNTIME_DIR`.
+    #[default]
+    Agent,
+    /// Every user's systemd instance, through a user unit that the agent installs in
+    /// /run/systemd/user; /run/environment.d sets `WAYLAND_DISPLAY` for the instance's
+    /// services (and thus for the commands of [`Launcher::Systemd`]; sessions of other
+    /// launchers need the guest to set it).
+    Systemd,
+    /// The guest itself (e.g., a user service of its init system); the agent only
+    /// installs waypipe.
+    Guest,
 }
 
 /// How the agent learns that the guest finished booting (sessions wait for it, such
