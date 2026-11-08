@@ -32,25 +32,57 @@ pub fn resolve(program: &str, path: &str) -> Option<String> {
         })
 }
 
-/// Starts `path` with `argv` (including argv[0]) and `env` ("NAME=value") in a new
-/// session. Returns the PID; the reaper reports its status.
-pub fn spawn(
-    path: &str,
-    argv: &[String],
-    env: &[String],
-    cwd: &str,
-    stdio: &Stdio,
-) -> Result<i32, Error> {
+/// A process to start (see [`spawn`]).
+pub struct Command {
+    pub path: String,
+    /// Including argv[0].
+    pub argv: Vec<String>,
+    /// "NAME=value".
+    pub env: Vec<String>,
+    /// The working directory (`/` if it does not exist or is not accessible).
+    pub cwd: String,
+    /// The user and groups that it runs as (else root).
+    pub credentials: Option<Credentials>,
+    /// A file descriptor that the process gets as file descriptor 3.
+    pub fd3: Option<RawFd>,
+}
+
+impl Command {
+    pub fn new(path: impl Into<String>, argv: Vec<String>, env: Vec<String>) -> Self {
+        Self {
+            path: path.into(),
+            argv,
+            env,
+            cwd: "/".into(),
+            credentials: None,
+            fd3: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Credentials {
+    pub uid: u32,
+    pub gid: u32,
+    /// The supplementary groups.
+    pub groups: Vec<u32>,
+}
+
+/// Starts a process in a new session. Returns the PID; the reaper reports its status.
+pub fn spawn(command: &Command, stdio: &Stdio) -> Result<i32, Error> {
     // Everything that the child needs is prepared before fork(): after it, the child
     // may only call async-signal-safe functions.
+    let path = command.path.as_str();
     let path_c = cstring(path);
-    let argv_c: Vec<CString> = argv.iter().map(|a| cstring(a)).collect();
-    let env_c: Vec<CString> = env.iter().map(|e| cstring(e)).collect();
-    let cwd_c = cstring(cwd);
+    let argv_c: Vec<CString> = command.argv.iter().map(|a| cstring(a)).collect();
+    let env_c: Vec<CString> = command.env.iter().map(|e| cstring(e)).collect();
+    let cwd_c = cstring(&command.cwd);
     let mut argv_p: Vec<*const libc::c_char> = argv_c.iter().map(|a| a.as_ptr()).collect();
     argv_p.push(std::ptr::null());
     let mut env_p: Vec<*const libc::c_char> = env_c.iter().map(|e| e.as_ptr()).collect();
     env_p.push(std::ptr::null());
+    let credentials = command.credentials.as_ref();
+    let groups: Vec<libc::gid_t> = credentials.map_or(Vec::new(), |c| c.groups.clone());
     // The agent blocks SIGCHLD (see reaper::block_sigchld); the mask survives exec.
     // SAFETY: sigemptyset() initializes the set.
     let no_signals = unsafe {
@@ -99,13 +131,27 @@ pub fn spawn(
                     libc::dup2(stderr, 2);
                 }
             }
+            if let Some(fd) = command.fd3 {
+                if fd == 3 {
+                    libc::fcntl(3, libc::F_SETFD, 0);
+                } else {
+                    libc::dup2(fd, 3);
+                }
+            }
             // Rust ignores SIGPIPE; the ignored disposition would survive exec.
             libc::signal(libc::SIGPIPE, libc::SIG_DFL);
             libc::sigprocmask(libc::SIG_SETMASK, &no_signals, std::ptr::null_mut());
-            if libc::chdir(cwd_c.as_ptr()) != 0 {
-                libc::chdir(c"/".as_ptr());
+            let dropped = credentials.is_none_or(|c| {
+                libc::setgroups(groups.len(), groups.as_ptr()) == 0
+                    && libc::setgid(c.gid) == 0
+                    && libc::setuid(c.uid) == 0
+            });
+            if dropped {
+                if libc::chdir(cwd_c.as_ptr()) != 0 {
+                    libc::chdir(c"/".as_ptr());
+                }
+                libc::execve(path_c.as_ptr(), argv_p.as_ptr(), env_p.as_ptr());
             }
-            libc::execve(path_c.as_ptr(), argv_p.as_ptr(), env_p.as_ptr());
             let errno = *libc::__errno_location();
             libc::write(status_write, (&raw const errno).cast(), 4);
             libc::_exit(127);
@@ -140,7 +186,7 @@ pub fn dev_null() -> Result<OwnedFd, Error> {
 
 /// Starts a process in the background: its stdin is /dev/null, its output goes to the
 /// console (our stdout / stderr), and nobody waits for its status.
-pub fn spawn_background(path: &str, argv: &[String], env: &[String]) -> Result<i32, Error> {
+pub fn spawn_background(command: &Command) -> Result<i32, Error> {
     let null = dev_null()?;
     let stdio = Stdio::Pipes {
         stdin: null.as_raw_fd(),
@@ -148,7 +194,7 @@ pub fn spawn_background(path: &str, argv: &[String], env: &[String]) -> Result<i
         stderr: 2,
     };
     // Nobody registers it, so the reaper drops its status.
-    spawn(path, argv, env, "/", &stdio)
+    spawn(command, &stdio)
 }
 
 /// Converts a wait status to (exit code, signal).

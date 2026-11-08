@@ -65,7 +65,7 @@ fn config(boot: &BootArgs) -> Result<MachineConfig> {
 pub fn boot(args: &BootArgs) -> Result<()> {
     let config = config(args)?;
     let mut stream = client::connect_daemon()?;
-    midgard_protocol::write_message(&mut stream, &Request::Boot(config))?;
+    midgard_protocol::write_message(&mut stream, &Request::Boot(Box::new(config)))?;
     let mut stdout = io::stdout().lock();
     loop {
         match midgard_protocol::read_message(&mut stream)? {

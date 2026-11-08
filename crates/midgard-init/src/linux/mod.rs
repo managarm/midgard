@@ -1,12 +1,14 @@
 //! Boot: mount the root file system, move into it, start the distribution's init (if
 //! the guest configuration names one) and serve sessions.
 
+mod launcher;
 mod process;
 mod ready;
 mod reaper;
 mod rt;
 mod session;
 mod sys;
+mod users;
 
 use std::fs::File;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -31,6 +33,10 @@ pub const HELPER: &str = "/run/midgard/midgard-init";
 
 /// The guest configuration (from the initramfs).
 static CONFIG: OnceLock<GuestConfig> = OnceLock::new();
+
+pub fn config() -> &'static GuestConfig {
+    CONFIG.get_or_init(GuestConfig::default)
+}
 
 /// Whether we started the distribution's init (and are its child).
 static INIT_RUNS: AtomicBool = AtomicBool::new(false);
@@ -68,14 +74,13 @@ pub fn main() {
         }
         return;
     }
-    // The guest runs us (as HELPER) in other modes.
-    let mode = std::env::args().nth(1).unwrap_or_default();
-    let result = match mode.as_str() {
-        "ready" => ready::notify(),
-        _ => {
-            eprintln!("midgard-init: unknown mode {mode:?} (the agent runs as PID 1)");
-            std::process::exit(2);
-        }
+    // The guest runs us (as HELPER) in other modes. A wrapper runs us as the user's login
+    // shell (see launcher::helper), i.e., without arguments.
+    let mode = std::env::args().nth(1);
+    let result = match mode.as_deref() {
+        None | Some("exec") => launcher::helper(),
+        Some("ready") => ready::notify().map_err(|error| error.to_string()),
+        Some(mode) => Err(format!("unknown mode {mode:?} (the agent runs as PID 1)")),
     };
     if let Err(error) = result {
         eprintln!("midgard-init: {error}");
@@ -132,6 +137,7 @@ fn boot() -> Result<()> {
     mount_share();
     install_helper();
     let config = CONFIG.get_or_init(|| config);
+    user_setup(config);
     let watcher = ready::Watcher::new(config.ready);
 
     // With the distribution's init, it becomes PID 1 and we continue as its child. We
@@ -180,6 +186,30 @@ fn install_helper() {
         .and_then(|_| std::fs::set_permissions(HELPER, PermissionsExt::from_mode(0o755)));
     if let Err(error) = result {
         log!("installing {HELPER}: {error}");
+    }
+}
+
+/// Runs the user setup command (see [`GuestConfig::user_setup`]).
+fn user_setup(config: &GuestConfig) {
+    let (Some(user), Some(setup)) = (&config.user, &config.user_setup) else {
+        return;
+    };
+    let Some((program, args)) = setup.split_first() else {
+        return;
+    };
+    log!("setting up user {user}");
+    let status = std::process::Command::new(program)
+        .args(args)
+        .arg(user)
+        .env_clear()
+        .env("PATH", PATH)
+        .env("HOME", "/root")
+        .current_dir("/")
+        .status();
+    match status {
+        Ok(status) if status.success() => {}
+        Ok(status) => log!("{program} failed ({status})"),
+        Err(error) => log!("running {program}: {error}"),
     }
 }
 

@@ -12,9 +12,10 @@ use futures_lite::{AsyncReadExt, AsyncWriteExt, future};
 use midgard_protocol::nonblocking::{read_message, write_message};
 use midgard_protocol::session::{Exec, Request, Response, WindowSize};
 
+use super::launcher::{self, Signals};
 use super::process::{self, Stdio};
 use super::sys::{self, Error};
-use super::{PATH, log, ready, reaper, rt};
+use super::{PATH, log, ready, reaper, rt, users};
 
 /// How long we wait for output after the command exited (e.g., for background
 /// processes that keep the terminal open, we do not wait forever).
@@ -53,35 +54,6 @@ pub async fn handle(stream: Async<File>) {
         Ok(None) => {}
         Err(error) => log!("bad request: {error}"),
     }
-}
-
-/// root's home and login shell from /etc/passwd.
-fn root_user() -> (String, String) {
-    let passwd = std::fs::read_to_string("/etc/passwd").unwrap_or_default();
-    passwd
-        .lines()
-        .map(|line| line.split(':').collect::<Vec<_>>())
-        .find(|fields| fields.len() >= 7 && fields[2] == "0")
-        .map(|fields| (fields[5].to_string(), fields[6].to_string()))
-        .unwrap_or_else(|| ("/root".into(), "/bin/sh".into()))
-}
-
-fn environment(exec: &Exec, home: &str, shell: &str) -> Vec<String> {
-    let mut env: Vec<(String, String)> = vec![
-        ("PATH".into(), PATH.into()),
-        ("HOME".into(), home.into()),
-        ("USER".into(), "root".into()),
-        ("LOGNAME".into(), "root".into()),
-        ("SHELL".into(), shell.into()),
-    ];
-    if exec.tty.is_some() {
-        env.push(("TERM".into(), "linux".into()));
-    }
-    for (name, value) in &exec.env {
-        env.retain(|(n, _)| n != name);
-        env.push((name.clone(), value.clone()));
-    }
-    env.into_iter().map(|(n, v)| format!("{n}={v}")).collect()
 }
 
 fn set_window_size(fd: RawFd, size: WindowSize) {
@@ -148,27 +120,15 @@ fn nonblocking(file: File) -> Result<Rc<Async<File>>, Error> {
 }
 
 async fn run(exec: Exec, stream: &Stream) -> Result<(), Error> {
-    let (home, shell) = root_user();
-    let env = environment(&exec, &home, &shell);
-    let path_env = env
-        .iter()
-        .find_map(|e| e.strip_prefix("PATH="))
-        .unwrap_or(PATH)
-        .to_string();
-    let (path, argv) = if exec.argv.is_empty() {
-        // A login shell: argv[0] starts with a dash.
-        let name = shell.rsplit('/').next().unwrap_or("sh");
-        (shell.clone(), vec![format!("-{name}")])
-    } else {
-        let path = process::resolve(&exec.argv[0], &path_env)
-            .ok_or_else(|| Error::Message(format!("{}: command not found", exec.argv[0])))?;
-        (path, exec.argv.clone())
-    };
+    let config = super::config();
+    let name = exec.user.as_deref().or(config.user.as_deref());
+    let user = users::lookup(name.unwrap_or("root"))?;
     let cwd = exec
         .cwd
         .clone()
         .filter(|cwd| std::path::Path::new(cwd).is_dir())
-        .unwrap_or(home);
+        .unwrap_or_else(|| user.home.clone());
+    let prepared = launcher::prepare(&config.launcher, &exec, &user, &cwd)?;
 
     // The command's input and its outputs (with whether each one is stderr).
     let (pid, input, outputs) = match exec.tty {
@@ -195,7 +155,16 @@ async fn run(exec: Exec, stream: &Stream) -> Result<(), Error> {
                 libc::fcntl(slave.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
             }
             set_window_size(master.as_raw_fd(), size);
-            let pid = process::spawn(&path, &argv, &env, &cwd, &Stdio::Pty(slave.as_raw_fd()))?;
+            // The user's programs may open the terminal again (as root does with logins).
+            if user.uid != 0 {
+                let tty = users::group_id("tty").unwrap_or(user.gid);
+                // SAFETY: fchown() and fchmod() only take numbers.
+                unsafe {
+                    libc::fchown(slave.as_raw_fd(), user.uid, tty);
+                    libc::fchmod(slave.as_raw_fd(), 0o620);
+                }
+            }
+            let pid = process::spawn(&prepared.command, &Stdio::Pty(slave.as_raw_fd()))?;
             drop(slave);
             let master = nonblocking(master)?;
             (pid, Input::Pty(master.clone()), vec![(master, false)])
@@ -209,7 +178,7 @@ async fn run(exec: Exec, stream: &Stream) -> Result<(), Error> {
                 stdout: stdout_write.as_raw_fd(),
                 stderr: stderr_write.as_raw_fd(),
             };
-            let pid = process::spawn(&path, &argv, &env, &cwd, &stdio)?;
+            let pid = process::spawn(&prepared.command, &stdio)?;
             drop((stdin_read, stdout_write, stderr_write));
             let stdin = Async::new(stdin_write)
                 .map_err(|error| Error::io("registering a file descriptor", error))?;
@@ -229,7 +198,13 @@ async fn run(exec: Exec, stream: &Stream) -> Result<(), Error> {
         .map(|(source, stderr)| rt::spawn(pump_output(source, stderr, responses.clone())))
         .collect();
     let finished = Rc::new(Cell::new(false));
-    let input = rt::spawn(forward_input(stream.clone(), input, pid, finished.clone()));
+    let input = rt::spawn(forward_input(
+        stream.clone(),
+        input,
+        pid,
+        prepared.signals,
+        finished.clone(),
+    ));
 
     let status = exited
         .recv()
@@ -258,7 +233,13 @@ async fn run(exec: Exec, stream: &Stream) -> Result<(), Error> {
 }
 
 /// Forwards requests to the command until the session ends.
-async fn forward_input(stream: Stream, mut input: Input, pid: i32, finished: Rc<Cell<bool>>) {
+async fn forward_input(
+    stream: Stream,
+    mut input: Input,
+    pid: i32,
+    signals: Signals,
+    finished: Rc<Cell<bool>>,
+) {
     // The process group that receives signals: the terminal's foreground group if there
     // is a terminal, otherwise the session (the command is its leader).
     let group = |input: &Input| match input {
@@ -296,16 +277,12 @@ async fn forward_input(stream: Stream, mut input: Input, pid: i32, finished: Rc<
                     set_window_size(master.as_raw_fd(), size);
                 }
             }
-            Ok(Some(Request::Signal(signal))) => {
-                // SAFETY: kill() only takes numbers.
-                unsafe { libc::kill(-group(&input), signal) };
-            }
+            Ok(Some(Request::Signal(signal))) => signals.deliver(group(&input), signal),
             Ok(Some(_)) => {}
             Ok(None) | Err(_) => {
                 // The client went away: hang up, like a closed terminal.
                 if !finished.get() {
-                    // SAFETY: kill() only takes numbers.
-                    unsafe { libc::kill(-group(&input), libc::SIGHUP) };
+                    signals.deliver(group(&input), libc::SIGHUP);
                 }
                 return;
             }
@@ -324,8 +301,8 @@ async fn shutdown() {
         log!("asking init to power off");
         let path = process::resolve("poweroff", PATH).unwrap_or_else(|| "/sbin/poweroff".into());
         let argv = vec!["poweroff".to_string()];
-        let env = vec![format!("PATH={PATH}")];
-        match process::spawn_background(&path, &argv, &env) {
+        let command = process::Command::new(path, argv, vec![format!("PATH={PATH}")]);
+        match process::spawn_background(&command) {
             Ok(_) => {
                 Timer::after(POWEROFF_TIMEOUT).await;
                 log!(

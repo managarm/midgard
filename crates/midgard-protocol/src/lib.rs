@@ -130,7 +130,7 @@ pub mod nonblocking {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::guest::{GuestConfig, Ready};
+    use crate::guest::{GuestConfig, Launch, Launcher, Ready};
     use crate::machine::{Disk, MachineConfig};
     use crate::session::{Exec, Request, Response, WindowSize};
 
@@ -153,6 +153,9 @@ mod tests {
             guest: GuestConfig {
                 init: Some("/sbin/init".into()),
                 ready: Ready::Systemd,
+                user: Some("alice".into()),
+                user_setup: Some(vec!["/etc/midgard/user-setup".into()]),
+                launcher: Launcher::Wrapper(vec!["runuser".into(), "{helper}".into()]),
             },
         };
         let mut stream = Vec::new();
@@ -223,6 +226,7 @@ mod tests {
             argv: vec!["ls".into(), "-l".into()],
             env: vec![("TERM".into(), "xterm".into())],
             cwd: Some("/root".into()),
+            user: Some("alice".into()),
             tty: Some(WindowSize { rows: 24, cols: 80 }),
         }));
         round_trip_request(Request::Stdin(b"hello".to_vec()));
@@ -243,6 +247,18 @@ mod tests {
         });
         round_trip_response(Response::Error("no such file".into()));
         round_trip_response(Response::Pong);
+    }
+
+    #[test]
+    fn launch_round_trip() {
+        let launch = Launch {
+            argv: vec!["ls".into()],
+            env: vec![("A".into(), "b".into())],
+            cwd: "/home/alice".into(),
+        };
+        let mut buffer = Vec::new();
+        write_message(&mut buffer, &launch).unwrap();
+        assert_eq!(read_message(&mut &buffer[..]).unwrap(), Some(launch));
     }
 
     #[test]

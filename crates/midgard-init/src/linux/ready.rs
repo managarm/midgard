@@ -131,8 +131,8 @@ async fn run_with_timeout(argv: &[&str], timeout: Duration) -> bool {
         log!("{}: command not found", argv[0]);
         return false;
     };
-    let argv: Vec<String> = argv.iter().map(|a| a.to_string()).collect();
-    let env = [format!("PATH={PATH}")];
+    let argv = argv.iter().map(|a| a.to_string()).collect();
+    let command = process::Command::new(path, argv, vec![format!("PATH={PATH}")]);
     let result = process::dev_null().and_then(|null| {
         let null = null.as_raw_fd();
         let stdio = process::Stdio::Pipes {
@@ -140,7 +140,7 @@ async fn run_with_timeout(argv: &[&str], timeout: Duration) -> bool {
             stdout: null,
             stderr: null,
         };
-        process::spawn(&path, &argv, &env, "/", &stdio)
+        process::spawn(&command, &stdio)
     });
     match result {
         Ok(pid) => {

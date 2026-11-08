@@ -11,6 +11,17 @@
 //! # `systemctl is-system-running --wait` returns) or "notify" (until the guest runs
 //! # `/run/midgard/midgard-init ready`).
 //! ready = "systemd"
+//! # The user that sessions run as unless bifrost names one (default: root).
+//! user = "alice"
+//! # A command that the agent runs on every boot (as root, before the distribution's
+//! # init) with the user's name as an additional argument, e.g., to create the user.
+//! user-setup = ["/etc/midgard/user-setup"]
+//! # How the agent runs the commands of sessions: "direct" (default: the agent runs
+//! # them itself), "systemd" (as transient services of the user's systemd instance) or
+//! # "wrapper" (through the command `wrapper`, which runs `{helper}` in a session of
+//! # `{user}`).
+//! launcher = "wrapper"
+//! wrapper = ["runuser", "-l", "{user}", "-s", "{helper}"]
 //! ```
 //!
 //! The settings describe the disk's contents, so they will be part of the templates that
@@ -19,7 +30,7 @@
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
-use midgard_protocol::guest::{GuestConfig, Ready};
+use midgard_protocol::guest::{GuestConfig, Launcher, Ready};
 use midgard_protocol::machine::{Disk, MachineConfig};
 use serde::Deserialize;
 
@@ -70,6 +81,10 @@ struct InstanceFile {
 struct GuestSettings {
     init: Option<String>,
     ready: Option<ReadySetting>,
+    user: Option<String>,
+    user_setup: Option<Vec<String>>,
+    launcher: Option<LauncherSetting>,
+    wrapper: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -78,6 +93,14 @@ enum ReadySetting {
     None,
     Systemd,
     Notify,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum LauncherSetting {
+    Direct,
+    Systemd,
+    Wrapper,
 }
 
 impl GuestSettings {
@@ -95,9 +118,37 @@ impl GuestSettings {
         if self.init.is_none() && ready != Ready::Immediately {
             bail!("ready needs init");
         }
+        if let Some(user_setup) = &self.user_setup {
+            if user_setup.is_empty() {
+                bail!("user-setup must not be empty");
+            }
+            if self.user.is_none() {
+                bail!("user-setup needs user");
+            }
+        }
+        let launcher = match (self.launcher, &self.wrapper) {
+            (Some(LauncherSetting::Wrapper), None) => bail!("launcher = \"wrapper\" needs wrapper"),
+            (Some(LauncherSetting::Wrapper), Some(wrapper)) => {
+                if !wrapper.iter().any(|arg| arg.contains("{helper}")) {
+                    bail!("wrapper must run {{helper}}");
+                }
+                Launcher::Wrapper(wrapper.clone())
+            }
+            (_, Some(_)) => bail!("wrapper needs launcher = \"wrapper\""),
+            (Some(LauncherSetting::Systemd), None) => {
+                if self.init.is_none() {
+                    bail!("launcher = \"systemd\" needs init");
+                }
+                Launcher::Systemd
+            }
+            (None | Some(LauncherSetting::Direct), None) => Launcher::Direct,
+        };
         Ok(GuestConfig {
             init: self.init.clone(),
             ready,
+            user: self.user.clone(),
+            user_setup: self.user_setup.clone(),
+            launcher,
         })
     }
 }
@@ -164,10 +215,28 @@ mod tests {
         .unwrap();
         assert_eq!(config.init.as_deref(), Some("/sbin/init"));
         assert_eq!(config.ready, Ready::Notify);
+        assert_eq!(config.launcher, Launcher::Direct);
+        let config = parse_instance_file(
+            r#"
+            [guest]
+            user = "alice"
+            launcher = "wrapper"
+            wrapper = ["runuser", "-l", "{user}", "-s", "{helper}"]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.user.as_deref(), Some("alice"));
+        assert!(matches!(config.launcher, Launcher::Wrapper(argv) if argv.len() == 5));
         for invalid in [
             "[guest]\ninit = \"sbin/init\"",
             "[guest]\nready = \"systemd\"",
             "[guest]\nready = \"soon\"",
+            "[guest]\nlauncher = \"systemd\"",
+            "[guest]\nlauncher = \"wrapper\"",
+            "[guest]\nlauncher = \"wrapper\"\nwrapper = [\"su\"]",
+            "[guest]\nwrapper = [\"{helper}\"]",
+            "[guest]\nuser = \"alice\"\nuser-setup = []",
+            "[guest]\nuser-setup = [\"/setup\"]",
             "[guest]\nunknown = 1",
             "[other]",
         ] {

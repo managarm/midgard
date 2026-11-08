@@ -180,6 +180,7 @@ pub fn run(name: &str, args: &RunArgs) -> Result<i32> {
         env,
         // The agent falls back to the home directory.
         cwd: args.cwd.clone(),
+        user: args.user.clone(),
         tty: if tty {
             Some(window_size().unwrap_or(WindowSize { rows: 24, cols: 80 }))
         } else {

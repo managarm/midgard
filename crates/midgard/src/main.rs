@@ -185,7 +185,7 @@ async fn serve(stream: Async<UnixStream>) -> Result<()> {
     let response = match request {
         Request::Boot(config) => {
             let kernel = config.kernel.display().to_string();
-            match boot(&stream, config).await {
+            match boot(&stream, *config).await {
                 Ok(reason) => {
                     log!("{kernel}: {reason}");
                     Response::Stopped(reason)
