@@ -29,4 +29,4 @@ mod vcpu;
 mod virtio;
 
 pub use machine::{Machine, MachineHandle, Stop, start};
-pub use virtio::vsock::VsockStream;
+pub use virtio::vsock::{VsockListener, VsockStream};

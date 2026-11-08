@@ -1,9 +1,10 @@
 //! virtio-vsock: stream sockets between midgard (the host, CID 2) and the guest.
 //!
 //! midgard itself is the host end; there is no AF_VSOCK on the host. Host tasks
-//! connect to ports that the guest listens on and get a [`VsockStream`] (AsyncRead and
-//! AsyncWrite); the guest cannot connect to the host. Both directions use virtio-vsock's
-//! credit-based flow control.
+//! connect to ports that the guest listens on, or accept connections from the guest on
+//! ports that they listen on ([`VsockListener`]); either way they get a [`VsockStream`]
+//! (AsyncRead and AsyncWrite). Both directions use virtio-vsock's credit-based flow
+//! control.
 
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
@@ -123,8 +124,16 @@ impl Connection {
     }
 }
 
+/// Connections from the guest that a host task did not accept yet.
+struct ListenerShared {
+    pending: Mutex<VecDeque<(Key, Arc<StreamShared>)>>,
+    changed: Event,
+}
+
 pub(crate) struct Vsock {
     connections: HashMap<Key, Connection>,
+    /// Host ports that accept connections from the guest.
+    listeners: HashMap<u32, Arc<ListenerShared>>,
     /// Control packets for the guest (without data).
     control: VecDeque<Header>,
     next_port: u32,
@@ -134,6 +143,7 @@ impl Default for Vsock {
     fn default() -> Self {
         Self {
             connections: HashMap::new(),
+            listeners: HashMap::new(),
             control: VecDeque::new(),
             next_port: FIRST_HOST_PORT,
         }
@@ -188,8 +198,21 @@ impl Vsock {
             }
             return;
         }
+        if h.op.get() == OP_REQUEST
+            && !self.connections.contains_key(&key)
+            && let Some(listener) = self.listeners.get(&h.dst_port.get()).cloned()
+        {
+            let shared = self.add_connection(key, ConnectState::Connected);
+            let connection = self.connections.get_mut(&key).unwrap();
+            connection.peer_buf_alloc = h.buf_alloc.get();
+            connection.peer_fwd_cnt = h.fwd_cnt.get();
+            self.control.push_back(header(key, OP_RESPONSE));
+            listener.pending.lock().unwrap().push_back((key, shared));
+            listener.changed.notify(usize::MAX);
+            return;
+        }
         let Some(connection) = self.connections.get_mut(&key) else {
-            // An unknown connection (or a request: nothing listens on the host).
+            // Nobody listens on the host (and the connection is unknown).
             if h.op.get() != OP_RST {
                 self.control.push_back(header(key, OP_RST));
             }
@@ -362,7 +385,7 @@ impl Vsock {
     /// Starts a connection to `port` of the guest.
     fn connect(&mut self, port: u32) -> (Key, Arc<StreamShared>) {
         let mut key = (self.next_port, port);
-        while self.connections.contains_key(&key) {
+        while self.connections.contains_key(&key) || self.listeners.contains_key(&key.0) {
             self.next_port = self.next_port.wrapping_add(1).max(FIRST_HOST_PORT);
             key.0 = self.next_port;
         }
@@ -426,6 +449,10 @@ impl Device for Vsock {
             self.reset(key);
         }
         self.control.clear();
+        // Connections that nobody accepted yet are gone with the device's state.
+        for listener in self.listeners.values() {
+            listener.pending.lock().unwrap().clear();
+        }
     }
 }
 
@@ -614,6 +641,66 @@ impl AsyncWrite for VsockStream {
     }
 }
 
+/// Accepts connections from the guest to a host port.
+pub struct VsockListener {
+    board: Arc<Board>,
+    port: u32,
+    shared: Arc<ListenerShared>,
+}
+
+impl VsockListener {
+    pub(crate) fn bind(board: &Arc<Board>, port: u32) -> io::Result<Self> {
+        let shared = Arc::new(ListenerShared {
+            pending: Mutex::new(VecDeque::new()),
+            changed: Event::new(),
+        });
+        let bound = board
+            .with_vsock(|vsock, _, _| {
+                let free = !vsock.listeners.contains_key(&port);
+                if free {
+                    vsock.listeners.insert(port, shared.clone());
+                }
+                (free, false)
+            })
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "the VM has no vsock device"))?;
+        if !bound {
+            return Err(io::ErrorKind::AddrInUse.into());
+        }
+        Ok(Self {
+            board: board.clone(),
+            port,
+            shared,
+        })
+    }
+
+    /// Waits for the next connection from the guest.
+    pub async fn accept(&self) -> VsockStream {
+        let (key, shared) = wait_until(&self.shared.pending, &self.shared.changed, |pending| {
+            pending.pop_front()
+        })
+        .await;
+        VsockStream::new(&self.board, key, shared)
+    }
+}
+
+impl Drop for VsockListener {
+    fn drop(&mut self) {
+        let port = self.port;
+        let pending = std::mem::take(&mut *self.shared.pending.lock().unwrap());
+        self.board.with_vsock(|vsock, queues, memory| {
+            vsock.listeners.remove(&port);
+            // The guest learns that nobody takes the connections that we did not accept.
+            for (key, _) in pending {
+                if vsock.connections.contains_key(&key) {
+                    vsock.control.push_back(header(key, OP_RST));
+                    vsock.reset(key);
+                }
+            }
+            ((), vsock.fill(queues, memory))
+        });
+    }
+}
+
 impl Drop for StreamHandle {
     fn drop(&mut self) {
         self.close();
@@ -673,7 +760,28 @@ mod tests {
     }
 
     #[test]
-    fn refuses_connections_from_the_guest() {
+    fn accepts_connections_on_listening_ports() {
+        let mut vsock = Vsock::default();
+        let listener = Arc::new(ListenerShared {
+            pending: Mutex::new(VecDeque::new()),
+            changed: Event::new(),
+        });
+        vsock.listeners.insert(1025, listener.clone());
+        let key = (1025, 5000);
+        vsock.receive(from_guest(key, OP_REQUEST), Vec::new());
+        assert_eq!(vsock.next_packet(0).unwrap().0.op.get(), OP_RESPONSE);
+        let (accepted, shared) = listener.pending.lock().unwrap().pop_front().unwrap();
+        assert_eq!(accepted, key);
+        assert_eq!(
+            shared.state.lock().unwrap().connect,
+            ConnectState::Connected
+        );
+        vsock.receive(from_guest(key, OP_RW), b"hello".to_vec());
+        assert_eq!(shared.state.lock().unwrap().from_guest, b"hello");
+    }
+
+    #[test]
+    fn refuses_connections_to_other_ports() {
         let mut vsock = Vsock::default();
         vsock.receive(from_guest((1025, 5000), OP_REQUEST), Vec::new());
         let (h, _) = vsock.next_packet(0).unwrap();

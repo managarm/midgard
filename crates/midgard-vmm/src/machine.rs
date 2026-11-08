@@ -22,7 +22,7 @@ use crate::logging::log;
 use crate::virtio::block::{self, Block};
 use crate::virtio::fs::{self, VirtioFs};
 use crate::virtio::net::VirtioNet;
-use crate::virtio::vsock::{Vsock, VsockStream};
+use crate::virtio::vsock::{Vsock, VsockListener, VsockStream};
 use crate::virtio::{DeviceList, DeviceRef};
 use crate::{acpi, boot, clock, platform, vcpu, virtio};
 
@@ -334,6 +334,11 @@ impl MachineHandle {
     /// Connects to a vsock port that the guest listens on.
     pub async fn vsock_connect(&self, port: u32) -> io::Result<VsockStream> {
         VsockStream::connect(&self.board()?, port).await
+    }
+
+    /// Listens on a host vsock port for connections from the guest.
+    pub fn vsock_listen(&self, port: u32) -> io::Result<VsockListener> {
+        VsockListener::bind(&self.board()?, port)
     }
 }
 
