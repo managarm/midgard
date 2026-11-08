@@ -112,6 +112,24 @@ def bootstrap(spec, root, work):
         if subdirectory := spec.get("subdirectory"):
             args += [f"--strip-components={len(Path(subdirectory).parts)}", subdirectory]
         run(*args)
+    elif method == "debootstrap":
+        # Debian's debootstrap (from its source tarball), with the archive keyring (from
+        # its package). It runs the packages' scripts in a chroot.
+        require("ar", "gpgv", "perl", "wget")
+        debootstrap = work / "debootstrap"
+        keyring = work / "keyring"
+        debootstrap.mkdir()
+        keyring.mkdir()
+        run("tar", "-xzf", spec["debootstrap"]["file"], "-C", debootstrap, "--strip-components=1")
+        package = spec["keyring"]["file"]
+        data = subprocess.run(["ar", "p", package, "data.tar.xz"], check=True, capture_output=True)
+        run("tar", "-xJf", "-", "-C", keyring, input=data.stdout)
+        in_namespaces(
+            "env", "LC_ALL=C.UTF-8", f"DEBOOTSTRAP_DIR={debootstrap}", debootstrap / "debootstrap",
+            "--arch=amd64", f"--variant={spec['variant']}",
+            f"--keyring={keyring}/usr/share/keyrings/debian-archive-keyring.gpg",
+            f"--include={','.join(spec['include'])}", spec["suite"], root, spec["mirror"],
+        )  # fmt: skip
     else:
         raise Failure(f"there is no bootstrap method {method}")
 
@@ -205,7 +223,7 @@ def cmd_build(args):
     spec = json.loads(args.bootstrap)
     require("mount", "tar", "mke2fs")
     root = work / "root"
-    scratch = [root]
+    scratch = [root, work / "debootstrap", work / "keyring"]
     # (Left behind by a build that was killed.)
     for path in scratch:
         remove_tree(path)

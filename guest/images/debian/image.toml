@@ -1,0 +1,22 @@
+# Debian: a minimal system (debootstrap's minbase variant) with systemd, udev and D-Bus.
+# Sessions run as transient services of the users' systemd instances, which start at boot
+# (the user lingers) and run the Wayland display. debootstrap and the archive keyring come
+# from snapshot.debian.org (such that the URLs stay valid).
+
+[bootstrap]
+method = "debootstrap"
+suite = "trixie"
+mirror = "https://deb.debian.org/debian"
+variant = "minbase"
+include = [
+    "systemd-sysv", "udev", "dbus", "dbus-user-session", "libpam-systemd",
+    "ca-certificates", "iproute2", "iputils-ping", "procps", "less", "nano",
+]
+
+[bootstrap.debootstrap]
+url = "https://snapshot.debian.org/archive/debian/20261101T000000Z/pool/main/d/debootstrap/debootstrap_1.0.141.tar.gz"
+sha256 = "232ec755f4b1f445f829996885846abba6f1b6fd55d049476ab26ddd8c4b4e1b"
+
+[bootstrap.keyring]
+url = "https://snapshot.debian.org/archive/debian/20261101T000000Z/pool/main/d/debian-archive-keyring/debian-archive-keyring_2025.1_all.deb"
+sha256 = "9ea7778e443144ca490668737a8ab22dd3e748bb99e805e22ec055abeb3c7fac"
