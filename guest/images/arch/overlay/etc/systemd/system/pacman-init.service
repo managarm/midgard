@@ -1,0 +1,14 @@
+# Creates pacman's keyring on the first boot of midgard's Arch image.
+[Unit]
+Description=Initialize the pacman keyring
+ConditionPathExists=!/etc/pacman.d/gnupg/trustdb.gpg
+After=time-sync.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/pacman-key --init
+ExecStart=/usr/bin/pacman-key --populate
+
+[Install]
+WantedBy=multi-user.target

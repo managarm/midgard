@@ -1,0 +1,9 @@
+# The default settings of the VM instances that midgard creates from the image (its
+# template). user-setup needs the user that sessions run as by default, which midgard's
+# configuration sets, e.g. `[distros.arch.guest]` with `user = "alice"`.
+[guest]
+init = "/sbin/init"
+ready = "systemd"
+user-setup = ["/etc/midgard/user-setup"]
+launcher = "systemd"
+display = "systemd"

@@ -1,0 +1,19 @@
+# Updates and configures the system (build.py runs it as root in a chroot of the image,
+# after it copied the overlay into it).
+
+# The overlay's sources (with the updates) replace those of debootstrap.
+rm -f /etc/apt/sources.list
+apt-get -qq update
+apt-get -qq -y -o Dpkg::Use-Pty=0 upgrade
+apt-get clean
+rm -rf /var/lib/apt/lists/*
+
+# Nothing should keep the VM busy behind the user's back (and the disks do not support
+# discard). Masks hold even when the packages' scripts enable the units.
+systemctl mask apt-daily.timer apt-daily-upgrade.timer fstrim.timer systemd-firstboot.service
+
+# An empty /etc/machine-id makes systemd generate the ID when a disk boots for the first
+# time (and save it), instead of every copy of the image sharing one. Unlike a missing file
+# or "uninitialized", an empty file does not make systemd apply the presets of all units.
+: > /etc/machine-id
+rm -f /var/lib/dbus/machine-id

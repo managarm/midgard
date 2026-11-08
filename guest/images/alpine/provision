@@ -1,0 +1,31 @@
+# Installs the packages and configures OpenRC and PAM (build.py runs it as root in a
+# chroot of the image, after it copied the overlay into it).
+apk upgrade -q --no-cache
+apk add -q --no-cache alpine-base dbus dbus-openrc linux-pam runuser openrc-user \
+    openrc-user-pam pam-rundir wayland-utils weston-clients
+# apk keeps the overlay's configuration files (e.g., /etc/inittab) and saves the
+# packages' versions next to them.
+find /etc -name '*.apk-new' -delete
+
+# OpenRC's services. midgard-init mounts the API file systems and configures the
+# network; there are no modules, no hardware clock to sync and no hot-plugging.
+for service in sysinit:devfs sysinit:dmesg boot:bootmisc boot:hostname boot:sysctl \
+    boot:seedrng boot:syslog boot:cgroups default:dbus shutdown:killprocs \
+    shutdown:mount-ro shutdown:savecache; do
+    rc-update -q add "${service#*:}" "${service%%:*}"
+done
+
+# Sessions through runuser -l get a PAM session with a runtime directory.
+for service in runuser runuser-l; do
+    cat > /etc/pam.d/$service <<PAM
+auth     sufficient pam_rootok.so
+account  include    base-account
+session  include    base-session
+session  optional   pam_rundir.so
+PAM
+done
+# The users' OpenRC instances need a runtime directory, too.
+grep -q pam_rundir /etc/pam.d/openrc-user || echo "session optional pam_rundir.so" >> /etc/pam.d/openrc-user
+
+# midgard mounts the root file system.
+: > /etc/fstab

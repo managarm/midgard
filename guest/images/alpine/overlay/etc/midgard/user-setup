@@ -1,0 +1,17 @@
+#!/bin/sh
+# Creates midgard's default user and starts their OpenRC user services at boot
+# (midgard-init runs it as root before init on every boot: `user-setup`).
+set -eu
+user=$1
+id "$user" >/dev/null 2>&1 || adduser -D -s /bin/sh "$user"
+home=$(awk -F: -v user="$user" '$1 == user { print $6 }' /etc/passwd)
+runlevel="$home/.config/rc/runlevels/default"
+if [ ! -d "$runlevel" ]; then
+    mkdir -p "$runlevel"
+    for service in dbus midgard-waypipe; do
+        ln -s "/etc/user/init.d/$service" "$runlevel/$service"
+    done
+    chown -R "$(id -u "$user"):$(id -g "$user")" "$home/.config"
+fi
+[ -e "/etc/init.d/user.$user" ] || ln -s user "/etc/init.d/user.$user"
+[ -e "/etc/runlevels/default/user.$user" ] || rc-update -q add "user.$user" default

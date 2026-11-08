@@ -1,0 +1,10 @@
+# Arch Linux: the official bootstrap tarball (the base package group, with systemd) from
+# the archive (such that the URL stays valid). Sessions run as transient services of the
+# users' systemd instances, which start at boot (the user lingers) and run the Wayland
+# display.
+
+[bootstrap]
+method = "tarball"
+url = "https://archive.archlinux.org/iso/2026.11.01/archlinux-bootstrap-x86_64.tar.zst"
+sha256 = "655bc99849b80859173fa39338a6c910185e952173f6a1a61526cfa34ab8339c"
+subdirectory = "root.x86_64"

@@ -1,0 +1,18 @@
+# Updates and configures the system (build.py runs it as root in a chroot of the image,
+# after it copied the overlay into it).
+
+sed -i 's|^#\(Server = https://geo.mirror.pkgbuild.com/\)|\1|' /etc/pacman.d/mirrorlist
+# The keyring that verifies the updates is removed again: pacman-init.service creates it
+# on the first boot, such that each disk gets its own master key.
+pacman-key --init
+pacman-key --populate
+pacman -Syu --noconfirm --noprogressbar
+rm -rf /var/cache/pacman/pkg/* /var/lib/pacman/sync/*
+rm -rf /etc/pacman.d/gnupg
+systemctl enable pacman-init.service
+
+systemctl mask systemd-firstboot.service
+# An empty /etc/machine-id makes systemd generate the ID when a disk boots for the first
+# time (and save it), instead of every copy of the image sharing one. Unlike a missing file
+# or "uninitialized", an empty file does not make systemd apply the presets of all units.
+: > /etc/machine-id

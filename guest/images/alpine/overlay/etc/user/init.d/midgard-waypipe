@@ -1,0 +1,16 @@
+#!/sbin/openrc-run
+# The Wayland display, as an OpenRC user service (`display = "guest"`).
+description="Wayland forwarding to midgard's host"
+command=/run/midgard/midgard-init
+command_args=waypipe
+command_background=yes
+pidfile="$XDG_RUNTIME_DIR/midgard-waypipe.pid"
+
+depend() {
+    need dbus
+}
+
+start_post() {
+    # Services that D-Bus starts get the display, too.
+    dbus-update-activation-environment WAYLAND_DISPLAY=wayland-0 || true
+}
