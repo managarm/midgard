@@ -13,6 +13,7 @@ use std::thread::JoinHandle;
 use anyhow::{Context, Result, anyhow, bail};
 use async_executor::Executor;
 use event_listener::Event;
+use midgard_protocol::guest::Ready;
 use midgard_protocol::machine::MachineConfig;
 use midgard_protocol::{SHARE_TAG, param};
 
@@ -22,7 +23,7 @@ use crate::logging::log;
 use crate::virtio::block::{self, Block};
 use crate::virtio::fs::{self, VirtioFs};
 use crate::virtio::net::VirtioNet;
-use crate::virtio::vsock::{Vsock, VsockStream};
+use crate::virtio::vsock::{Vsock, VsockListener, VsockStream};
 use crate::virtio::{DeviceList, DeviceRef};
 use crate::{acpi, boot, clock, platform, vcpu, virtio};
 
@@ -49,6 +50,19 @@ fn validate(config: &MachineConfig) -> Result<()> {
     }
     if config.agent.is_some() && config.initrd.is_some() {
         bail!("the agent and an initrd are mutually exclusive");
+    }
+    if let Some(init) = &config.guest.init {
+        if config.agent.is_none() {
+            bail!("the distribution's init needs the agent");
+        }
+        if !init.starts_with('/') {
+            bail!("the distribution's init must be an absolute path (not {init:?})");
+        }
+    } else if config.guest.ready != Ready::Immediately {
+        bail!("waiting for the guest to boot needs the distribution's init");
+    }
+    if config.waypipe.is_some() && config.agent.is_none() {
+        bail!("the guest's waypipe needs the agent");
     }
     Ok(())
 }
@@ -153,7 +167,19 @@ fn read(path: &Path, what: &str) -> Result<Vec<u8>> {
 fn load_images(config: &MachineConfig) -> Result<(Vec<u8>, Option<Vec<u8>>)> {
     let kernel = read(&config.kernel, "the kernel")?;
     let initrd = match (&config.agent, &config.initrd) {
-        (Some(agent), _) => Some(boot::initramfs::build(&read(agent, "the agent")?)),
+        (Some(agent), _) => {
+            let mut guest_config = Vec::new();
+            midgard_protocol::write_message(&mut guest_config, &config.guest)?;
+            let waypipe = match &config.waypipe {
+                Some(path) => Some(read(path, "the guest's waypipe")?),
+                None => None,
+            };
+            Some(boot::initramfs::build(
+                &read(agent, "the agent")?,
+                &guest_config,
+                waypipe.as_deref(),
+            ))
+        }
         (None, Some(path)) => Some(read(path, "the initrd")?),
         (None, None) => None,
     };
@@ -334,6 +360,11 @@ impl MachineHandle {
     /// Connects to a vsock port that the guest listens on.
     pub async fn vsock_connect(&self, port: u32) -> io::Result<VsockStream> {
         VsockStream::connect(&self.board()?, port).await
+    }
+
+    /// Listens on a host vsock port for connections from the guest.
+    pub fn vsock_listen(&self, port: u32) -> io::Result<VsockListener> {
+        VsockListener::bind(&self.board()?, port)
     }
 }
 

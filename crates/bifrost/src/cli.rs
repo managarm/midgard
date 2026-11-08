@@ -54,9 +54,13 @@ pub struct RunArgs {
     #[arg(long, value_name = "NAME")]
     pub vm: Option<String>,
 
-    /// The working directory in the guest [default: root's home directory]
+    /// The working directory in the guest [default: the user's home directory]
     #[arg(short = 'C', long = "cd", value_name = "DIR")]
     pub cwd: Option<String>,
+
+    /// The user in the guest [default: the VM instance's default user]
+    #[arg(short = 'u', long, value_name = "NAME")]
+    pub user: Option<String>,
 
     /// Set an environment variable, can be provided multiple times
     #[arg(

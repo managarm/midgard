@@ -4,6 +4,8 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::guest::GuestConfig;
+
 /// Everything that bifrost decided about a VM; midgard boots it as described. bifrost
 /// sends it to midgard when it launches midgard (see [`crate::write_message`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -27,6 +29,11 @@ pub struct MachineConfig {
     pub network: bool,
     /// The host directory that the guest sees in [`crate::SHARE_MOUNT`] (virtio-fs).
     pub share: Option<PathBuf>,
+    /// How the agent sets up the guest (with the agent).
+    pub guest: GuestConfig,
+    /// The guest's waypipe (with the agent), which forwards the guest's Wayland clients
+    /// to midgard (see [`crate::guest::Display`]).
+    pub waypipe: Option<PathBuf>,
 }
 
 /// A disk image (raw or qcow2) that the guest sees as a virtio block device.

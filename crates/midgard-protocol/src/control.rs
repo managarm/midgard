@@ -10,7 +10,7 @@ use crate::machine::MachineConfig;
 pub enum Request {
     /// Boot a VM. midgard sends its console output until it stops, then
     /// [`Response::Stopped`]; the VM stops when bifrost closes the connection.
-    Boot(MachineConfig),
+    Boot(Box<MachineConfig>),
     /// Connect to the agent in the VM of a VM instance, which midgard starts first if it
     /// does not run (and `start`). midgard answers [`Response::Starting`] if it starts
     /// the VM and [`Response::Ready`] once the agent answers; from then on, the

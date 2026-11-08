@@ -32,3 +32,8 @@ pub fn runtime_dir(name: &str) -> PathBuf {
 pub fn console_log(name: &str) -> PathBuf {
     runtime_dir(name).join("console.log")
 }
+
+/// The socket of the `waypipe client` for a VM instance's Wayland clients.
+pub fn waypipe_socket(name: &str) -> PathBuf {
+    runtime_dir(name).join("waypipe")
+}

@@ -27,6 +27,8 @@ pub struct Exec {
     pub env: Vec<(String, String)>,
     /// The working directory (the user's home if absent).
     pub cwd: Option<String>,
+    /// The user that runs the command (the guest configuration's default if absent).
+    pub user: Option<String>,
     /// Run the command on a pseudo terminal of this size (otherwise, on pipes).
     pub tty: Option<WindowSize>,
 }

@@ -1,8 +1,9 @@
 //! The interface between bifrost (the CLI), midgard (the VMM daemon) and the guest
 //! agent (midgard-init): bifrost decides how a VM looks ([`machine::MachineConfig`]) and
 //! asks midgard to run it (see [`control`]) on midgard's socket (see [`runtime`]);
-//! bifrost and the agent speak the session protocol (see [`session`]). It also has the
-//! constants that both sides of the VM need to agree on.
+//! bifrost and the agent speak the session protocol (see [`session`]); midgard tells the
+//! agent how to set up the guest (see [`guest`]). It also has the constants that both
+//! sides of the VM need to agree on.
 //!
 //! Each message is a frame: a little-endian u32 length and the message in postcard.
 //! bifrost, midgard and the agent come from the same installation, so the encoding does
@@ -15,6 +16,7 @@ use std::io::{self, Read, Write};
 use serde::{Serialize, de::DeserializeOwned};
 
 pub mod control;
+pub mod guest;
 pub mod machine;
 pub mod runtime;
 pub mod session;
@@ -26,6 +28,9 @@ pub const GUEST_CID: u32 = 3;
 
 /// The vsock port that the agent listens on.
 pub const AGENT_PORT: u32 = 1024;
+
+/// The host vsock port that the guest's waypipe connects to (once per Wayland client).
+pub const WAYPIPE_PORT: u32 = 1025;
 
 /// The virtio-fs tag of the host's shared directory.
 pub const SHARE_TAG: &str = "managarm";
@@ -128,6 +133,7 @@ pub mod nonblocking {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::guest::{Display, GuestConfig, Launch, Launcher, Ready};
     use crate::machine::{Disk, MachineConfig};
     use crate::session::{Exec, Request, Response, WindowSize};
 
@@ -147,6 +153,16 @@ mod tests {
             }],
             network: true,
             share: Some("/".into()),
+            guest: GuestConfig {
+                init: Some("/sbin/init".into()),
+                ready: Ready::Systemd,
+                user: Some("alice".into()),
+                user_setup: Some(vec!["/etc/midgard/user-setup".into()]),
+                launcher: Launcher::Wrapper(vec!["runuser".into(), "{helper}".into()]),
+                display: Display::Systemd,
+                waypipe_debug: true,
+            },
+            waypipe: Some("/usr/lib/midgard/guest-waypipe".into()),
         };
         let mut stream = Vec::new();
         write_message(&mut stream, &config).unwrap();
@@ -216,6 +232,7 @@ mod tests {
             argv: vec!["ls".into(), "-l".into()],
             env: vec![("TERM".into(), "xterm".into())],
             cwd: Some("/root".into()),
+            user: Some("alice".into()),
             tty: Some(WindowSize { rows: 24, cols: 80 }),
         }));
         round_trip_request(Request::Stdin(b"hello".to_vec()));
@@ -236,6 +253,18 @@ mod tests {
         });
         round_trip_response(Response::Error("no such file".into()));
         round_trip_response(Response::Pong);
+    }
+
+    #[test]
+    fn launch_round_trip() {
+        let launch = Launch {
+            argv: vec!["ls".into()],
+            env: vec![("A".into(), "b".into())],
+            cwd: "/home/alice".into(),
+        };
+        let mut buffer = Vec::new();
+        write_message(&mut buffer, &launch).unwrap();
+        assert_eq!(read_message(&mut &buffer[..]).unwrap(), Some(launch));
     }
 
     #[test]
