@@ -25,6 +25,8 @@ pub struct MachineConfig {
     pub disks: Vec<Disk>,
     /// User-mode networking.
     pub network: bool,
+    /// The host directory that the guest sees in [`crate::SHARE_MOUNT`] (virtio-fs).
+    pub share: Option<PathBuf>,
 }
 
 /// A disk image (raw or qcow2) that the guest sees as a virtio block device.

@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use async_io::{Async, Timer};
-use midgard_protocol::{AGENT_PORT, param};
-use sys::mount;
+use midgard_protocol::{AGENT_PORT, SHARE_MOUNT, SHARE_TAG, param};
+use sys::{Error, mount};
 
 /// The default PATH of sessions.
 pub const PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
@@ -80,6 +80,7 @@ fn boot() -> Result<()> {
 
     setup_root();
     setup_network();
+    mount_share();
     agent()
 }
 
@@ -144,6 +145,18 @@ fn setup_network() {
                 log!("writing /etc/resolv.conf: {error}");
             }
         }
+    }
+}
+
+/// The host's shared directory (virtio-fs), if midgard offers one.
+fn mount_share() {
+    let _ = std::fs::create_dir_all(SHARE_MOUNT);
+    match mount(SHARE_TAG, SHARE_MOUNT, "virtiofs", 0, None) {
+        Ok(()) => {}
+        // No virtio-fs device with that tag (or no virtio-fs at all).
+        Err(Error::Os { error, .. })
+            if matches!(error.raw_os_error(), Some(libc::EINVAL | libc::ENODEV)) => {}
+        Err(error) => log!("{error}"),
     }
 }
 

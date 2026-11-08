@@ -175,6 +175,14 @@ pub struct BootArgs {
     #[arg(long)]
     pub no_network: bool,
 
+    /// The host directory in /mnt/managarm [default: /]
+    #[arg(long, value_name = "DIR", conflicts_with = "no_share")]
+    pub share: Option<PathBuf>,
+
+    /// No shared directory
+    #[arg(long)]
+    pub no_share: bool,
+
     /// A disk image (raw or qcow2), can be provided multiple times (the first one is
     /// the root file system)
     #[arg(long, value_name = "FILE[,ro]", value_parser = parse_disk)]
@@ -366,6 +374,22 @@ mod tests {
         };
         assert_eq!(boot.agent, Some(PathBuf::from("midgard-init")));
         assert!(parse(&["boot", "--kernel", "k", "--agent", "a", "--initrd", "i"]).is_err());
+    }
+
+    #[test]
+    fn boot_share() {
+        let cli = parse(&["boot", "--kernel", "bzImage", "--share", "/home"]).unwrap();
+        let Some(Action::Boot(boot)) = cli.action else {
+            panic!("not boot: {:?}", cli.action);
+        };
+        assert_eq!(boot.share, Some(PathBuf::from("/home")));
+        assert!(!boot.no_share);
+        let cli = parse(&["boot", "--kernel", "bzImage", "--no-share"]).unwrap();
+        let Some(Action::Boot(boot)) = cli.action else {
+            panic!("not boot: {:?}", cli.action);
+        };
+        assert!(boot.no_share);
+        assert!(parse(&["boot", "--kernel", "k", "--share", "/", "--no-share"]).is_err());
     }
 
     #[test]

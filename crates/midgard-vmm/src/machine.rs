@@ -14,12 +14,13 @@ use anyhow::{Context, Result, anyhow, bail};
 use async_executor::Executor;
 use event_listener::Event;
 use midgard_protocol::machine::MachineConfig;
-use midgard_protocol::param;
+use midgard_protocol::{SHARE_TAG, param};
 
 use crate::board::Board;
 use crate::host::{image, net};
 use crate::logging::log;
 use crate::virtio::block::{self, Block};
+use crate::virtio::fs::{self, VirtioFs};
 use crate::virtio::net::VirtioNet;
 use crate::virtio::vsock::{Vsock, VsockStream};
 use crate::virtio::{DeviceList, DeviceRef};
@@ -61,6 +62,8 @@ struct Devices {
     network: Option<(DeviceRef<VirtioNet>, async_channel::Receiver<Vec<u8>>)>,
     /// The block devices and their host side (which starts once the VM exists).
     disks: Vec<(DeviceRef<Block>, block::Backend)>,
+    /// The shared directory's device and its host side (which starts once the VM exists).
+    share: Option<(DeviceRef<VirtioFs>, fs::Backend)>,
 }
 
 fn create_devices(config: &MachineConfig) -> Result<Devices> {
@@ -71,6 +74,14 @@ fn create_devices(config: &MachineConfig) -> Result<Devices> {
         let (handle, from_guest) = net::channel();
         (list.add(VirtioNet::new(net::GUEST_MAC, handle)), from_guest)
     });
+    let share = match &config.share {
+        Some(directory) => {
+            let (device, backend) = VirtioFs::new(SHARE_TAG, directory)
+                .with_context(|| format!("cannot share {directory:?}"))?;
+            Some((list.add(device), backend))
+        }
+        None => None,
+    };
     let mut disks = Vec::new();
     for (index, disk) in config.disks.iter().enumerate() {
         let image = image::open(&disk.path, disk.read_only)
@@ -90,6 +101,7 @@ fn create_devices(config: &MachineConfig) -> Result<Devices> {
         vsock,
         network,
         disks,
+        share,
     })
 }
 
@@ -167,6 +179,8 @@ pub struct Machine {
     running: Arc<Running>,
     /// The block devices' I/O, which must finish before the VM is gone.
     disks: Vec<block::Shutdown>,
+    /// The shared directory's requests, which must finish before the VM is gone.
+    share: Option<fs::Shutdown>,
 }
 
 /// Counts the vCPU threads that did not exit yet.
@@ -256,6 +270,7 @@ impl Drop for Machine {
     fn drop(&mut self) {
         self.board.stop();
         let disks = std::mem::take(&mut self.disks);
+        let share = self.share.take();
         async_io::block_on(self.executor.run(async {
             // The VM's tasks keep running until the vCPUs are gone: a vCPU may wait for
             // them (e.g., for disk I/O when the guest resets the device).
@@ -264,6 +279,9 @@ impl Drop for Machine {
             // may open the images).
             for disk in disks {
                 disk.wait().await;
+            }
+            if let Some(share) = share {
+                share.wait().await;
             }
         }));
         for thread in self.threads.drain(..) {
@@ -347,6 +365,7 @@ fn spawn_vcpus(
     board: Arc<Board>,
     executor: Arc<Executor<'static>>,
     disks: Vec<block::Shutdown>,
+    share: Option<fs::Shutdown>,
     vcpus: Vec<vcpu::Vcpu>,
 ) -> Result<Machine> {
     let (sender, stopped) = async_channel::unbounded();
@@ -359,6 +378,7 @@ fn spawn_vcpus(
         executor,
         running: Arc::default(),
         disks,
+        share,
     };
     for (id, mut vcpu) in vcpus.into_iter().enumerate() {
         let sender = sender.clone();
@@ -432,5 +452,7 @@ pub fn start(config: &MachineConfig, console: Box<dyn Write + Send>) -> Result<M
     let disks = (devices.disks.into_iter())
         .map(|(device, backend)| block::start(&executor, board.clone(), device, backend))
         .collect();
-    spawn_vcpus(board, executor, disks, vcpus)
+    let share = (devices.share)
+        .map(|(device, backend)| fs::start(&executor, board.clone(), device, backend));
+    spawn_vcpus(board, executor, disks, share, vcpus)
 }

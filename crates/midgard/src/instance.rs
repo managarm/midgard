@@ -62,6 +62,7 @@ pub fn config(name: &str) -> Result<MachineConfig> {
             read_only: false,
         }],
         network: true,
+        share: Some("/".into()),
     })
 }
 
