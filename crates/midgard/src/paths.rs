@@ -1,5 +1,5 @@
 //! Where midgard's files are: its inputs (the guest kernel and the agent) and the VM
-//! instances' disks. The daemon's runtime files are in [`midgard_protocol::runtime`].
+//! instances' disks and instance files. The daemon's runtime files are in [`midgard_protocol::runtime`].
 
 use std::path::PathBuf;
 
@@ -70,4 +70,10 @@ pub fn disk_candidates(name: &str) -> impl Iterator<Item = PathBuf> {
     IMAGE_EXTENSIONS
         .into_iter()
         .map(move |extension| dir.join(format!("{name}.{extension}")))
+}
+
+/// The instance file of a VM instance (in [`state_dir`], next to its disk), which it
+/// does not need to have.
+pub fn instance_file(name: &str) -> PathBuf {
+    state_dir().join(format!("{name}.toml"))
 }
