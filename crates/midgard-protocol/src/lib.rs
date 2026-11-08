@@ -1,8 +1,9 @@
 //! The interface between bifrost (the CLI), midgard (the VMM daemon) and the guest
 //! agent (midgard-init): bifrost decides how a VM looks ([`machine::MachineConfig`]) and
 //! asks midgard to run it (see [`control`]) on midgard's socket (see [`runtime`]);
-//! bifrost and the agent speak the session protocol (see [`session`]). It also has the
-//! constants that both sides of the VM need to agree on.
+//! bifrost and the agent speak the session protocol (see [`session`]); midgard tells the
+//! agent how to set up the guest (see [`guest`]). It also has the constants that both
+//! sides of the VM need to agree on.
 //!
 //! Each message is a frame: a little-endian u32 length and the message in postcard.
 //! bifrost, midgard and the agent come from the same installation, so the encoding does
@@ -15,6 +16,7 @@ use std::io::{self, Read, Write};
 use serde::{Serialize, de::DeserializeOwned};
 
 pub mod control;
+pub mod guest;
 pub mod machine;
 pub mod runtime;
 pub mod session;
@@ -128,6 +130,7 @@ pub mod nonblocking {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::guest::{GuestConfig, Ready};
     use crate::machine::{Disk, MachineConfig};
     use crate::session::{Exec, Request, Response, WindowSize};
 
@@ -147,6 +150,10 @@ mod tests {
             }],
             network: true,
             share: Some("/".into()),
+            guest: GuestConfig {
+                init: Some("/sbin/init".into()),
+                ready: Ready::Systemd,
+            },
         };
         let mut stream = Vec::new();
         write_message(&mut stream, &config).unwrap();

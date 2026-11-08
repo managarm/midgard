@@ -2,7 +2,7 @@
 //! std::process::Command) because the reaper owns all wait statuses.
 
 use std::ffi::CString;
-use std::os::fd::RawFd;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 use super::sys::{Error, cstring};
 
@@ -125,6 +125,30 @@ pub fn spawn(
         return Err(Error::io(path, std::io::Error::from_raw_os_error(errno)));
     }
     Ok(pid)
+}
+
+/// Opens /dev/null (e.g., as the stdin of background processes).
+pub fn dev_null() -> Result<OwnedFd, Error> {
+    // SAFETY: open() takes a NUL-terminated path.
+    let fd = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return Err(Error::last("/dev/null"));
+    }
+    // SAFETY: We own the new file descriptor.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// Starts a process in the background: its stdin is /dev/null, its output goes to the
+/// console (our stdout / stderr), and nobody waits for its status.
+pub fn spawn_background(path: &str, argv: &[String], env: &[String]) -> Result<i32, Error> {
+    let null = dev_null()?;
+    let stdio = Stdio::Pipes {
+        stdin: null.as_raw_fd(),
+        stdout: 1,
+        stderr: 2,
+    };
+    // Nobody registers it, so the reaper drops its status.
+    spawn(path, argv, env, "/", &stdio)
 }
 
 /// Converts a wait status to (exit code, signal).

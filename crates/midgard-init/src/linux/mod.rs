@@ -1,6 +1,8 @@
-//! Boot: mount the root file system, move into it and serve sessions.
+//! Boot: mount the root file system, move into it, start the distribution's init (if
+//! the guest configuration names one) and serve sessions.
 
 mod process;
+mod ready;
 mod reaper;
 mod rt;
 mod session;
@@ -8,30 +10,76 @@ mod sys;
 
 use std::fs::File;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use async_io::{Async, Timer};
+use midgard_protocol::guest::{CONFIG_FILE, GuestConfig};
 use midgard_protocol::{AGENT_PORT, SHARE_MOUNT, SHARE_TAG, param};
 use sys::{Error, mount};
 
 /// The default PATH of sessions.
 pub const PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
+/// Where we put files for the guest (a tmpfs, see [`setup_root`]).
+pub const RUN_DIR: &str = "/run/midgard";
+/// Our executable in the guest, which the guest runs in other modes (see [`main`]).
+pub const HELPER: &str = "/run/midgard/midgard-init";
+
+/// The guest configuration (from the initramfs).
+static CONFIG: OnceLock<GuestConfig> = OnceLock::new();
+
+/// Whether we started the distribution's init (and are its child).
+static INIT_RUNS: AtomicBool = AtomicBool::new(false);
+
+/// Whether the distribution's init runs as PID 1 (and we are its child).
+pub fn init_runs() -> bool {
+    // If executing the init failed, PID 1 is still us.
+    INIT_RUNS.load(Ordering::Relaxed) && !same_file("/proc/1/exe", "/proc/self/exe")
+}
+
+fn same_file(a: &str, b: &str) -> bool {
+    match (std::fs::metadata(a), std::fs::metadata(b)) {
+        (Ok(a), Ok(b)) => (a.dev(), a.ino()) == (b.dev(), b.ino()),
+        _ => false,
+    }
+}
+
+/// Logs a line to the console, in one write: the distribution's init writes there, too.
 macro_rules! log {
-    ($($arg:tt)*) => { eprintln!("midgard-init: {}", format_args!($($arg)*)) };
+    ($($arg:tt)*) => {{
+        let line = format!("midgard-init: {}\n", format_args!($($arg)*));
+        let _ = std::io::Write::write_all(&mut std::io::stderr(), line.as_bytes());
+    }};
 }
 pub(crate) use log;
 
 pub fn main() {
-    if std::process::id() != 1 {
-        eprintln!("midgard-init: must run as PID 1");
-        std::process::exit(1);
+    // (As PID 1, we ignore our arguments: the kernel passes the parameters that it does not
+    // know, e.g., "single".)
+    if std::process::id() == 1 {
+        if let Err(error) = boot() {
+            log!("{error:#}");
+            // PID 1 must not exit; stop the VM instead (midgard sees all vCPUs halt).
+            sys::power_off();
+        }
+        return;
     }
-    if let Err(error) = boot() {
-        log!("{error:#}");
-        // PID 1 must not exit; stop the VM instead (midgard sees all vCPUs halt).
-        sys::power_off();
+    // The guest runs us (as HELPER) in other modes.
+    let mode = std::env::args().nth(1).unwrap_or_default();
+    let result = match mode.as_str() {
+        "ready" => ready::notify(),
+        _ => {
+            eprintln!("midgard-init: unknown mode {mode:?} (the agent runs as PID 1)");
+            std::process::exit(2);
+        }
+    };
+    if let Err(error) = result {
+        eprintln!("midgard-init: {error}");
+        std::process::exit(1);
     }
 }
 
@@ -55,6 +103,7 @@ fn boot() -> Result<()> {
     let root = parameter(&cmdline, param::ROOT)
         .with_context(|| format!("no {}= parameter", param::ROOT))?;
     let fstype = parameter(&cmdline, param::ROOT_FSTYPE).unwrap_or_else(|| "ext4".into());
+    let config = load_config();
 
     // The disk shows up once its driver probed it.
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -67,7 +116,7 @@ fn boot() -> Result<()> {
     mount(&root, "/newroot", &fstype, 0, None)?;
 
     // Move /dev and /proc into the new root and make it the root (like switch_root;
-    // the initramfs stays in memory, but it only contains us).
+    // the initramfs stays in memory, but only we are left in it).
     for dir in ["/dev", "/proc"] {
         let target = format!("/newroot{dir}");
         let _ = std::fs::create_dir(&target);
@@ -81,17 +130,91 @@ fn boot() -> Result<()> {
     setup_root();
     setup_network();
     mount_share();
-    agent()
+    install_helper();
+    let config = CONFIG.get_or_init(|| config);
+    let watcher = ready::Watcher::new(config.ready);
+
+    // With the distribution's init, it becomes PID 1 and we continue as its child. We
+    // are still single-threaded here, which makes fork() safe.
+    if let Some(init) = &config.init {
+        // SAFETY: fork() in a single-threaded process.
+        match unsafe { libc::fork() } {
+            -1 => bail!("fork(): {}", std::io::Error::last_os_error()),
+            0 => {
+                INIT_RUNS.store(true, Ordering::Relaxed);
+                // SAFETY: setsid() has no preconditions; it detaches us from init's
+                // session and process group.
+                unsafe { libc::setsid() };
+                if let Err(error) = agent(watcher) {
+                    log!("{error:#}");
+                }
+                std::process::exit(1);
+            }
+            _ => exec_init(init),
+        }
+    }
+    agent(watcher)
 }
 
-/// Serves sessions as PID 1. One thread runs everything (see [`rt`]).
-fn agent() -> Result<()> {
+/// Reads the guest configuration from the initramfs (before we leave it).
+fn load_config() -> GuestConfig {
+    let path = format!("/{CONFIG_FILE}");
+    let result = File::open(&path)
+        .and_then(|mut file| midgard_protocol::read_message(&mut file))
+        .map(Option::unwrap_or_default);
+    // The initramfs stays in memory.
+    let _ = std::fs::remove_file(&path);
+    result.unwrap_or_else(|error| {
+        log!("reading {path}: {error}; using the default configuration");
+        GuestConfig::default()
+    })
+}
+
+/// Copies ourselves to [`HELPER`], such that the guest can run us.
+fn install_helper() {
+    let result = std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o755)
+        .create(RUN_DIR)
+        .and_then(|()| std::fs::copy("/proc/self/exe", HELPER))
+        .and_then(|_| std::fs::set_permissions(HELPER, PermissionsExt::from_mode(0o755)));
+    if let Err(error) = result {
+        log!("installing {HELPER}: {error}");
+    }
+}
+
+/// Serves sessions (as PID 1 or as a child of the distribution's init). One thread runs
+/// everything (see [`rt`]).
+fn agent(watcher: ready::Watcher) -> Result<()> {
     // Before any thread starts (async-io starts one).
     reaper::block_sigchld();
     rt::block_on(async {
         rt::spawn(reaper::run()).detach();
+        rt::spawn(ready::watch(watcher)).detach();
         serve().await
     })
+}
+
+/// Replaces PID 1 with the distribution's init. If that fails, PID 1 only reaps orphans
+/// (the agent already runs).
+fn exec_init(init: &str) -> ! {
+    log!("starting {init}");
+    // Rust ignores SIGPIPE; the ignored disposition would survive exec.
+    // SAFETY: signal() only takes numbers.
+    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+    let path = sys::cstring(init);
+    let argv = [path.as_ptr(), std::ptr::null()];
+    let env = [c"HOME=/".as_ptr(), c"TERM=linux".as_ptr(), std::ptr::null()];
+    // SAFETY: argv and env are NULL-terminated arrays of NUL-terminated strings.
+    unsafe { libc::execve(path.as_ptr(), argv.as_ptr(), env.as_ptr()) };
+    log!("executing {init}: {}", std::io::Error::last_os_error());
+    loop {
+        let mut status = 0;
+        // SAFETY: waitpid() only writes the status.
+        if unsafe { libc::waitpid(-1, &mut status, 0) } < 0 {
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    }
 }
 
 /// Mounts that every distribution expects.

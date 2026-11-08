@@ -1,8 +1,10 @@
 //! The initramfs that runs midgard-init: built in memory as a "newc" cpio archive.
 
-/// Builds an archive with /init (the agent), /dev/console and the directories that the
-/// agent mounts on.
-pub(crate) fn build(init: &[u8]) -> Vec<u8> {
+use midgard_protocol::guest::CONFIG_FILE;
+
+/// Builds an archive with /init (the agent), /dev/console, the directories that the
+/// agent mounts on and the guest configuration (see [`midgard_protocol::guest`]).
+pub(crate) fn build(init: &[u8], guest_config: &[u8]) -> Vec<u8> {
     let mut archive = Vec::new();
     let mut inode = 1;
     let mut add = |name: &str, mode: u32, rdev: (u32, u32), data: &[u8]| {
@@ -36,6 +38,7 @@ pub(crate) fn build(init: &[u8]) -> Vec<u8> {
     // The kernel opens /dev/console for init before init runs.
     add("dev/console", 0o020600, (5, 1), &[]);
     add("init", 0o100755, (0, 0), init);
+    add(CONFIG_FILE, 0o100644, (0, 0), guest_config);
     add("TRAILER!!!", 0, (0, 0), &[]);
     archive
 }
@@ -46,13 +49,14 @@ mod tests {
 
     #[test]
     fn layout() {
-        let archive = build(b"#!binary");
+        let archive = build(b"#!binary", b"config");
         assert!(archive.starts_with(b"070701"));
         assert_eq!(archive.len() % 4, 0);
         // Every entry starts at a 4-byte boundary with the magic.
         let text = String::from_utf8_lossy(&archive);
-        assert_eq!(text.matches("070701").count(), 7);
+        assert_eq!(text.matches("070701").count(), 8);
         assert!(text.contains("init\0"));
+        assert!(text.contains("guest-config\0"));
         assert!(text.contains("TRAILER!!!\0"));
         assert!(archive.windows(8).any(|w| w == b"#!binary"));
     }

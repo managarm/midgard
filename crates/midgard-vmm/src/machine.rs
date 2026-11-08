@@ -13,6 +13,7 @@ use std::thread::JoinHandle;
 use anyhow::{Context, Result, anyhow, bail};
 use async_executor::Executor;
 use event_listener::Event;
+use midgard_protocol::guest::Ready;
 use midgard_protocol::machine::MachineConfig;
 use midgard_protocol::{SHARE_TAG, param};
 
@@ -49,6 +50,16 @@ fn validate(config: &MachineConfig) -> Result<()> {
     }
     if config.agent.is_some() && config.initrd.is_some() {
         bail!("the agent and an initrd are mutually exclusive");
+    }
+    if let Some(init) = &config.guest.init {
+        if config.agent.is_none() {
+            bail!("the distribution's init needs the agent");
+        }
+        if !init.starts_with('/') {
+            bail!("the distribution's init must be an absolute path (not {init:?})");
+        }
+    } else if config.guest.ready != Ready::Immediately {
+        bail!("waiting for the guest to boot needs the distribution's init");
     }
     Ok(())
 }
@@ -153,7 +164,14 @@ fn read(path: &Path, what: &str) -> Result<Vec<u8>> {
 fn load_images(config: &MachineConfig) -> Result<(Vec<u8>, Option<Vec<u8>>)> {
     let kernel = read(&config.kernel, "the kernel")?;
     let initrd = match (&config.agent, &config.initrd) {
-        (Some(agent), _) => Some(boot::initramfs::build(&read(agent, "the agent")?)),
+        (Some(agent), _) => {
+            let mut guest_config = Vec::new();
+            midgard_protocol::write_message(&mut guest_config, &config.guest)?;
+            Some(boot::initramfs::build(
+                &read(agent, "the agent")?,
+                &guest_config,
+            ))
+        }
         (None, Some(path)) => Some(read(path, "the initrd")?),
         (None, None) => None,
     };

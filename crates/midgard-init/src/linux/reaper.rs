@@ -1,6 +1,7 @@
-//! As PID 1, we reap every process. Sessions register the processes that they started
-//! and get their wait status; the statuses of other processes (e.g., orphans that the
-//! kernel reparented to us) are dropped. SIGCHLD arrives through a signalfd.
+//! We reap our children (as PID 1, every process). Sessions register the processes that
+//! they started and get their wait status; the statuses of other processes (e.g.,
+//! orphans that the kernel reparented to us) are dropped. SIGCHLD arrives through a
+//! signalfd.
 //!
 //! The reaper runs as a task on the agent's only thread, and sessions register a process
 //! before they await anything after starting it, so the reaper never sees a process

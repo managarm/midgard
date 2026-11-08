@@ -6,6 +6,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use midgard_protocol::control::{Request, Response};
+use midgard_protocol::guest::GuestConfig;
 use midgard_protocol::machine::{Disk, MachineConfig};
 
 use crate::cli::BootArgs;
@@ -54,6 +55,8 @@ fn config(boot: &BootArgs) -> Result<MachineConfig> {
             (Some(share), false) => Some(absolute(share)?),
             (None, false) => Some("/".into()),
         },
+        // The agent stays PID 1.
+        guest: GuestConfig::default(),
     })
 }
 

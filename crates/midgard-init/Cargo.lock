@@ -252,6 +252,7 @@ dependencies = [
  "async-channel",
  "async-executor",
  "async-io",
+ "event-listener",
  "futures-lite",
  "libc",
  "midgard-protocol",

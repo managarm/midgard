@@ -2,6 +2,7 @@
 //! [`paths::state_dir`]) that midgard boots with its guest kernel and the agent.
 
 use anyhow::{Result, bail};
+use midgard_protocol::guest::GuestConfig;
 use midgard_protocol::machine::{Disk, MachineConfig};
 
 use crate::paths;
@@ -63,6 +64,7 @@ pub fn config(name: &str) -> Result<MachineConfig> {
         }],
         network: true,
         share: Some("/".into()),
+        guest: GuestConfig::default(),
     })
 }
 

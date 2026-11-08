@@ -14,7 +14,7 @@ use midgard_protocol::session::{Exec, Request, Response, WindowSize};
 
 use super::process::{self, Stdio};
 use super::sys::{self, Error};
-use super::{PATH, log, reaper, rt};
+use super::{PATH, log, ready, reaper, rt};
 
 /// How long we wait for output after the command exited (e.g., for background
 /// processes that keep the terminal open, we do not wait forever).
@@ -44,6 +44,7 @@ pub async fn handle(stream: Async<File>) {
             shutdown().await
         }
         Ok(Some(Request::Exec(exec))) => {
+            ready::wait().await;
             if let Err(error) = run(exec, &stream).await {
                 reply(Response::Error(error.to_string())).await;
             }
@@ -312,8 +313,29 @@ async fn forward_input(stream: Stream, mut input: Input, pid: i32, finished: Rc<
     }
 }
 
+/// How long the distribution's init may take to power off.
+const POWEROFF_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Stops all processes, unmounts everything and powers off.
 async fn shutdown() {
+    if super::init_runs() {
+        // The distribution's init stops its services and powers off (and kills us on the
+        // way). If it does not within the timeout, we do it ourselves.
+        log!("asking init to power off");
+        let path = process::resolve("poweroff", PATH).unwrap_or_else(|| "/sbin/poweroff".into());
+        let argv = vec!["poweroff".to_string()];
+        let env = vec![format!("PATH={PATH}")];
+        match process::spawn_background(&path, &argv, &env) {
+            Ok(_) => {
+                Timer::after(POWEROFF_TIMEOUT).await;
+                log!(
+                    "init did not power off within {} s",
+                    POWEROFF_TIMEOUT.as_secs()
+                );
+            }
+            Err(error) => log!("running poweroff: {error}"),
+        }
+    }
     log!("shutting down");
     // SAFETY: kill(-1) signals all processes except us.
     unsafe { libc::kill(-1, libc::SIGTERM) };
