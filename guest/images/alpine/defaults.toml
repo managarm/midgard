@@ -1,0 +1,10 @@
+# The default settings of the VM instances that midgard creates from the image (its
+# template). user-setup needs the user that sessions run as by default, which midgard's
+# configuration sets, e.g. `[distros.alpine.guest]` with `user = "alice"`.
+[guest]
+init = "/sbin/init"
+ready = "notify"
+user-setup = ["/etc/midgard/user-setup"]
+launcher = "wrapper"
+wrapper = ["runuser", "-l", "{user}", "-s", "{helper}"]
+display = "guest"

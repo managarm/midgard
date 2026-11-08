@@ -1,0 +1,16 @@
+#!/bin/sh
+# Tells midgard-init that the guest booted (`ready = "notify"`), once the users' OpenRC
+# instances (which start in the background) started their services.
+for link in /etc/runlevels/default/user.*; do
+    [ -e "$link" ] || continue
+    uid=$(id -u "${link##*/user.}") || continue
+    # Up to 30 s.
+    tries=600
+    while [ "$(cat "/run/user/$uid/openrc/softlevel" 2>/dev/null)" != default ] ||
+        pgrep -u "$uid" -x openrc >/dev/null; do
+        tries=$((tries - 1))
+        [ "$tries" -gt 0 ] || break
+        sleep 0.05
+    done
+done
+exec /run/midgard/midgard-init ready

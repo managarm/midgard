@@ -1,0 +1,8 @@
+# Alpine Linux: OpenRC (started by busybox init) and D-Bus. Sessions run through
+# runuser (with a PAM session, in which pam_rundir creates XDG_RUNTIME_DIR), and each
+# user's OpenRC user services run D-Bus and the Wayland display.
+
+[bootstrap]
+method = "tarball"
+url = "https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/x86_64/alpine-minirootfs-3.24.4-x86_64.tar.gz"
+sha256 = "cdaa38cb8de3537967ee5b6c9b6cd00cc962da2b018e6eea48696bb274923012"

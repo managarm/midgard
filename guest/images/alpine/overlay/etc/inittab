@@ -1,0 +1,10 @@
+# /etc/inittab of midgard's Alpine image (busybox init, which midgard-init executes as
+# PID 1 after it mounted the API file systems). OpenRC starts the services of the
+# runlevels; then /etc/midgard/booted tells midgard-init that the guest booted
+# (`ready = "notify"`).
+::sysinit:/sbin/openrc sysinit
+::sysinit:/sbin/openrc boot
+::wait:/sbin/openrc default
+::wait:/etc/midgard/booted
+::ctrlaltdel:/sbin/reboot
+::shutdown:/sbin/openrc shutdown
