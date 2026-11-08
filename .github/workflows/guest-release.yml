@@ -1,0 +1,39 @@
+name: Guest release
+
+# Publishes the guest files that a run of guest.yml built as a release (guest-<date>), with
+# those of the previous guest release for the targets that the run did not build, and
+# deletes old guest releases (see guest/publish.py).
+
+on:
+  workflow_dispatch:
+    inputs:
+      run:
+        description: The ID of the run of the Guest workflow
+        required: true
+
+permissions:
+  contents: write
+  actions: read
+
+# (Releases of the same day would get the same tag.)
+concurrency:
+  group: guest-release
+
+jobs:
+  release:
+    name: Publish
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          run-id: ${{ inputs.run }}
+          github-token: ${{ github.token }}
+          pattern: guest-*
+          merge-multiple: true
+          path: dist
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN: ${{ inputs.run }}
+        run: python3 guest/publish.py dist --run "$RUN"

@@ -16,7 +16,8 @@ from it, defaults.toml).
 `build` builds targets into the output directory, with <target>.json, which lists their
 files with their SHA-256 and what they were built from.
 `targets` lists the targets (whose inputs changed) as JSON, for CI
-(.github/workflows/guest.yml).
+(.github/workflows/guest.yml); guest/publish.py publishes the files of a workflow run as a
+guest release.
 
 Images are built without root: guest/rootfs.py, which creates an image's file system,
 runs as root in a user namespace (unshare --map-root-user --map-auto, which needs
@@ -48,6 +49,8 @@ REPO = GUEST.parent
 CACHE = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "midgard-build"
 DIST = CACHE / "dist"
 IMAGES = GUEST / "images"
+# The tags of the releases with guest files.
+RELEASE_PREFIX = "guest-"
 # The workflow that builds the targets.
 WORKFLOW = ".github/workflows/guest.yml"
 
@@ -304,6 +307,18 @@ def cmd_build(args):
             files = build_image(target, out, namespace)
         write_manifest(out, target, files)
         log(f"built {target}: {', '.join(files)} in {out}")
+
+
+def read_manifest(directory, target):
+    """Reads <target>.json and checks the files that it lists."""
+    path = directory / f"{target}.json"
+    if not path.exists():
+        raise Failure(f"there is no {path} (build {target} first)")
+    manifest = json.loads(path.read_text())
+    for name, sha256 in manifest["files"].items():
+        if not (directory / name).exists() or file_sha256(directory / name) != sha256:
+            raise Failure(f"{directory / name} is not the file that {path} lists")
+    return manifest
 
 
 def changed_files(commit):
