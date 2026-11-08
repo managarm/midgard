@@ -2,6 +2,7 @@
 """Builds midgard's guest files on a Linux host: the guest kernel (vmlinuz), which midgard
 boots with midgard-init as the initramfs, and the distributions' disk images.
 
+    build.py install [<target>...] [--release <tag> | --run <id> | --local] [-d <dir>]
     build.py build <target>... [-o <dir>]
     build.py targets [--changed-since <commit>]
 
@@ -13,11 +14,14 @@ template: <name>.qcow2.zst (its sparse 64 GiB ext4 file system as a qcow2 image,
 with zstd) and <name>.toml (the default settings of the VM instances that midgard creates
 from it, defaults.toml).
 
-`build` builds targets into the output directory, with <target>.json, which lists their
-files with their SHA-256 and what they were built from.
-`targets` lists the targets (whose inputs changed) as JSON, for CI
-(.github/workflows/guest.yml); guest/publish.py publishes the files of a workflow run as a
-guest release.
+`install` installs targets' files into midgard's data directory (default: $MIDGARD_DATA_DIR
+or ~/.local/lib/midgard), where midgard finds the kernel and the templates: those that CI
+built (.github/workflows/guest.yml), from the newest guest release (guest-<date>) by
+default, from another release or from a workflow run (which needs gh), or those that
+`build` built (--local). `build` builds targets into the output directory (--build-dir of
+`install`), with <target>.json, which lists their files with their SHA-256 and what they
+were built from. `targets` lists the targets (whose inputs changed) as JSON, for CI;
+guest/publish.py publishes the files of a workflow run as a guest release.
 
 Images are built without root: guest/rootfs.py, which creates an image's file system,
 runs as root in a user namespace (unshare --map-root-user --map-auto, which needs
@@ -26,8 +30,8 @@ any owner and the package managers can run the packages' scripts.
 
 Downloads and intermediate files are in $XDG_CACHE_HOME/midgard-build
 (~/.cache/midgard-build); the output directory defaults to its dist directory. Needs
-Python 3.11, what building Linux needs (make, gcc, flex, bison, bc, the libelf headers)
-and, for images, util-linux (unshare, mount), e2fsprogs and zstd.
+Python 3.11, and `build` needs what building Linux needs (make, gcc, flex, bison, bc, the
+libelf headers) and, for images, util-linux (unshare, mount), e2fsprogs and zstd.
 """
 
 import argparse
@@ -40,6 +44,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import tomllib
 import urllib.request
 from pathlib import Path
@@ -49,6 +54,8 @@ REPO = GUEST.parent
 CACHE = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "midgard-build"
 DIST = CACHE / "dist"
 IMAGES = GUEST / "images"
+# The GitHub repository whose guest releases and workflow runs `install` downloads.
+GITHUB_REPO = "48cf/midgard"
 # The tags of the releases with guest files.
 RELEASE_PREFIX = "guest-"
 # The workflow that builds the targets.
@@ -309,6 +316,17 @@ def cmd_build(args):
         log(f"built {target}: {', '.join(files)} in {out}")
 
 
+def env_path(name):
+    value = os.environ.get(name)
+    return Path(value) if value else None
+
+
+def data_dir():
+    """Where midgard looks for the guest kernel and the templates first (see
+    crates/midgard/src/paths.rs)."""
+    return env_path("MIDGARD_DATA_DIR") or Path.home() / ".local/lib/midgard"
+
+
 def read_manifest(directory, target):
     """Reads <target>.json and checks the files that it lists."""
     path = directory / f"{target}.json"
@@ -319,6 +337,91 @@ def read_manifest(directory, target):
         if not (directory / name).exists() or file_sha256(directory / name) != sha256:
             raise Failure(f"{directory / name} is not the file that {path} lists")
     return manifest
+
+
+def fetch_json(url, headers={}):
+    try:
+        request = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(request, timeout=60) as response:
+            return json.load(response)
+    except (OSError, http.client.HTTPException) as error:
+        raise Failure(f"cannot download {url}: {error}")
+
+
+def install_release(repo, tag, wanted, data):
+    """Downloads targets' files from a guest release (default: the newest) into the data
+    directory."""
+    if tag is None:
+        # (Newest first.)
+        url = f"https://api.github.com/repos/{repo}/releases?per_page=100"
+        releases = fetch_json(url, {"Accept": "application/vnd.github+json"})
+        tags = [r["tag_name"] for r in releases if r["tag_name"].startswith(RELEASE_PREFIX)]
+        if not tags:
+            raise Failure(f"{repo} has no guest releases")
+        tag = tags[0]
+    log(f"installing from the release {tag}")
+    base = f"https://github.com/{repo}/releases/download/{tag}"
+    manifest = fetch_json(f"{base}/manifest.json")
+    entries = []
+    for target in wanted or manifest:
+        if target not in manifest:
+            raise Failure(f"the release {tag} has no {target}")
+        entry = manifest[target]
+        for name, sha256 in entry["files"].items():
+            download(f"{base}/{name}", data / name, sha256)
+        entries.append(entry)
+    return entries
+
+
+def install_local(directory, wanted, data):
+    """Copies targets' files (default: all) from a directory with built files into the data
+    directory."""
+    entries = []
+    for target in wanted or sorted(path.stem for path in directory.glob("*.json")):
+        entry = read_manifest(directory, target)
+        for name in entry["files"]:
+            partial = data / f"{name}.partial"
+            shutil.copyfile(directory / name, partial)
+            partial.rename(data / name)
+        entries.append(entry)
+    if not entries:
+        raise Failure(f"there are no built targets in {directory}")
+    return entries
+
+
+def download_run(repo, run_id, wanted, directory):
+    """Downloads targets' files (default: all) from the artifacts of a workflow run into a
+    directory (with gh)."""
+    require("gh")
+    names = [arg for target in wanted for arg in ["--name", f"guest-{target}"]]
+    run("gh", "run", "download", run_id, "--repo", repo, "--dir", directory,
+        *(names or ["--pattern", "guest-*"]))  # fmt: skip
+    # (gh extracts a single artifact into the directory itself, others into directories.)
+    for path in directory.glob("guest-*/*"):
+        os.replace(path, directory / path.name)
+
+
+def cmd_install(args):
+    data = args.data_dir.resolve()
+    data.mkdir(parents=True, exist_ok=True)
+    os.umask(0o022)
+    if args.local:
+        entries = install_local(args.build_dir.resolve(), args.targets, data)
+    elif args.run is not None:
+        CACHE.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=CACHE, prefix="run-") as directory:
+            download_run(args.repo, args.run, args.targets, Path(directory))
+            entries = install_local(Path(directory), args.targets, data)
+    else:
+        entries = install_release(args.repo, args.release, args.targets, data)
+    for entry in entries:
+        target = entry["target"]
+        if target in targets() and entry["inputs"] != inputs_hash(target):
+            log(
+                f"warning: {target} was built from other inputs than this checkout's "
+                f"(at {entry['commit']})"
+            )
+        log(f"installed {target}: {', '.join(entry['files'])} in {data}")
 
 
 def changed_files(commit):
@@ -352,6 +455,20 @@ def main():
         description=__doc__.split("\n\n")[0], formatter_class=argparse.RawDescriptionHelpFormatter
     )
     commands = parser.add_subparsers(dest="command", required=True, metavar="command")
+    install = commands.add_parser("install", help="install files into midgard's data directory")
+    install.add_argument("targets", nargs="*", metavar="target", help="default: all")
+    source = install.add_mutually_exclusive_group()
+    source.add_argument("--release", metavar="tag", help="default: the newest guest release")
+    source.add_argument("--run", metavar="id", help=f"a run of {WORKFLOW} (needs gh)")
+    source.add_argument("--local", action="store_true", help="the files that build built")
+    install.add_argument(
+        "--build-dir", type=Path, default=DIST, help="build's output directory (with --local)"
+    )
+    install.add_argument("--repo", default=GITHUB_REPO, help=f"default: {GITHUB_REPO}")
+    install.add_argument(
+        "-d", "--data-dir", type=Path, default=data_dir(), help="default: %(default)s"
+    )
+    install.set_defaults(handler=cmd_install)
     build = commands.add_parser("build", help="build targets")
     build.add_argument("targets", nargs="+", metavar="target")
     build.add_argument("-o", "--output", type=Path, default=DIST, help="the output directory")
