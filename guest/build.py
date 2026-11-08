@@ -3,6 +3,7 @@
 boots with midgard-init as the initramfs, and the distributions' disk images.
 
     build.py build <target>... [-o <dir>]
+    build.py targets [--changed-since <commit>]
 
 The targets are `kernel` (guest/kernel.toml and guest/linux.config) and the images in
 guest/images/<name>: image.toml says how to bootstrap the root file system, the files in
@@ -14,6 +15,8 @@ from it, defaults.toml).
 
 `build` builds targets into the output directory, with <target>.json, which lists their
 files with their SHA-256 and what they were built from.
+`targets` lists the targets (whose inputs changed) as JSON, for CI
+(.github/workflows/guest.yml).
 
 Images are built without root: guest/rootfs.py, which creates an image's file system,
 runs as root in a user namespace (unshare --map-root-user --map-auto, which needs
@@ -45,6 +48,8 @@ REPO = GUEST.parent
 CACHE = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "midgard-build"
 DIST = CACHE / "dist"
 IMAGES = GUEST / "images"
+# The workflow that builds the targets.
+WORKFLOW = ".github/workflows/guest.yml"
 
 
 class Failure(Exception):
@@ -301,6 +306,32 @@ def cmd_build(args):
         log(f"built {target}: {', '.join(files)} in {out}")
 
 
+def changed_files(commit):
+    """The files that changed since a commit (None if git does not know it)."""
+    if set(commit) == {"0"}:
+        return None
+    result = subprocess.run(
+        ["git", "-C", str(REPO), "diff", "--name-only", commit, "HEAD"],
+        capture_output=True,
+        text=True,
+    )
+    return set(result.stdout.splitlines()) if result.returncode == 0 else None
+
+
+def cmd_targets(args):
+    selected = targets()
+    changed = changed_files(args.changed_since) if args.changed_since else None
+    if changed is not None and WORKFLOW not in changed:
+        selected = [
+            target
+            for target in selected
+            if changed & {str(path) for path in inputs(target)}
+            # (Files that were removed from an image.)
+            or any(path.startswith(f"guest/images/{target}/") for path in changed)
+        ]
+    print(json.dumps(selected))
+
+
 def main():
     parser = argparse.ArgumentParser(
         description=__doc__.split("\n\n")[0], formatter_class=argparse.RawDescriptionHelpFormatter
@@ -310,6 +341,11 @@ def main():
     build.add_argument("targets", nargs="+", metavar="target")
     build.add_argument("-o", "--output", type=Path, default=DIST, help="the output directory")
     build.set_defaults(handler=cmd_build)
+    list_targets = commands.add_parser("targets", help="list the targets as JSON (for CI)")
+    list_targets.add_argument(
+        "--changed-since", metavar="commit", help="only those whose inputs changed since then"
+    )
+    list_targets.set_defaults(handler=cmd_targets)
     args = parser.parse_args()
 
     # (Such that rootfs.py can clean up, see run_terminating(), and subprocess.run() kills

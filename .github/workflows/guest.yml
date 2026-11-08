@@ -1,0 +1,79 @@
+name: Guest
+
+# Builds the guest kernel and the distributions' images (guest/build.py) as artifacts when
+# their inputs change (all of them when the workflow runs manually). guest-release.yml
+# publishes the artifacts of a run as a release.
+
+on:
+  push:
+    # (Without branches, pushes of tags would run the workflow: paths do not apply to them.)
+    branches:
+      - "**"
+    paths:
+      - "guest/**"
+      - ".github/workflows/guest.yml"
+  pull_request:
+    paths:
+      - "guest/**"
+      - ".github/workflows/guest.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  targets:
+    name: Select the targets
+    runs-on: ubuntu-24.04
+    outputs:
+      targets: ${{ steps.targets.outputs.targets }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: targets
+        env:
+          BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+            targets=$(python3 guest/build.py targets)
+          else
+            targets=$(python3 guest/build.py targets --changed-since "$BASE")
+          fi
+          echo "targets=$targets" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: targets
+    if: needs.targets.outputs.targets != '[]'
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(needs.targets.outputs.targets) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc binutils bison e2fsprogs flex gcc gpgv libelf-dev make perl uidmap wget zstd
+      # Images are built in a user namespace (unshare --map-auto), which needs subordinate
+      # IDs and which Ubuntu restricts.
+      - name: Allow user namespaces
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          user=$(id -un)
+          grep -q "^$user:" /etc/subuid || sudo usermod --add-subuids 100000-165535 "$user"
+          grep -q "^$user:" /etc/subgid || sudo usermod --add-subgids 100000-165535 "$user"
+      - name: Build
+        env:
+          TARGET: ${{ matrix.target }}
+        run: python3 guest/build.py build "$TARGET" -o dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: guest-${{ matrix.target }}
+          path: dist/
+          # (The files are compressed already.)
+          compression-level: 0
+          if-no-files-found: error
