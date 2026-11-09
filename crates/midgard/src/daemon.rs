@@ -340,10 +340,11 @@ impl Instances {
             let mut instances = self.running.lock().unwrap();
             match instances.get(name) {
                 Some(running) => Ok(running.clone()),
-                None if !start => Err(format!("{name} is not running")),
-                None if self.reserved.lock().unwrap().contains(name) => {
-                    Err(format!("{name} is being created or deleted"))
-                }
+                None if self.reserved.lock().unwrap().contains(name) => Err(
+                    control::Response::Error(format!("{name} is being created or deleted")),
+                ),
+                None if !instance::exists(name) => Err(control::Response::NoInstance),
+                None if !start => Err(control::Response::Error(format!("{name} is not running"))),
                 None => {
                     let running = Arc::new(Running {
                         state: Mutex::new(State::Booting),
@@ -369,7 +370,7 @@ impl Instances {
         };
         let running = match running {
             Ok(running) => running,
-            Err(error) => return respond(&stream, control::Response::Error(error)).await,
+            Err(response) => return respond(&stream, response).await,
         };
         if running.booting() {
             respond(&stream, control::Response::Starting).await?;

@@ -181,6 +181,7 @@ mod tests {
             control::Response::Stopped("the guest powered off".into()),
             control::Response::Starting,
             control::Response::Ready,
+            control::Response::NoInstance,
             control::Response::Running(vec!["alpine".into()]),
             control::Response::List(control::Listing {
                 instances: vec![control::InstanceInfo {

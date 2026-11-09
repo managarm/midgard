@@ -17,8 +17,9 @@ pub enum Request {
     /// Input for the console of the VM that [`Request::Boot`] started.
     Input(Vec<u8>),
     /// Connect to the agent in the VM of a VM instance, which midgard starts first if it
-    /// does not run (and `start`). midgard answers [`Response::Starting`] if it starts
-    /// the VM and [`Response::Ready`] once the agent answers; from then on, the
+    /// does not run (and `start`). midgard answers [`Response::NoInstance`] if there is
+    /// no such instance, [`Response::Starting`] if it starts the VM and
+    /// [`Response::Ready`] once the agent answers; from then on, the
     /// connection carries the session protocol (see [`crate::session`]).
     Session { name: String, start: bool },
     /// The VM instances whose VMs run ([`Response::Running`]).
@@ -47,6 +48,8 @@ pub enum Response {
     Starting,
     /// The connection now goes to the agent.
     Ready,
+    /// There is no such VM instance.
+    NoInstance,
     Running(Vec<String>),
     List(Listing),
     /// The request succeeded.

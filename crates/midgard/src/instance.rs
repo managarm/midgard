@@ -137,6 +137,11 @@ pub fn remove_leftovers() {
     }
 }
 
+/// Whether the instance `name` exists (which it does even if it is broken).
+pub fn exists(name: &str) -> bool {
+    paths::instances_dir().join(name).is_dir()
+}
+
 /// Creates the instance `name` from `template`: its directory is made next to where it
 /// belongs and moved there once it is complete. Nothing else may create or delete the
 /// instance meanwhile (see [`crate::daemon::Instances::reserve`]).

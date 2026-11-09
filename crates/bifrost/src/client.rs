@@ -337,8 +337,20 @@ pub fn log(name: &str, follow: bool) -> Result<i32> {
     }
 }
 
+/// midgard has no VM instance of this name.
+#[derive(Debug)]
+struct NoInstance(String);
+
+impl std::fmt::Display for NoInstance {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "no VM instance {} (bifrost create makes one)", self.0)
+    }
+}
+
+impl std::error::Error for NoInstance {}
+
 /// Connects to the agent in the VM of `name`, which midgard starts first if it does
-/// not run (and `start`).
+/// not run (and `start`). Fails with [`NoInstance`] if there is no such instance.
 fn connect(name: &str, start: bool) -> Result<UnixStream> {
     let mut stream = connect_daemon()?;
     let request = control::Request::Session {
@@ -356,6 +368,7 @@ fn connect(name: &str, start: bool) -> Result<UnixStream> {
                 }
             }
             Some(control::Response::Ready) => return Ok(stream),
+            Some(control::Response::NoInstance) => return Err(NoInstance(name.into()).into()),
             Some(control::Response::Error(message)) => bail!("{message}"),
             Some(other) => bail!("unexpected answer from midgard: {other:?}"),
             None => bail!("midgard closed the connection"),
@@ -398,9 +411,42 @@ fn install_signal_handlers(tty: bool) -> Result<std::fs::File> {
     Ok(unsafe { std::fs::File::from_raw_fd(fds[0]) })
 }
 
-/// Runs a command in the VM of `name`; returns its exit code.
+/// Creates the missing VM instance `name` from the template of the same name, if there
+/// is one, after asking (unless `yes`).
+fn offer_instance(name: &str, yes: bool) -> Result<()> {
+    let listing = listing()?;
+    if !listing
+        .templates
+        .iter()
+        .any(|template| template.name == name)
+    {
+        return Err(NoInstance(name.into()).into());
+    }
+    if !yes {
+        if !is_tty(0) {
+            bail!(
+                "no VM instance {name} (bifrost create {name} creates it from the template \
+                 {name})"
+            );
+        }
+        let question = format!("No VM instance {name}. Create it from the template {name}? [Y/n] ");
+        if !matches!(prompt(&question)?.as_str(), "" | "y" | "Y" | "yes") {
+            return Err(NoInstance(name.into()).into());
+        }
+    }
+    create_instance(name, name, None, None, yes)
+}
+
+/// Runs a command in the VM of `name` (which is created first if it is missing, see
+/// [`offer_instance`]); returns its exit code.
 pub fn run(name: &str, args: &RunArgs) -> Result<i32> {
-    let stream = connect(name, !args.no_start)?;
+    let stream = match connect(name, !args.no_start) {
+        Err(error) if !args.no_start && error.is::<NoInstance>() => {
+            offer_instance(name, args.yes)?;
+            connect(name, true)?
+        }
+        result => result?,
+    };
     let tty = args.tty().unwrap_or_else(|| is_tty(0) && is_tty(1));
     let mut env = Vec::new();
     if tty && let Ok(term) = std::env::var("TERM") {
