@@ -21,8 +21,8 @@ pub struct MachineConfig {
     pub append: Vec<String>,
     /// The guest's RAM in bytes.
     pub memory: u64,
-    /// The number of vCPUs.
-    pub cpus: u32,
+    /// The number of vCPUs (None: midgard chooses).
+    pub cpus: Option<u32>,
     /// The guest's console.
     pub console: ConsoleKind,
     /// The first disk is the root file system.
