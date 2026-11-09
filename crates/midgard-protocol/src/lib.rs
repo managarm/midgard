@@ -225,6 +225,7 @@ mod tests {
                 user: Some("alice".into()),
                 memory: Some(2 << 30),
             },
+            control::Request::Delete { name: "dev".into() },
         ];
         for request in &requests {
             write_message(&mut stream, request).unwrap();

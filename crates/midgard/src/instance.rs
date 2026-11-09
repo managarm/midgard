@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use midgard_protocol::control::InstanceInfo;
 use midgard_protocol::machine::{ConsoleKind, Disk, MachineConfig};
+use midgard_protocol::runtime;
 
 use crate::settings::{self, Role, Settings};
 use crate::template::Template;
@@ -114,8 +115,9 @@ fn sync_dir(path: &Path) {
     }
 }
 
-/// Removes what creating instances left behind when midgard stopped in the middle (see
-/// [`create`]). Nothing may create instances meanwhile.
+/// Removes what creating or deleting instances left behind when midgard stopped in the
+/// middle (see [`create`] and [`delete`]). Nothing may create or delete instances
+/// meanwhile.
 pub fn remove_leftovers() {
     let instances = paths::instances_dir();
     let Ok(entries) = std::fs::read_dir(&instances) else {
@@ -123,8 +125,11 @@ pub fn remove_leftovers() {
     };
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
-        if name.starts_with('.') && name.ends_with(".partial") {
-            log!("removing {name}, which creating an instance left behind");
+        let leftover = [".partial", ".deleted"]
+            .iter()
+            .any(|suffix| name.ends_with(suffix));
+        if name.starts_with('.') && leftover {
+            log!("removing {name}, which creating or deleting an instance left behind");
             if let Err(error) = std::fs::remove_dir_all(entry.path()) {
                 log!("failed to remove {:?}: {error}", entry.path());
             }
@@ -166,6 +171,36 @@ pub fn create(name: &str, template: &str, user: Option<&str>, memory: Option<u64
         let _ = std::fs::remove_dir_all(&partial);
     }
     result
+}
+
+/// Deletes the instance `name`: its directory is moved out of the way first, such that a
+/// failure does not leave half an instance behind. Its VM must not run, and nothing else
+/// may create or delete the instance meanwhile (see
+/// [`crate::daemon::Instances::reserve`]).
+pub fn delete(name: &str) -> Result<()> {
+    validate_name(name)?;
+    let instances = paths::instances_dir();
+    let dir = instances.join(name);
+    if !dir.is_dir() {
+        bail!("no VM instance {name} (in {})", instances.display());
+    }
+    // (Names do not contain dots, so this is no instance.)
+    let deleted = instances.join(format!(".{name}.deleted"));
+    if deleted.exists() {
+        std::fs::remove_dir_all(&deleted)
+            .with_context(|| format!("failed to delete {deleted:?}"))?;
+    }
+    std::fs::rename(&dir, &deleted).with_context(|| format!("failed to delete {dir:?}"))?;
+    log!("deleting {name}");
+    std::fs::remove_dir_all(&deleted).with_context(|| format!("failed to delete {deleted:?}"))?;
+    // Its console log.
+    let runtime = runtime::runtime_dir(name);
+    match std::fs::remove_dir_all(&runtime) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => {
+            Err(error).with_context(|| format!("failed to delete {runtime:?}"))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// The instance `name` for `bifrost list` (`running`: whether its VM runs).

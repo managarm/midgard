@@ -260,6 +260,13 @@ async fn serve(stream: Async<UnixStream>) -> Result<()> {
             })
             .await
         }
+        Request::Delete { name } => {
+            answer(move || {
+                let _reservation = INSTANCES.reserve(&name)?;
+                instance::delete(&name)
+            })
+            .await
+        }
         Request::Session { .. } => unreachable!(),
     };
     // bifrost may be gone already (which stopped the VM).
@@ -296,7 +303,7 @@ fn main() {
             std::process::exit(1);
         }
     };
-    // (Before any request can create instances.)
+    // (Before any request can create or delete instances.)
     instance::remove_leftovers();
     async_io::block_on(EXECUTOR.run(accept(listener)));
 }

@@ -18,7 +18,7 @@ use midgard_protocol::size::format_size;
 use midgard_protocol::{control, runtime};
 
 use crate::cli::{CreateArgs, RunArgs};
-use crate::{log, terminal};
+use crate::{EXIT_FAILURE, log, terminal};
 
 // The libc crate does not define these for managarm; mlibc uses the Linux ABI values.
 const TIOCGWINSZ: libc::c_ulong = 0x5413;
@@ -260,6 +260,41 @@ pub fn create(args: &CreateArgs) -> Result<i32> {
     )?;
     log!("created {}", args.name);
     Ok(0)
+}
+
+/// Deletes the VM instance `name` and its disk after asking (unless `yes`).
+pub fn delete(name: &str, yes: bool) -> Result<i32> {
+    let listing = listing()?;
+    let Some(instance) = listing
+        .instances
+        .iter()
+        .find(|instance| instance.name == name)
+    else {
+        bail!("no VM instance {name}");
+    };
+    if instance.running {
+        bail!("{name} is running (bifrost shutdown {name} stops it)");
+    }
+    if !yes {
+        if !is_tty(0) {
+            bail!("not deleting {name} without --yes (stdin is not a terminal)");
+        }
+        let answer = prompt(&format!(
+            "Delete the VM instance {name} and its disk? [y/N] "
+        ))?;
+        if !matches!(answer.as_str(), "y" | "Y" | "yes") {
+            return Ok(EXIT_FAILURE.into());
+        }
+    }
+    match ask(control::Request::Delete {
+        name: name.to_string(),
+    })? {
+        control::Response::Done => {
+            log!("deleted {name}");
+            Ok(0)
+        }
+        other => bail!("unexpected answer from midgard: {other:?}"),
+    }
 }
 
 /// Prints the console log of the VM of `name`; with `follow`, keeps printing what is

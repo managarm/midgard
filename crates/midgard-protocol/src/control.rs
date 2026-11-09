@@ -33,6 +33,8 @@ pub enum Request {
         user: Option<String>,
         memory: Option<u64>,
     },
+    /// Delete a VM instance, whose VM must not run, and its disk ([`Response::Done`]).
+    Delete { name: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
