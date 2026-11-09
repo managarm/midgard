@@ -3,7 +3,7 @@
 //! asks midgard to run it (see [`control`]) on midgard's socket (see [`runtime`]);
 //! bifrost and the agent speak the session protocol (see [`session`]); midgard tells the
 //! agent how to set up the guest (see [`guest`]). It also has the constants that both
-//! sides of the VM need to agree on.
+//! sides of the VM need to agree on, and how sizes are written (see [`size`]).
 //!
 //! Each message is a frame: a little-endian u32 length and the message in postcard.
 //! bifrost, midgard and the agent come from the same installation, so the encoding does
@@ -20,6 +20,7 @@ pub mod guest;
 pub mod machine;
 pub mod runtime;
 pub mod session;
+pub mod size;
 
 /// The vsock CID of the host (midgard itself).
 pub const HOST_CID: u32 = 2;

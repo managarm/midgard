@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use clap::error::ErrorKind;
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use midgard_protocol::machine::Disk;
+use midgard_protocol::size::parse_size;
 
 /// Runs a command, or your login shell, in the VM.
 ///
@@ -259,27 +260,6 @@ fn parse_disk(text: &str) -> Result<Disk, String> {
         path: path.into(),
         read_only,
     })
-}
-
-fn parse_size(text: &str) -> Result<u64, String> {
-    let digits = text
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(text.len());
-    let (number, suffix) = text.split_at(digits);
-    let number: u64 = number
-        .parse()
-        .map_err(|_| format!("invalid size {text:?}"))?;
-    let shift = match suffix.to_ascii_lowercase().as_str() {
-        "" | "b" => 0,
-        "k" | "kib" => 10,
-        "m" | "mib" => 20,
-        "g" | "gib" => 30,
-        "t" | "tib" => 40,
-        _ => return Err(format!("invalid size suffix {suffix:?} (use K, M, G or T)")),
-    };
-    number
-        .checked_mul(1 << shift)
-        .ok_or_else(|| format!("size {text:?} is too large"))
 }
 
 #[cfg(test)]
