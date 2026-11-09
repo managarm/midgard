@@ -6,19 +6,7 @@ use midgard_hv::CpuidEntry;
 use midgard_hv::x86::cpuid::{
     LEAF1_ECX_HYPERVISOR, LEAF1_ECX_TSC_DEADLINE, LEAF1_ECX_X2APIC, LEAF1_EDX_APIC,
 };
-
-#[cfg(target_arch = "x86_64")]
-fn host_cpuid(leaf: u32, subleaf: u32) -> [u32; 4] {
-    #[allow(unused_unsafe)]
-    // SAFETY: CPUID is always available on x86_64.
-    let r = unsafe { core::arch::x86_64::__cpuid_count(leaf, subleaf) };
-    [r.eax, r.ebx, r.ecx, r.edx]
-}
-
-#[cfg(not(target_arch = "x86_64"))]
-fn host_cpuid(_leaf: u32, _subleaf: u32) -> [u32; 4] {
-    [0; 4]
-}
+use midgard_hv::x86::{host_cpuid, xsave_compacted_size, xsave_size};
 
 const MAX_BASIC_LEAF: u32 = 0xD;
 const MAX_EXTENDED_LEAF: u32 = 0x8000_0008;
@@ -64,35 +52,6 @@ const LEAF81_ECX_CLEAR: u32 = bits(&[2]);
 const LEAF81_EDX_CLEAR: u32 = bits(&[27]);
 // Leaf 0x80000007 EDX: invariant TSC.
 const LEAF87_EDX_KEEP: u32 = 1 << 8;
-
-/// The size of the (standard format) XSAVE area for the components in `xcr0`.
-fn xsave_size(xcr0: u64) -> u32 {
-    // Legacy region and XSAVE header.
-    let mut size = 576;
-    for component in 2..64 {
-        if xcr0 & (1 << component) != 0 {
-            let [component_size, offset, _, _] = host_cpuid(0xD, component);
-            size = size.max(offset + component_size);
-        }
-    }
-    size
-}
-
-/// The size of the compacted format XSAVE area (XSAVEC) for the components in `xcr0`.
-fn xsave_compacted_size(xcr0: u64) -> u32 {
-    let mut size: u32 = 576;
-    for component in 2..64 {
-        if xcr0 & (1 << component) != 0 {
-            let [component_size, _, flags, _] = host_cpuid(0xD, component);
-            // Bit 1: the component is 64-byte aligned in the compacted format.
-            if flags & 2 != 0 {
-                size = size.next_multiple_of(64);
-            }
-            size += component_size;
-        }
-    }
-    size
-}
 
 /// The CPUID table of a vCPU. The bits that depend on the vCPU's state (OSXSAVE, the
 /// APIC's enable bit and the XSAVE area sizes) are those of the reset state; the

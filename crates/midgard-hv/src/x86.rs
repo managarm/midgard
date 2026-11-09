@@ -72,3 +72,46 @@ pub mod cpuid {
     pub const LEAF1_ECX_HYPERVISOR: u32 = 1 << 31;
     pub const LEAF1_EDX_APIC: u32 = 1 << 9;
 }
+
+/// CPUID on the host.
+#[cfg(target_arch = "x86_64")]
+pub fn host_cpuid(leaf: u32, subleaf: u32) -> [u32; 4] {
+    #[allow(unused_unsafe)]
+    // SAFETY: CPUID is always available on x86_64.
+    let r = unsafe { core::arch::x86_64::__cpuid_count(leaf, subleaf) };
+    [r.eax, r.ebx, r.ecx, r.edx]
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+pub fn host_cpuid(_leaf: u32, _subleaf: u32) -> [u32; 4] {
+    [0; 4]
+}
+
+/// The size of the (standard format) XSAVE area for the components in `xcr0`.
+pub fn xsave_size(xcr0: u64) -> u32 {
+    // Legacy region and XSAVE header.
+    let mut size = 576;
+    for component in 2..64 {
+        if xcr0 & (1 << component) != 0 {
+            let [component_size, offset, _, _] = host_cpuid(0xD, component);
+            size = size.max(offset + component_size);
+        }
+    }
+    size
+}
+
+/// The size of the compacted format XSAVE area (XSAVEC) for the components in `xcr0`.
+pub fn xsave_compacted_size(xcr0: u64) -> u32 {
+    let mut size: u32 = 576;
+    for component in 2..64 {
+        if xcr0 & (1 << component) != 0 {
+            let [component_size, _, flags, _] = host_cpuid(0xD, component);
+            // Bit 1: the component is 64-byte aligned in the compacted format.
+            if flags & 2 != 0 {
+                size = size.next_multiple_of(64);
+            }
+            size += component_size;
+        }
+    }
+    size
+}
