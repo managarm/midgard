@@ -2,7 +2,7 @@
 //! waypipe) and the VM instances. The daemon's runtime files are in
 //! [`midgard_protocol::runtime`].
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Where packages install the guest kernel and the agent.
 const PACKAGE_DIR: &str = "/usr/lib/midgard";
@@ -61,4 +61,25 @@ pub fn guest_waypipe() -> Option<PathBuf> {
 /// The VM instances' directories (see [`crate::instance`]).
 pub fn instances_dir() -> PathBuf {
     midgard_dir().join("instances")
+}
+
+/// The templates' directories (see [`crate::template`]).
+pub fn templates_dir() -> PathBuf {
+    midgard_dir().join("templates")
+}
+
+/// The names of the instances or templates in `dir` (sorted): its entries whose names
+/// are valid (see [`crate::instance::validate_name`]), which leaves out others, e.g.,
+/// those that are being created.
+pub fn names(dir: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| crate::instance::validate_name(name).is_ok())
+        .collect();
+    names.sort();
+    names
 }

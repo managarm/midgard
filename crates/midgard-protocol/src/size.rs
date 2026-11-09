@@ -23,6 +23,20 @@ pub fn parse_size(text: &str) -> Result<u64, String> {
         .ok_or_else(|| format!("size {text:?} is too large"))
 }
 
+/// A size for people, e.g. "64 GiB" or "1.5 GiB".
+pub fn format_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["bytes", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    let text = format!("{value:.1}");
+    let text = text.strip_suffix(".0").unwrap_or(&text);
+    format!("{text} {}", UNITS[unit])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -36,5 +50,12 @@ mod tests {
         for invalid in ["", "G", "1.5G", "2X", "-1", "99999999999T"] {
             assert!(parse_size(invalid).is_err(), "{invalid:?}");
         }
+    }
+
+    #[test]
+    fn format() {
+        assert_eq!(format_size(64 << 30), "64 GiB");
+        assert_eq!(format_size(3 << 29), "1.5 GiB");
+        assert_eq!(format_size(512), "512 bytes");
     }
 }

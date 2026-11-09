@@ -1,9 +1,18 @@
-//! The settings of VM instances, in their instance files (`instance.toml`, see
-//! [`crate::instance`]):
+//! The settings files of templates (`template.toml`, see [`crate::template`]) and VM
+//! instances (`instance.toml`, see [`crate::instance`]). Both have the same grammar, such
+//! that an instance's file starts as a copy of its template's (with its comments), but
+//! some settings belong to one of them only (see [`Role`]):
 //!
 //! ```toml
 //! # The guest's RAM (default: 1G).
 //! memory = "2G"
+//!
+//! # About the template.
+//! [template]
+//! # What the template is (for people).
+//! description = "Alpine Linux"
+//! # The template that the instance was created from (only in instance files).
+//! name = "alpine"
 //!
 //! [guest]
 //! # The distribution's init, which the agent starts as PID 1 (default: none, the agent
@@ -17,6 +26,7 @@
 //! user = "alice"
 //! # A command that the agent runs on every boot (as root, before the distribution's
 //! # init) with the user's name as an additional argument, e.g., to create the user.
+//! # Instance files need a user for it; a template's user is the default.
 //! user-setup = ["/etc/midgard/user-setup"]
 //! # How the agent runs the commands of sessions: "direct" (default: the agent runs
 //! # them itself), "systemd" (as transient services of the user's systemd instance) or
@@ -30,18 +40,26 @@
 //! # waypipe` as the user itself).
 //! display = "systemd"
 //! ```
-//!
-//! The settings describe the disk's contents, so they will be part of the templates that
-//! instances are created from.
 
 use anyhow::{Context, Result, bail};
 use midgard_protocol::guest::{Display, GuestConfig, Launcher, Ready};
 use midgard_protocol::size::parse_size;
 use serde::Deserialize;
 
-/// The settings of a VM instance.
+/// Which file the settings are in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    Template,
+    Instance,
+}
+
+/// The settings of a template or a VM instance.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Settings {
+    /// The template that the instance was created from.
+    pub template: Option<String>,
+    /// What the template is.
+    pub description: Option<String>,
     /// The guest's RAM (in bytes).
     pub memory: Option<u64>,
     /// How the agent sets up the guest.
@@ -54,7 +72,17 @@ pub struct Settings {
 struct SettingsFile {
     memory: Option<String>,
     #[serde(default)]
+    template: TemplateSettings,
+    #[serde(default)]
     guest: GuestSettings,
+}
+
+/// About the template.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TemplateSettings {
+    name: Option<String>,
+    description: Option<String>,
 }
 
 /// How the agent sets up the guest (see [`GuestConfig`]).
@@ -95,7 +123,7 @@ enum DisplaySetting {
 }
 
 impl GuestSettings {
-    fn to_config(&self) -> Result<GuestConfig> {
+    fn to_config(&self, role: Role) -> Result<GuestConfig> {
         let ready = match self.ready {
             None | Some(ReadySetting::None) => Ready::Immediately,
             Some(ReadySetting::Systemd) => Ready::Systemd,
@@ -113,7 +141,7 @@ impl GuestSettings {
             if user_setup.is_empty() {
                 bail!("user-setup must not be empty");
             }
-            if self.user.is_none() {
+            if role == Role::Instance && self.user.is_none() {
                 bail!("user-setup needs user");
             }
         }
@@ -157,8 +185,11 @@ impl GuestSettings {
 }
 
 /// Parses a settings file.
-pub fn parse(text: &str) -> Result<Settings> {
+pub fn parse(text: &str, role: Role) -> Result<Settings> {
     let file: SettingsFile = toml::from_str(text)?;
+    if role == Role::Template && file.template.name.is_some() {
+        bail!("[template] name is only for instance files (a template's directory names it)");
+    }
     let memory = file
         .memory
         .map(|memory| parse_size(&memory).map_err(anyhow::Error::msg))
@@ -168,8 +199,13 @@ pub fn parse(text: &str) -> Result<Settings> {
             Ok(memory)
         })
         .context("invalid memory")?;
-    let guest = file.guest.to_config().context("invalid [guest]")?;
-    Ok(Settings { memory, guest })
+    let guest = file.guest.to_config(role).context("invalid [guest]")?;
+    Ok(Settings {
+        template: file.template.name,
+        description: file.template.description,
+        memory,
+        guest,
+    })
 }
 
 #[cfg(test)]
@@ -178,9 +214,15 @@ mod tests {
 
     #[test]
     fn settings() {
-        assert_eq!(parse("").unwrap(), Settings::default());
-        let settings = parse("memory = \"2G\"").unwrap();
+        assert_eq!(parse("", Role::Instance).unwrap(), Settings::default());
+        let settings = parse(
+            "memory = \"2G\"\n[template]\nname = \"alpine\"\ndescription = \"Alpine\"",
+            Role::Instance,
+        )
+        .unwrap();
         assert_eq!(settings.memory, Some(2 << 30));
+        assert_eq!(settings.template.as_deref(), Some("alpine"));
+        assert_eq!(settings.description.as_deref(), Some("Alpine"));
         for invalid in [
             "memory = \"2X\"",
             "memory = \"0\"",
@@ -188,14 +230,25 @@ mod tests {
             "memory = 2",
             "unknown = 1",
             "[other]",
+            "[template]\nversion = 1",
         ] {
-            assert!(parse(invalid).is_err(), "{invalid:?}");
+            assert!(parse(invalid, Role::Instance).is_err(), "{invalid:?}");
         }
     }
 
     #[test]
+    fn roles() {
+        let user_setup = "[guest]\nuser-setup = [\"/setup\"]";
+        assert!(parse(user_setup, Role::Template).is_ok());
+        assert!(parse(user_setup, Role::Instance).is_err());
+        let name = "[template]\nname = \"alpine\"";
+        assert!(parse(name, Role::Instance).is_ok());
+        assert!(parse(name, Role::Template).is_err());
+    }
+
+    #[test]
     fn guest() {
-        let guest = |text: &str| parse(text).map(|settings| settings.guest);
+        let guest = |text: &str| parse(text, Role::Instance).map(|settings| settings.guest);
         let config = guest(
             r#"
             [guest]

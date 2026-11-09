@@ -182,6 +182,22 @@ mod tests {
             control::Response::Starting,
             control::Response::Ready,
             control::Response::Running(vec!["alpine".into()]),
+            control::Response::List(control::Listing {
+                instances: vec![control::InstanceInfo {
+                    name: "dev".into(),
+                    template: Some("debian".into()),
+                    running: true,
+                    disk_size: Some(1 << 30),
+                    error: None,
+                }],
+                templates: vec![control::TemplateInfo {
+                    name: "debian".into(),
+                    description: None,
+                    needs_user: true,
+                    error: Some("no disk".into()),
+                }],
+                templates_dir: "/var/lib/midgard/templates".into(),
+            }),
             control::Response::Error("no such file".into()),
         ];
         for response in &responses {

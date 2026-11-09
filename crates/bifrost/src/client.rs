@@ -1,6 +1,7 @@
 //! Talking to midgard (on its socket, see [`midgard_protocol::control`]): runs commands
-//! (or a login shell) in a VM instance, stops VMs and shows their console logs. midgard starts an instance's VM
-//! for the first session with it; the VM stays up for later commands.
+//! (or a login shell) in a VM instance, stops VMs, shows their console logs and manages
+//! the VM instances. midgard starts an instance's VM for the first session with it; the
+//! VM stays up for later commands.
 
 use std::fs::File;
 use std::io::{self, Read, Seek, Write};
@@ -11,7 +12,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use midgard_protocol::control::Listing;
 use midgard_protocol::session::{Exec, Request, Response, WindowSize};
+use midgard_protocol::size::format_size;
 use midgard_protocol::{control, runtime};
 
 use crate::cli::RunArgs;
@@ -59,6 +62,107 @@ fn ask(request: control::Request) -> Result<control::Response> {
         Some(control::Response::Error(message)) => bail!("{message}"),
         Some(response) => Ok(response),
         None => bail!("midgard closed the connection"),
+    }
+}
+
+/// The VM instances and the templates.
+fn listing() -> Result<Listing> {
+    match ask(control::Request::List)? {
+        control::Response::List(listing) => Ok(listing),
+        other => bail!("unexpected answer from midgard: {other:?}"),
+    }
+}
+
+/// Formats rows as a table with aligned columns (the first row is the heading).
+fn table<const N: usize>(rows: &[[String; N]]) -> String {
+    let mut widths = [0; N];
+    for row in rows {
+        for (width, cell) in widths.iter_mut().zip(row) {
+            *width = (*width).max(cell.chars().count());
+        }
+    }
+    let mut out = String::new();
+    for row in rows {
+        let mut line = String::new();
+        for (column, (cell, width)) in row.iter().zip(widths).enumerate() {
+            if column + 1 < N {
+                line += &format!("{cell:width$}  ");
+            } else {
+                line += cell;
+            }
+        }
+        out += line.trim_end();
+        out.push('\n');
+    }
+    out
+}
+
+/// Formats the VM instances and the templates for people.
+fn format_listing(listing: &Listing) -> String {
+    let mut out = String::new();
+    if listing.instances.is_empty() {
+        out += "No VM instances (bifrost create makes one).\n";
+    } else {
+        let mut rows = vec![["NAME", "TEMPLATE", "STATE", "DISK"].map(String::from)];
+        for instance in &listing.instances {
+            let state = if instance.error.is_some() {
+                "invalid"
+            } else if instance.running {
+                "running"
+            } else {
+                "stopped"
+            };
+            rows.push([
+                instance.name.clone(),
+                instance.template.clone().unwrap_or_else(|| "-".into()),
+                state.into(),
+                instance.disk_size.map_or_else(|| "-".into(), format_size),
+            ]);
+        }
+        out += &table(&rows);
+    }
+    out.push('\n');
+    if listing.templates.is_empty() {
+        out += &format!(
+            "No templates in {} (guest/build.py install installs them).\n",
+            listing.templates_dir.display()
+        );
+    } else {
+        let mut rows = vec![["TEMPLATE", "DESCRIPTION"].map(String::from)];
+        for template in &listing.templates {
+            let description = match &template.error {
+                Some(_) => "(invalid)".into(),
+                None => template.description.clone().unwrap_or_default(),
+            };
+            rows.push([template.name.clone(), description]);
+        }
+        out += &table(&rows);
+    }
+    out
+}
+
+/// Lists the VM instances and the templates (and what is wrong with broken ones).
+pub fn list() -> Result<i32> {
+    let listing = listing()?;
+    for (name, error) in listing
+        .instances
+        .iter()
+        .map(|instance| (&instance.name, &instance.error))
+        .chain(
+            listing
+                .templates
+                .iter()
+                .map(|template| (&template.name, &template.error)),
+        )
+    {
+        if let Some(error) = error {
+            log!("{name}: {error}");
+        }
+    }
+    match io::stdout().write_all(format_listing(&listing).as_bytes()) {
+        // E.g., `bifrost list | head`.
+        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(0),
+        result => result.map(|()| 0).map_err(Into::into),
     }
 }
 
@@ -356,4 +460,58 @@ pub fn shutdown(name: &str) -> Result<()> {
         std::thread::sleep(Duration::from_millis(100));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use midgard_protocol::control::{InstanceInfo, TemplateInfo};
+
+    #[test]
+    fn listing() {
+        let listing = Listing {
+            instances: vec![
+                InstanceInfo {
+                    name: "alpine".into(),
+                    template: Some("alpine".into()),
+                    running: true,
+                    disk_size: Some(3 << 29),
+                    error: None,
+                },
+                InstanceInfo {
+                    name: "broken".into(),
+                    template: None,
+                    running: false,
+                    disk_size: None,
+                    error: Some("invalid instance.toml".into()),
+                },
+            ],
+            templates: vec![TemplateInfo {
+                name: "debian".into(),
+                description: Some("Debian".into()),
+                needs_user: true,
+                error: None,
+            }],
+            templates_dir: "/templates".into(),
+        };
+        assert_eq!(
+            format_listing(&listing),
+            "NAME    TEMPLATE  STATE    DISK\n\
+             alpine  alpine    running  1.5 GiB\n\
+             broken  -         invalid  -\n\
+             \n\
+             TEMPLATE  DESCRIPTION\n\
+             debian    Debian\n"
+        );
+        let empty = Listing {
+            instances: Vec::new(),
+            templates: Vec::new(),
+            templates_dir: "/templates".into(),
+        };
+        assert_eq!(
+            format_listing(&empty),
+            "No VM instances (bifrost create makes one).\n\n\
+             No templates in /templates (guest/build.py install installs them).\n"
+        );
+    }
 }

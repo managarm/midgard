@@ -15,6 +15,7 @@ mod daemon;
 mod instance;
 mod paths;
 mod settings;
+mod template;
 
 use std::io;
 use std::os::fd::{FromRawFd, RawFd};
@@ -28,7 +29,7 @@ use async_executor::Executor;
 use async_io::Async;
 use clap::Parser;
 use futures_lite::{AsyncReadExt, future};
-use midgard_protocol::control::{Request, Response};
+use midgard_protocol::control::{Listing, Request, Response};
 use midgard_protocol::machine::MachineConfig;
 use midgard_protocol::nonblocking::{read_message, write_message};
 use midgard_protocol::runtime;
@@ -190,6 +191,23 @@ async fn boot(stream: &Arc<Async<UnixStream>>, config: MachineConfig) -> Result<
     result
 }
 
+/// The VM instances and the templates.
+fn list() -> Listing {
+    let instances = paths::names(&paths::instances_dir())
+        .iter()
+        .map(|name| instance::info(name, INSTANCES.is_running(name)))
+        .collect();
+    let templates = paths::names(&paths::templates_dir())
+        .iter()
+        .map(|name| template::info(name))
+        .collect();
+    Listing {
+        instances,
+        templates,
+        templates_dir: paths::templates_dir(),
+    }
+}
+
 /// Serves one connection from bifrost.
 async fn serve(stream: Async<UnixStream>) -> Result<()> {
     let Some(request) = read_message::<Request>(&mut &stream).await? else {
@@ -218,6 +236,7 @@ async fn serve(stream: Async<UnixStream>) -> Result<()> {
         }
         Request::Running => Response::Running(INSTANCES.running()),
         Request::Input(_) => Response::Error("no VM runs on this connection".into()),
+        Request::List => Response::List(list()),
         Request::Session { .. } => unreachable!(),
     };
     // bifrost may be gone already (which stopped the VM).

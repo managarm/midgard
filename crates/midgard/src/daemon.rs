@@ -290,6 +290,10 @@ async fn respond(stream: &Async<UnixStream>, response: control::Response) -> Res
 }
 
 impl Instances {
+    pub fn is_running(&self, name: &str) -> bool {
+        self.running.lock().unwrap().contains_key(name)
+    }
+
     pub fn running(&self) -> Vec<String> {
         self.running.lock().unwrap().keys().cloned().collect()
     }

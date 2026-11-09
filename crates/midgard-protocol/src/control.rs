@@ -2,6 +2,8 @@
 //! bifrost starts each connection with one [`Request`]; midgard answers with
 //! [`Response`]s.
 
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
 
 use crate::machine::MachineConfig;
@@ -21,6 +23,8 @@ pub enum Request {
     Session { name: String, start: bool },
     /// The VM instances whose VMs run ([`Response::Running`]).
     Running,
+    /// The VM instances and the templates ([`Response::List`]).
+    List,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -34,6 +38,39 @@ pub enum Response {
     /// The connection now goes to the agent.
     Ready,
     Running(Vec<String>),
+    List(Listing),
     /// The request failed.
     Error(String),
+}
+
+/// The VM instances and the templates.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Listing {
+    pub instances: Vec<InstanceInfo>,
+    pub templates: Vec<TemplateInfo>,
+    /// Where the templates are.
+    pub templates_dir: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InstanceInfo {
+    pub name: String,
+    /// The template that the instance was created from.
+    pub template: Option<String>,
+    /// Whether its VM runs.
+    pub running: bool,
+    /// The size of its disk's file.
+    pub disk_size: Option<u64>,
+    /// Why the instance is broken (e.g., an invalid instance file).
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TemplateInfo {
+    pub name: String,
+    pub description: Option<String>,
+    /// Whether instances need a user (for the template's user-setup).
+    pub needs_user: bool,
+    /// Why the template is broken (e.g., it has no disk).
+    pub error: Option<String>,
 }

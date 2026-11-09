@@ -7,10 +7,11 @@ use std::io;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
+use midgard_protocol::control::InstanceInfo;
 use midgard_protocol::machine::{ConsoleKind, Disk, MachineConfig};
 
 use crate::paths;
-use crate::settings::{self, Settings};
+use crate::settings::{self, Role, Settings};
 
 /// The longest name of an instance.
 const MAX_NAME: usize = 64;
@@ -44,7 +45,7 @@ pub fn validate_name(name: &str) -> Result<()> {
 pub struct Instance {
     /// The instance's directory.
     dir: PathBuf,
-    settings: Settings,
+    pub settings: Settings,
 }
 
 impl Instance {
@@ -63,7 +64,8 @@ impl Instance {
             }
             Err(error) => return Err(error).with_context(|| format!("failed to read {path:?}")),
         };
-        let settings = settings::parse(&text).with_context(|| format!("invalid {path:?}"))?;
+        let settings =
+            settings::parse(&text, Role::Instance).with_context(|| format!("invalid {path:?}"))?;
         Ok(Self { dir, settings })
     }
 
@@ -93,6 +95,25 @@ impl Instance {
             waypipe: paths::guest_waypipe(),
         }
     }
+}
+
+/// The instance `name` for `bifrost list` (`running`: whether its VM runs).
+pub fn info(name: &str, running: bool) -> InstanceInfo {
+    let mut info = InstanceInfo {
+        name: name.to_string(),
+        template: None,
+        running,
+        disk_size: None,
+        error: None,
+    };
+    match Instance::load(name) {
+        Ok(instance) => {
+            info.disk_size = std::fs::metadata(instance.disk()).ok().map(|m| m.len());
+            info.template = instance.settings.template;
+        }
+        Err(error) => info.error = Some(format!("{error:#}")),
+    }
+    info
 }
 
 #[cfg(test)]

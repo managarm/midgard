@@ -43,6 +43,7 @@ fn main() -> ExitCode {
         None => client::run(vm(&cli.run.vm), &cli.run),
         Some(Action::Shutdown(args)) if args.all => client::shutdown_all().map(|()| 0),
         Some(Action::Shutdown(args)) => client::shutdown(vm(&args.name)).map(|()| 0),
+        Some(Action::List) => client::list(),
         Some(Action::Log(args)) => client::log(vm(&args.name), args.follow),
         Some(Action::Boot(args)) => boot::boot(args).map(|()| 0),
         Some(action) => Err(anyhow::anyhow!("not implemented yet: {action:?}")),
