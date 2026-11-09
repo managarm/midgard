@@ -203,16 +203,6 @@ impl Msrs {
     }
 }
 
-/// Whether a vCPU runs (see [`Vcpu::mp_state`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MpState {
-    Runnable,
-    /// HLT: the vCPU waits for an interrupt.
-    Halted,
-    /// The vCPU waits for a startup IPI (an AP before it was started, or after INIT).
-    WaitForStartup,
-}
-
 /// An MMIO access that the backend already decoded (KVM decodes MMIO instructions in
 /// the kernel; Hel does not).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -290,7 +280,6 @@ backend! {
         fn set_regs(&mut self, regs: &Regs) -> Result<()>;
         fn msrs(&mut self) -> Result<Msrs>;
         fn set_msrs(&mut self, msrs: &Msrs) -> Result<()>;
-        fn mp_state(&mut self) -> Result<MpState>;
         /// Accesses a 32-bit register of an in-kernel device (the local APIC in xAPIC
         /// mode or the I/O APIC) for an MMIO exit that the VMM decoded; `write` is the
         /// value to write. Returns None if no in-kernel device is at `address`.

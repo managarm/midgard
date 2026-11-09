@@ -15,8 +15,7 @@ use std::sync::{Arc, Mutex, Once};
 
 use anyhow::{Context, Result, bail};
 use kvm_bindings::{
-    CpuId, KVM_CPUID_FLAG_SIGNIFCANT_INDEX, KVM_MAX_CPUID_ENTRIES, KVM_MP_STATE_HALTED,
-    KVM_MP_STATE_INIT_RECEIVED, KVM_MP_STATE_UNINITIALIZED, KVM_MSR_EXIT_REASON_FILTER,
+    CpuId, KVM_CPUID_FLAG_SIGNIFCANT_INDEX, KVM_MAX_CPUID_ENTRIES, KVM_MSR_EXIT_REASON_FILTER,
     KVM_MSR_EXIT_REASON_INVAL, KVM_MSR_EXIT_REASON_UNKNOWN, KVM_VCPU_TSC_CTRL, KVM_VCPU_TSC_OFFSET,
     Msrs as KvmMsrs, kvm_cpuid_entry2, kvm_device_attr, kvm_dtable, kvm_enable_cap, kvm_msr_entry,
     kvm_regs, kvm_run, kvm_segment, kvm_userspace_memory_region, kvm_xcrs,
@@ -28,7 +27,7 @@ use kvm_ioctls::{
 use crate::x86::{LAPIC_BASE, cpuid, msr};
 use crate::{
     BasicRegs, Completion, CpuidEntry, DescriptorTable, Exit, GuestMemory, HypervisorOps,
-    KickerOps, MmioAccess, MpState, Msrs, RESERVED_BASE, Regs, Segment, VcpuOps,
+    KickerOps, MmioAccess, Msrs, RESERVED_BASE, Regs, Segment, VcpuOps,
 };
 
 // kvm-ioctls only wraps KVM_SET_DEVICE_ATTR for vCPUs on aarch64.
@@ -762,15 +761,6 @@ impl VcpuOps for Vcpu {
         xcrs.xcrs[0].xcr = 0;
         xcrs.xcrs[0].value = m.xcr0;
         self.fd.set_xcrs(&xcrs).context("KVM_SET_XCRS failed")
-    }
-
-    fn mp_state(&mut self) -> Result<MpState> {
-        let state = self.fd.get_mp_state().context("KVM_GET_MP_STATE failed")?;
-        Ok(match state.mp_state {
-            KVM_MP_STATE_HALTED => MpState::Halted,
-            KVM_MP_STATE_UNINITIALIZED | KVM_MP_STATE_INIT_RECEIVED => MpState::WaitForStartup,
-            _ => MpState::Runnable,
-        })
     }
 
     fn kernel_mmio(&mut self, _address: u64, _write: Option<u32>) -> Result<Option<u32>> {
