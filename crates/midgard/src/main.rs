@@ -14,6 +14,7 @@
 mod daemon;
 mod instance;
 mod paths;
+mod settings;
 
 use std::io;
 use std::os::fd::{FromRawFd, RawFd};

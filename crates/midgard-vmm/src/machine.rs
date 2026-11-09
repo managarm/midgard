@@ -48,20 +48,26 @@ fn default_cpus() -> u32 {
     (host as u32).clamp(1, DEFAULT_MAX_CPUS.min(max_cpus()))
 }
 
-/// Checks that midgard can run the VM (with `cpus` vCPUs).
-fn validate(config: &MachineConfig, cpus: u32) -> Result<()> {
-    if cpus == 0 || cpus > max_cpus() {
-        bail!("the number of vCPUs must be between 1 and {}", max_cpus());
-    }
-    if !config.memory.is_multiple_of(4096) || config.memory < (64 << 20) {
+/// Checks that a VM can have `memory` bytes of RAM.
+pub fn validate_memory(memory: u64) -> Result<()> {
+    if !memory.is_multiple_of(4096) || memory < (64 << 20) {
         bail!("guest memory must be a multiple of 4 KiB and at least 64 MiB");
     }
-    if config.memory > platform::MAX_LOW_RAM {
+    if memory > platform::MAX_LOW_RAM {
         bail!(
             "guest memory above {:#x} is not supported yet",
             platform::MAX_LOW_RAM
         );
     }
+    Ok(())
+}
+
+/// Checks that midgard can run the VM (with `cpus` vCPUs).
+fn validate(config: &MachineConfig, cpus: u32) -> Result<()> {
+    if cpus == 0 || cpus > max_cpus() {
+        bail!("the number of vCPUs must be between 1 and {}", max_cpus());
+    }
+    validate_memory(config.memory)?;
     if config.agent.is_some() && config.initrd.is_some() {
         bail!("the agent and an initrd are mutually exclusive");
     }

@@ -27,7 +27,8 @@ use midgard_protocol::session::{Request, Response};
 use midgard_protocol::{AGENT_PORT, WAYPIPE_PORT, control, runtime};
 use midgard_vmm::{Machine, MachineHandle, VsockStream};
 
-use crate::{CONSOLE_BUFFER, CONSOLE_CHUNK, instance, log};
+use crate::instance::{self, Instance};
+use crate::{CONSOLE_BUFFER, CONSOLE_CHUNK, log};
 
 /// How long the guest may take to boot (managarm under nested virtualization is slow).
 const BOOT_TIMEOUT: Duration = Duration::from_secs(600);
@@ -383,7 +384,7 @@ impl Drop for ConsoleLog {
     }
 }
 
-/// Runs the VM of `name` (see [`instance::config`]) until it stops.
+/// Runs the VM of `name` (see [`Instance::config`]) until it stops.
 fn run_instance(name: &str, running: &Running) {
     let reason = match boot_instance(name, running) {
         Ok(reason) => reason,
@@ -396,7 +397,7 @@ fn run_instance(name: &str, running: &Running) {
 /// Boots the VM of `name`, makes it ready for sessions and runs it until it stops;
 /// returns why it stopped.
 fn boot_instance(name: &str, running: &Running) -> Result<String> {
-    let mut config = instance::config(name)?;
+    let mut config = Instance::load(name)?.config();
     config.guest.waypipe_debug = waypipe_debug();
     let dir = runtime::runtime_dir(name);
     std::fs::create_dir_all(&dir).with_context(|| format!("failed to create {dir:?}"))?;

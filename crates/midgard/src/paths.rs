@@ -1,11 +1,8 @@
 //! Where midgard's files are: its inputs (the guest kernel, the agent and the guest's
-//! waypipe) and the VM instances' disks and instance files. The daemon's runtime files
-//! are in [`midgard_protocol::runtime`].
+//! waypipe) and the VM instances. The daemon's runtime files are in
+//! [`midgard_protocol::runtime`].
 
 use std::path::PathBuf;
-
-/// The extensions of distribution images: qcow2 or raw ext4 (in this order).
-const IMAGE_EXTENSIONS: [&str; 2] = ["qcow2", "ext4"];
 
 /// Where packages install the guest kernel and the agent.
 const PACKAGE_DIR: &str = "/usr/lib/midgard";
@@ -61,16 +58,7 @@ pub fn guest_waypipe() -> Option<PathBuf> {
     Some(guest_file("guest-waypipe")).filter(|path| path.exists())
 }
 
-/// The disks that a VM instance may have (in [`midgard_dir`]; one at most exists).
-pub fn disk_candidates(name: &str) -> impl Iterator<Item = PathBuf> {
-    let dir = midgard_dir();
-    IMAGE_EXTENSIONS
-        .into_iter()
-        .map(move |extension| dir.join(format!("{name}.{extension}")))
-}
-
-/// The instance file of a VM instance (in [`midgard_dir`], next to its disk), which it
-/// does not need to have.
-pub fn instance_file(name: &str) -> PathBuf {
-    midgard_dir().join(format!("{name}.toml"))
+/// The VM instances' directories (see [`crate::instance`]).
+pub fn instances_dir() -> PathBuf {
+    midgard_dir().join("instances")
 }
