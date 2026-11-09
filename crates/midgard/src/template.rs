@@ -115,3 +115,36 @@ pub fn info(name: &str) -> TemplateInfo {
     }
     info
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The templates that guest/build.py builds.
+    const TEMPLATES: [(&str, &str); 3] = [
+        (
+            "alpine",
+            include_str!("../../../guest/images/alpine/template.toml"),
+        ),
+        (
+            "arch",
+            include_str!("../../../guest/images/arch/template.toml"),
+        ),
+        (
+            "debian",
+            include_str!("../../../guest/images/debian/template.toml"),
+        ),
+    ];
+
+    #[test]
+    fn guest_templates() {
+        for (name, text) in TEMPLATES {
+            let template = settings::parse(text, Role::Template).expect(name);
+            assert!(template.description.is_some(), "{name}");
+            let instance = settings::instance_file(text, name, None, Some("alice")).expect(name);
+            let instance = settings::parse(&instance, Role::Instance).expect(name);
+            assert_eq!(instance.template.as_deref(), Some(name));
+            assert_eq!(instance.guest.user.as_deref(), Some("alice"));
+        }
+    }
+}

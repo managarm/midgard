@@ -1,0 +1,12 @@
+# The settings of the VM instances made from the Debian image: bifrost create copies this
+# file into each instance, with the user that sessions run as (which user-setup creates).
+
+[template]
+description = "Debian 13 (trixie)"
+
+[guest]
+init = "/sbin/init"
+ready = "systemd"
+user-setup = ["/etc/midgard/user-setup"]
+launcher = "systemd"
+display = "systemd"

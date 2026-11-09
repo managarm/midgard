@@ -9,10 +9,10 @@ boots with midgard-init as the initramfs, and the distributions' disk images.
 The targets are `kernel` (guest/kernel.toml and guest/linux.config) and the images in
 guest/images/<name>: image.toml says how to bootstrap the root file system, the files in
 overlay/ are copied into it, and `provision`, a shell script, runs in a chroot of it (as
-root, with the network), e.g., to install packages. An image's files are midgard's
-template: <name>.qcow2.zst (its sparse 64 GiB ext4 file system as a qcow2 image, compressed
-with zstd) and <name>.toml (the default settings of the VM instances that midgard creates
-from it, defaults.toml).
+root, with the network), e.g., to install packages. An image is midgard's template <name>:
+<name>.tar with the template's directory, <name>/disk.qcow2.zst (its sparse 64 GiB ext4
+file system as a qcow2 image, compressed with zstd) and <name>/template.toml (the settings
+of the VM instances that midgard creates from it).
 
 `install` installs targets' files into midgard's directory (default: $MIDGARD_DATA_DIR,
 /var/lib/midgard for root or ~/.local/share/midgard), where midgard finds the kernel and the
@@ -31,7 +31,7 @@ any owner and the package managers can run the packages' scripts.
 
 Downloads and intermediate files are in $XDG_CACHE_HOME/midgard-build
 (~/.cache/midgard-build); the output directory defaults to its dist directory. Needs
-Python 3.11, and `build` needs what building Linux needs (make, gcc, flex, bison, bc, the
+Python 3.12, and `build` needs what building Linux needs (make, gcc, flex, bison, bc, the
 libelf headers) and, for images, util-linux (unshare, mount), e2fsprogs and zstd.
 """
 
@@ -45,6 +45,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tarfile
 import tempfile
 import tomllib
 import urllib.request
@@ -57,6 +58,8 @@ DIST = CACHE / "dist"
 IMAGES = GUEST / "images"
 # The GitHub repository whose guest releases and workflow runs `install` downloads.
 GITHUB_REPO = "48cf/midgard"
+# The file in an installed template's directory with the SHA-256 of its tar file.
+INSTALLED_FROM = "installed-from"
 # The tags of the releases with guest files.
 RELEASE_PREFIX = "guest-"
 # The workflow that builds the targets.
@@ -267,9 +270,20 @@ def run_terminating(*args):
         raise subprocess.CalledProcessError(returncode, [str(arg) for arg in args])
 
 
+def add_to_tar(tar, path, name):
+    """Adds a file or a directory (without its contents) to a tar file, owned by root."""
+    info = tar.gettarinfo(path, name)
+    info.uid = info.gid = 0
+    info.uname = info.gname = "root"
+    if info.isfile():
+        with open(path, "rb") as file:
+            tar.addfile(info, file)
+    else:
+        tar.addfile(info)
+
+
 def build_image(name, out, namespace):
-    """Builds <name>.qcow2.zst and <name>.toml: rootfs.py creates the file system in the
-    user namespace."""
+    """Builds <name>.tar: rootfs.py creates the file system in the user namespace."""
     recipe = IMAGES / name
     spec = load_toml(recipe / "image.toml")["bootstrap"]
     fetch_downloads(spec)
@@ -278,24 +292,35 @@ def build_image(name, out, namespace):
     work.mkdir(exist_ok=True)
     ext4 = work / "root.ext4"
     qcow2 = work / "root.qcow2"
+    template = work / name
     try:
         run_terminating(
             *namespace, sys.executable, GUEST / "rootfs.py", "build", recipe, work, json.dumps(spec)
         )
-        log(f"creating {name}.qcow2.zst")
+        log(f"creating {name}.tar")
         run(sys.executable, GUEST / "mkqcow2.py", ext4, qcow2)
         ext4.unlink()
-        run("zstd", "-q", "-f", "-T0", "-15", qcow2, "-o", out / f"{name}.qcow2.zst")
-        shutil.copyfile(recipe / "defaults.toml", out / f"{name}.toml")
+        template.mkdir(exist_ok=True)
+        run("zstd", "-q", "-f", "-T0", "-15", "--rm", qcow2, "-o", template / "disk.qcow2.zst")
+        shutil.copyfile(recipe / "template.toml", template / "template.toml")
+        # (Not compressed again: the disk is compressed already.)
+        partial = out / f"{name}.tar.partial"
+        with tarfile.open(partial, "w", format=tarfile.PAX_FORMAT) as tar:
+            add_to_tar(tar, template, name)
+            for file in ["template.toml", "disk.qcow2.zst"]:
+                add_to_tar(tar, template / file, f"{name}/{file}")
+        partial.rename(out / f"{name}.tar")
     finally:
         ext4.unlink(missing_ok=True)
         qcow2.unlink(missing_ok=True)
+        shutil.rmtree(template, ignore_errors=True)
+        (out / f"{name}.tar.partial").unlink(missing_ok=True)
         # (Unless a rootfs.py that was killed left the root file system behind.)
         try:
             work.rmdir()
         except OSError:
             pass
-    return [f"{name}.qcow2.zst", f"{name}.toml"]
+    return [f"{name}.tar"]
 
 
 def cmd_build(args):
@@ -353,9 +378,75 @@ def fetch_json(url, headers={}):
         raise Failure(f"cannot download {url}: {error}")
 
 
-def install_release(repo, tag, wanted, data):
-    """Downloads targets' files from a guest release (default: the newest) into the data
+def installed(data, name, sha256):
+    """Whether a target's file is installed in the data directory already (for a template:
+    from that tar file)."""
+    if name.endswith(".tar"):
+        marker = data / "templates" / name.removesuffix(".tar") / INSTALLED_FROM
+        return marker.is_file() and marker.read_text().strip() == sha256
+    path = data / name
+    return path.is_file() and file_sha256(path) == sha256
+
+
+def check_format(entry, source):
+    """Fails for images in the format from before templates were tar files."""
+    target = entry["target"]
+    if target != "kernel" and list(entry["files"]) != [f"{target}.tar"]:
+        raise Failure(
+            f"{source} has {target} in an older format (without {target}.tar), which midgard "
+            "does not use anymore"
+        )
+
+
+def install_template(path, sha256, data):
+    """Unpacks a template (<name>.tar) into the data directory's templates/<name>,
+    replacing the template that is there."""
+    name = path.name.removesuffix(".tar")
+    templates = data / "templates"
+    templates.mkdir(parents=True, exist_ok=True)
+    # (midgard ignores directories whose names start with a dot.)
+    with tempfile.TemporaryDirectory(dir=templates, prefix=f".{name}.") as directory:
+        directory = Path(directory)
+        with tarfile.open(path) as tar:
+            for member in tar.getmembers():
+                inside = member.name == name or member.name.startswith(f"{name}/")
+                if not inside or not (member.isfile() or member.isdir()):
+                    raise Failure(f"{path} has {member.name}, which is not a file in {name}/")
+            tar.extractall(directory, filter="data")
+        new = directory / name
+        if not (new / "template.toml").is_file():
+            raise Failure(f"{path} has no {name}/template.toml")
+        (new / INSTALLED_FROM).write_text(f"{sha256}\n")
+        old = templates / name
+        if old.exists():
+            # (It goes away with the temporary directory.)
+            old.rename(directory / ".old")
+        new.rename(old)
+
+
+def install_files(directory, files, data):
+    """Installs files (by name, with their SHA-256) from a directory into the data
     directory."""
+    for name, sha256 in files.items():
+        if name.endswith(".tar"):
+            install_template(directory / name, sha256, data)
+        else:
+            partial = data / f"{name}.partial"
+            shutil.copyfile(directory / name, partial)
+            partial.rename(data / name)
+
+
+def missing_files(entry, data):
+    """The files of a target that are not installed in the data directory."""
+    return {
+        name: sha256 for name, sha256 in entry["files"].items() if not installed(data, name, sha256)
+    }
+
+
+def install_release(repo, tag, wanted, data):
+    """Downloads targets' files from a guest release (default: the newest) and installs
+    those that are not installed already into the data directory. Returns the targets'
+    manifest entries and whether they were installed."""
     if tag is None:
         # (Newest first.)
         url = f"https://api.github.com/repos/{repo}/releases?per_page=100"
@@ -367,31 +458,43 @@ def install_release(repo, tag, wanted, data):
     log(f"installing from the release {tag}")
     base = f"https://github.com/{repo}/releases/download/{tag}"
     manifest = fetch_json(f"{base}/manifest.json")
-    entries = []
     for target in wanted or manifest:
         if target not in manifest:
             raise Failure(f"the release {tag} has no {target}")
+        check_format(manifest[target], f"the release {tag}")
+    results = []
+    CACHE.mkdir(parents=True, exist_ok=True)
+    for target in wanted or manifest:
         entry = manifest[target]
-        for name, sha256 in entry["files"].items():
-            download(f"{base}/{name}", data / name, sha256)
-        entries.append(entry)
-    return entries
+        missing = missing_files(entry, data)
+        if missing:
+            with tempfile.TemporaryDirectory(dir=CACHE, prefix="release-") as directory:
+                directory = Path(directory)
+                for name, sha256 in missing.items():
+                    download(f"{base}/{name}", directory / name, sha256)
+                install_files(directory, missing, data)
+        results.append((entry, bool(missing)))
+    return results
 
 
 def install_local(directory, wanted, data):
-    """Copies targets' files (default: all) from a directory with built files into the data
-    directory."""
-    entries = []
-    for target in wanted or sorted(path.stem for path in directory.glob("*.json")):
-        entry = read_manifest(directory, target)
-        for name in entry["files"]:
-            partial = data / f"{name}.partial"
-            shutil.copyfile(directory / name, partial)
-            partial.rename(data / name)
-        entries.append(entry)
+    """Installs targets' files (default: all) from a directory with built files into the
+    data directory, unless they are installed already. Returns the targets' manifest
+    entries and whether they were installed."""
+    entries = [
+        read_manifest(directory, target)
+        for target in wanted or sorted(path.stem for path in directory.glob("*.json"))
+    ]
     if not entries:
         raise Failure(f"there are no built targets in {directory}")
-    return entries
+    for entry in entries:
+        check_format(entry, directory)
+    results = []
+    for entry in entries:
+        missing = missing_files(entry, data)
+        install_files(directory, missing, data)
+        results.append((entry, bool(missing)))
+    return results
 
 
 def download_run(repo, run_id, wanted, directory):
@@ -411,22 +514,25 @@ def cmd_install(args):
     data.mkdir(parents=True, exist_ok=True)
     os.umask(0o022)
     if args.local:
-        entries = install_local(args.build_dir.resolve(), args.targets, data)
+        results = install_local(args.build_dir.resolve(), args.targets, data)
     elif args.run is not None:
         CACHE.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=CACHE, prefix="run-") as directory:
             download_run(args.repo, args.run, args.targets, Path(directory))
-            entries = install_local(Path(directory), args.targets, data)
+            results = install_local(Path(directory), args.targets, data)
     else:
-        entries = install_release(args.repo, args.release, args.targets, data)
-    for entry in entries:
+        results = install_release(args.repo, args.release, args.targets, data)
+    for entry, changed in results:
         target = entry["target"]
         if target in targets() and entry["inputs"] != inputs_hash(target):
             log(
                 f"warning: {target} was built from other inputs than this checkout's "
                 f"(at {entry['commit']})"
             )
-        log(f"installed {target}: {', '.join(entry['files'])} in {data}")
+        if changed:
+            log(f"installed {target}: {', '.join(entry['files'])} in {data}")
+        else:
+            log(f"{target} is installed already in {data}")
 
 
 def changed_files(commit):
