@@ -79,7 +79,7 @@ use kvm as imp;
 #[cfg(not(target_os = "linux"))]
 compile_error!("midgard-hv has no backend for this target OS");
 
-pub use imp::{Hypervisor, Kicker, Vcpu};
+pub use imp::{Hypervisor, Kicker, MAX_VCPUS, Vcpu};
 
 /// Guest-physical addresses that the backend may use for itself, which the VMM must
 /// leave alone (KVM puts its identity map and real-mode TSS there).
@@ -308,7 +308,8 @@ backend! {
     /// What a backend's [`Hypervisor`] (a VM) does; it is shared by all vCPU threads.
     pub struct Hypervisor;
     trait HypervisorOps {
-        /// Creates a vCPU (`id` is its x2APIC ID). The local APIC starts in x2APIC mode.
+        /// Creates a vCPU (`id` is its x2APIC ID, below [`MAX_VCPUS`]). The local APIC
+        /// starts in x2APIC mode.
         /// vCPU 0 is the bootstrap processor (it starts in its reset state; the VMM sets
         /// its registers); the others wait for a startup IPI.
         fn create_vcpu(&self, id: u32, cpuid: &[CpuidEntry]) -> Result<Vcpu>;

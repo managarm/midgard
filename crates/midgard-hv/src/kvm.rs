@@ -106,6 +106,9 @@ impl Drop for Mapping {
     }
 }
 
+/// KVM has no limit of its own below the platform's.
+pub const MAX_VCPUS: u32 = u32::MAX;
+
 pub struct Hypervisor {
     vm: VmFd,
     supported_cpuid: Vec<kvm_cpuid_entry2>,
