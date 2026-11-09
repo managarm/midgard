@@ -14,8 +14,9 @@ template: <name>.qcow2.zst (its sparse 64 GiB ext4 file system as a qcow2 image,
 with zstd) and <name>.toml (the default settings of the VM instances that midgard creates
 from it, defaults.toml).
 
-`install` installs targets' files into midgard's data directory (default: $MIDGARD_DATA_DIR
-or ~/.local/lib/midgard), where midgard finds the kernel and the templates: those that CI
+`install` installs targets' files into midgard's directory (default: $MIDGARD_DATA_DIR,
+/var/lib/midgard for root or ~/.local/share/midgard), where midgard finds the kernel and the
+templates: those that CI
 built (.github/workflows/guest.yml), from the newest guest release (guest-<date>) by
 default, from another release or from a workflow run (which needs gh), or those that
 `build` built (--local). `build` builds targets into the output directory (--build-dir of
@@ -322,9 +323,13 @@ def env_path(name):
 
 
 def data_dir():
-    """Where midgard looks for the guest kernel and the templates first (see
+    """midgard's directory, where it looks for the guest kernel and the templates (see
     crates/midgard/src/paths.rs)."""
-    return env_path("MIDGARD_DATA_DIR") or Path.home() / ".local/lib/midgard"
+    if path := env_path("MIDGARD_DATA_DIR"):
+        return path
+    if os.geteuid() == 0:
+        return Path("/var/lib/midgard")
+    return (env_path("XDG_DATA_HOME") or Path.home() / ".local/share") / "midgard"
 
 
 def read_manifest(directory, target):

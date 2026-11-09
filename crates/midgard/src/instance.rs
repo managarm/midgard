@@ -1,5 +1,5 @@
-//! VM instances: a disk in the state directory (`<name>.qcow2` or `<name>.ext4`, see
-//! [`paths::state_dir`]) that midgard boots with its guest kernel and the agent, and an
+//! VM instances: a disk in midgard's directory (`<name>.qcow2` or `<name>.ext4`, see
+//! [`paths::midgard_dir`]) that midgard boots with its guest kernel and the agent, and an
 //! optional instance file next to it (`<name>.toml`) with the instance's settings:
 //!
 //! ```toml

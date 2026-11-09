@@ -7,6 +7,9 @@ use std::path::PathBuf;
 /// The extensions of distribution images: qcow2 or raw ext4 (in this order).
 const IMAGE_EXTENSIONS: [&str; 2] = ["qcow2", "ext4"];
 
+/// Where packages install the guest kernel and the agent.
+const PACKAGE_DIR: &str = "/usr/lib/midgard";
+
 fn env_path(name: &str) -> Option<PathBuf> {
     std::env::var_os(name).map(PathBuf::from)
 }
@@ -16,48 +19,11 @@ fn in_home(relative: &str) -> Option<PathBuf> {
     env_path("HOME").map(|home| home.join(relative))
 }
 
-/// Where the guest kernel and the agent are, in the order in which midgard searches
-/// them: ~/.local/lib/midgard (files that a user built) and /usr/lib/midgard (the
-/// packages). MIDGARD_DATA_DIR replaces both.
-pub fn data_dirs() -> Vec<PathBuf> {
+/// midgard's directory: MIDGARD_DATA_DIR, else /var/lib/midgard for root and
+/// $XDG_DATA_HOME/midgard (~/.local/share/midgard) for other users. It has the VM
+/// instances and the guest files that the user installed (see guest/build.py).
+pub fn midgard_dir() -> PathBuf {
     if let Some(dir) = env_path("MIDGARD_DATA_DIR") {
-        return vec![dir];
-    }
-    let mut dirs: Vec<PathBuf> = in_home(".local/lib/midgard").into_iter().collect();
-    dirs.push("/usr/lib/midgard".into());
-    dirs
-}
-
-/// Returns the first data directory's `name` that exists (else the one in the last
-/// directory, such that errors name it).
-fn data_file(name: &str) -> PathBuf {
-    let dirs = data_dirs();
-    let path = dirs
-        .iter()
-        .map(|dir| dir.join(name))
-        .find(|path| path.exists());
-    path.unwrap_or_else(|| dirs.last().unwrap().join(name))
-}
-
-/// The guest kernel.
-pub fn kernel() -> PathBuf {
-    data_file("vmlinuz")
-}
-
-/// The guest agent (midgard-init).
-pub fn agent() -> PathBuf {
-    data_file("midgard-init")
-}
-
-/// The guest's waypipe (a static Linux build), if there is one.
-pub fn guest_waypipe() -> Option<PathBuf> {
-    Some(data_file("guest-waypipe")).filter(|path| path.exists())
-}
-
-/// Where the VM instances' disks live: MIDGARD_STATE_DIR, else /var/lib/midgard for
-/// root and $XDG_DATA_HOME/midgard (~/.local/share/midgard) for other users.
-pub fn state_dir() -> PathBuf {
-    if let Some(dir) = env_path("MIDGARD_STATE_DIR") {
         return dir;
     }
     // SAFETY: getuid() has no preconditions.
@@ -70,16 +36,41 @@ pub fn state_dir() -> PathBuf {
         .join("midgard")
 }
 
-/// The disks that a VM instance may have (in [`state_dir`]; one at most exists).
+/// Returns `name` from [`midgard_dir`] if it exists there, else the one that the
+/// packages install (such that errors name it).
+fn guest_file(name: &str) -> PathBuf {
+    let path = midgard_dir().join(name);
+    if path.exists() {
+        return path;
+    }
+    PathBuf::from(PACKAGE_DIR).join(name)
+}
+
+/// The guest kernel.
+pub fn kernel() -> PathBuf {
+    guest_file("vmlinuz")
+}
+
+/// The guest agent (midgard-init).
+pub fn agent() -> PathBuf {
+    guest_file("midgard-init")
+}
+
+/// The guest's waypipe (a static Linux build), if there is one.
+pub fn guest_waypipe() -> Option<PathBuf> {
+    Some(guest_file("guest-waypipe")).filter(|path| path.exists())
+}
+
+/// The disks that a VM instance may have (in [`midgard_dir`]; one at most exists).
 pub fn disk_candidates(name: &str) -> impl Iterator<Item = PathBuf> {
-    let dir = state_dir();
+    let dir = midgard_dir();
     IMAGE_EXTENSIONS
         .into_iter()
         .map(move |extension| dir.join(format!("{name}.{extension}")))
 }
 
-/// The instance file of a VM instance (in [`state_dir`], next to its disk), which it
+/// The instance file of a VM instance (in [`midgard_dir`], next to its disk), which it
 /// does not need to have.
 pub fn instance_file(name: &str) -> PathBuf {
-    state_dir().join(format!("{name}.toml"))
+    midgard_dir().join(format!("{name}.toml"))
 }
