@@ -198,6 +198,7 @@ mod tests {
                 }],
                 templates_dir: "/var/lib/midgard/templates".into(),
             }),
+            control::Response::Done,
             control::Response::Error("no such file".into()),
         ];
         for response in &responses {
@@ -218,6 +219,12 @@ mod tests {
                 start: true,
             },
             control::Request::Input(b"ls\r".to_vec()),
+            control::Request::Create {
+                name: "dev".into(),
+                template: "debian".into(),
+                user: Some("alice".into()),
+                memory: Some(2 << 30),
+            },
         ];
         for request in &requests {
             write_message(&mut stream, request).unwrap();

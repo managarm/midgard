@@ -37,6 +37,17 @@ pub fn format_size(bytes: u64) -> String {
     format!("{text} {}", UNITS[unit])
 }
 
+/// A size in the shortest form that [`parse_size`] reads as exactly that size, e.g. "2G"
+/// or "1536M".
+pub fn format_size_exact(bytes: u64) -> String {
+    for (shift, suffix) in [(40, "T"), (30, "G"), (20, "M"), (10, "K")] {
+        if bytes != 0 && bytes.is_multiple_of(1 << shift) {
+            return format!("{}{suffix}", bytes >> shift);
+        }
+    }
+    bytes.to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -57,5 +68,12 @@ mod tests {
         assert_eq!(format_size(64 << 30), "64 GiB");
         assert_eq!(format_size(3 << 29), "1.5 GiB");
         assert_eq!(format_size(512), "512 bytes");
+        assert_eq!(format_size_exact(2 << 30), "2G");
+        assert_eq!(format_size_exact(3 << 29), "1536M");
+        assert_eq!(format_size_exact(4097), "4097");
+        assert_eq!(format_size_exact(0), "0");
+        for bytes in [1 << 40, 5 << 10, 12345 << 20] {
+            assert_eq!(parse_size(&format_size_exact(bytes)), Ok(bytes));
+        }
     }
 }

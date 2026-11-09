@@ -17,7 +17,7 @@ use midgard_protocol::session::{Exec, Request, Response, WindowSize};
 use midgard_protocol::size::format_size;
 use midgard_protocol::{control, runtime};
 
-use crate::cli::RunArgs;
+use crate::cli::{CreateArgs, RunArgs};
 use crate::{log, terminal};
 
 // The libc crate does not define these for managarm; mlibc uses the Linux ABI values.
@@ -164,6 +164,102 @@ pub fn list() -> Result<i32> {
         Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(0),
         result => result.map(|()| 0).map_err(Into::into),
     }
+}
+
+/// Asks a question on the terminal; returns the answer (without surrounding blanks).
+fn prompt(question: &str) -> Result<String> {
+    eprint!("{question}");
+    io::stderr().flush()?;
+    let mut answer = String::new();
+    if io::stdin().read_line(&mut answer)? == 0 {
+        bail!("no answer (end of input)");
+    }
+    Ok(answer.trim().to_string())
+}
+
+/// The user that sessions of a new VM instance run as: the answer to a question whose
+/// default is our user name (which `yes`, or no terminal, takes without asking).
+fn ask_user(yes: bool) -> Result<String> {
+    let default = ["USER", "LOGNAME"]
+        .iter()
+        .find_map(|name| std::env::var(name).ok().filter(|user| !user.is_empty()));
+    if yes || !is_tty(0) {
+        return default.context(
+            "the template needs a user for the VM instance (bifrost create --user names it)",
+        );
+    }
+    loop {
+        let answer = match &default {
+            Some(default) => prompt(&format!("User in the VM instance [{default}]: "))?,
+            None => prompt("User in the VM instance: ")?,
+        };
+        match (answer.is_empty(), &default) {
+            (false, _) => return Ok(answer),
+            (true, Some(default)) => return Ok(default.clone()),
+            (true, None) => {}
+        }
+    }
+}
+
+/// Creates the VM instance `name` from `template` (asking for the user if the template
+/// needs one and `user` does not name it).
+fn create_instance(
+    name: &str,
+    template: &str,
+    user: Option<String>,
+    memory: Option<u64>,
+    yes: bool,
+) -> Result<()> {
+    let listing = listing()?;
+    if listing
+        .instances
+        .iter()
+        .any(|instance| instance.name == name)
+    {
+        bail!("the VM instance {name} exists already");
+    }
+    let Some(info) = listing.templates.iter().find(|info| info.name == template) else {
+        let names: Vec<_> = listing.templates.iter().map(|info| &*info.name).collect();
+        if names.is_empty() {
+            bail!(
+                "no template {template} (there are no templates in {}; guest/build.py \
+                 install installs them)",
+                listing.templates_dir.display()
+            );
+        }
+        bail!("no template {template} (there are {})", names.join(", "));
+    };
+    if let Some(error) = &info.error {
+        bail!("{error}");
+    }
+    let user = match user {
+        None if info.needs_user => Some(ask_user(yes)?),
+        user => user,
+    };
+    log!("creating {name} from the template {template}...");
+    match ask(control::Request::Create {
+        name: name.to_string(),
+        template: template.to_string(),
+        user,
+        memory,
+    })? {
+        control::Response::Done => Ok(()),
+        other => bail!("unexpected answer from midgard: {other:?}"),
+    }
+}
+
+/// Creates a VM instance (`bifrost create`).
+pub fn create(args: &CreateArgs) -> Result<i32> {
+    let template = args.template.as_deref().unwrap_or(&args.name);
+    create_instance(
+        &args.name,
+        template,
+        args.user.clone(),
+        args.memory,
+        args.yes,
+    )?;
+    log!("created {}", args.name);
+    Ok(0)
 }
 
 /// Prints the console log of the VM of `name`; with `follow`, keeps printing what is

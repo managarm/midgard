@@ -43,8 +43,12 @@
 
 use anyhow::{Context, Result, bail};
 use midgard_protocol::guest::{Display, GuestConfig, Launcher, Ready};
-use midgard_protocol::size::parse_size;
+use midgard_protocol::size::{format_size_exact, parse_size};
 use serde::Deserialize;
+use toml_edit::{DocumentMut, Item, Table, TableLike, Value};
+
+/// The longest name of a user in the guest.
+const MAX_USER: usize = 32;
 
 /// Which file the settings are in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,6 +141,9 @@ impl GuestSettings {
         if self.init.is_none() && ready != Ready::Immediately {
             bail!("ready needs init");
         }
+        if let Some(user) = &self.user {
+            validate_user(user)?;
+        }
         if let Some(user_setup) = &self.user_setup {
             if user_setup.is_empty() {
                 bail!("user-setup must not be empty");
@@ -184,6 +191,24 @@ impl GuestSettings {
     }
 }
 
+/// Checks the name of a user in the guest (which user-setup gets as an argument): it
+/// consists of letters, digits, `.`, `-` and `_` and does not start with `-`.
+fn validate_user(user: &str) -> Result<()> {
+    let valid = !user.is_empty()
+        && user.len() <= MAX_USER
+        && !user.starts_with('-')
+        && user
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'));
+    if !valid {
+        bail!(
+            "invalid user {user:?} (use up to {MAX_USER} letters, digits, '.', '-' and '_', \
+             not starting with '-')"
+        );
+    }
+    Ok(())
+}
+
 /// Parses a settings file.
 pub fn parse(text: &str, role: Role) -> Result<Settings> {
     let file: SettingsFile = toml::from_str(text)?;
@@ -206,6 +231,104 @@ pub fn parse(text: &str, role: Role) -> Result<Settings> {
         memory,
         guest,
     })
+}
+
+/// The table `key` of a settings file (a table or an inline table), which is created if
+/// it is missing.
+fn table<'a>(document: &'a mut DocumentMut, key: &str) -> Result<&'a mut dyn TableLike> {
+    let item = document.entry(key).or_insert_with(|| {
+        let mut table = Table::new();
+        table.set_implicit(true);
+        Item::Table(table)
+    });
+    item.as_table_like_mut()
+        .with_context(|| format!("{key} must be a table"))
+}
+
+/// Sets `key` in `table` to `value`, keeping the comments of a setting that exists.
+fn set(table: &mut dyn TableLike, key: &str, value: impl Into<Value>) {
+    let mut value = value.into();
+    match table.get_mut(key) {
+        Some(item) => {
+            if let Some(old) = item.as_value() {
+                *value.decor_mut() = old.decor().clone();
+            }
+            *item = Item::Value(value);
+        }
+        None => {
+            table.insert(key, Item::Value(value));
+        }
+    }
+}
+
+/// Sets a top-level setting. A new one goes before the tables, so it takes over the
+/// comment at the top of the file (which says what the file is) from the first table:
+/// the comment up to the last blank line in front of the table.
+fn set_top_level(document: &mut DocumentMut, key: &str, value: impl Into<Value>) {
+    let first_setting = !document.iter().any(|(_, item)| item.is_value());
+    let exists = document.contains_key(key);
+    set(document.as_table_mut(), key, value);
+    if exists || !first_setting {
+        return;
+    }
+    let first_table = document
+        .iter_mut()
+        .filter_map(|(_, item)| item.as_table_mut())
+        .filter(|table| !table.is_implicit())
+        .min_by_key(|table| table.position());
+    let Some(first_table) = first_table else {
+        return;
+    };
+    let prefix = first_table
+        .decor()
+        .prefix()
+        .and_then(|prefix| prefix.as_str())
+        .unwrap_or_default()
+        .to_string();
+    // The lines up to the last blank one (with the line break in front of it).
+    let mut split = None;
+    let mut offset = 0;
+    for line in prefix.split_inclusive('\n') {
+        offset += line.len();
+        if line.trim().is_empty() {
+            split = Some(offset);
+        }
+    }
+    let Some(split) = split else {
+        return;
+    };
+    let (header, own) = prefix.split_at(split);
+    first_table.decor_mut().set_prefix(format!("\n{own}"));
+    if let Some(mut key) = document.key_mut(key) {
+        key.leaf_decor_mut().set_prefix(header);
+    }
+}
+
+/// Makes the instance file of a new instance from its template's file (keeping the
+/// comments): it records the template's name and sets the instance's own settings.
+pub fn instance_file(
+    template_file: &str,
+    template: &str,
+    memory: Option<u64>,
+    user: Option<&str>,
+) -> Result<String> {
+    let mut document: DocumentMut = template_file.parse()?;
+    if let Some(memory) = memory {
+        set_top_level(&mut document, "memory", format_size_exact(memory));
+    }
+    set(table(&mut document, "template")?, "name", template);
+    if let Some(user) = user {
+        set(table(&mut document, "guest")?, "user", user);
+    }
+    // Inline tables have no comments, but the spacing of their former last entry.
+    for key in ["template", "guest"] {
+        if let Some(table) = document.get_mut(key).and_then(Item::as_inline_table_mut) {
+            table.fmt();
+        }
+    }
+    let text = document.to_string();
+    parse(&text, Role::Instance)?;
+    Ok(text)
 }
 
 #[cfg(test)]
@@ -247,6 +370,94 @@ mod tests {
     }
 
     #[test]
+    fn instance_files() {
+        let template = r#"# Alpine Linux.
+
+[template]
+# For people.
+description = "Alpine"
+
+[guest]
+# The distribution's init.
+init = "/sbin/init"
+user-setup = ["/setup"]
+"#;
+        let text = instance_file(template, "alpine", Some(3 << 29), Some("alice")).unwrap();
+        assert_eq!(
+            text,
+            r#"# Alpine Linux.
+
+memory = "1536M"
+
+[template]
+# For people.
+description = "Alpine"
+name = "alpine"
+
+[guest]
+# The distribution's init.
+init = "/sbin/init"
+user-setup = ["/setup"]
+user = "alice"
+"#
+        );
+        let settings = parse(&text, Role::Instance).unwrap();
+        assert_eq!(settings.template.as_deref(), Some("alpine"));
+        assert_eq!(settings.guest.user.as_deref(), Some("alice"));
+
+        // Settings that exist keep their comments; tables that the template does not have
+        // are added.
+        let text = instance_file(
+            "# 1G\nmemory = \"1G\"\n",
+            "plain",
+            Some(2 << 30),
+            Some("bob"),
+        )
+        .unwrap();
+        assert!(text.starts_with("# 1G\nmemory = \"2G\"\n"), "{text}");
+        let settings = parse(&text, Role::Instance).unwrap();
+        assert_eq!(settings.memory, Some(2 << 30));
+        assert_eq!(settings.template.as_deref(), Some("plain"));
+        assert_eq!(settings.guest.user.as_deref(), Some("bob"));
+
+        // Only the file's header moves to a new top-level setting; settings keep their
+        // comments (also after the value) when they change.
+        let text = instance_file(
+            "# Header.\n\n# Template.\n[template]\n\n[guest]\nuser = \"x\" # Default.\n",
+            "a",
+            Some(1 << 30),
+            Some("bob"),
+        )
+        .unwrap();
+        assert_eq!(
+            text,
+            "# Header.\n\nmemory = \"1G\"\n\n# Template.\n[template]\nname = \"a\"\n\n\
+             [guest]\nuser = \"bob\" # Default.\n"
+        );
+        let text = instance_file("# Template.\n[template]\n", "a", Some(1 << 30), None).unwrap();
+        assert_eq!(
+            text,
+            "memory = \"1G\"\n# Template.\n[template]\nname = \"a\"\n"
+        );
+
+        // Inline tables and dotted keys.
+        for template in [
+            "guest = { init = \"/sbin/init\", user-setup = [\"/s\"] }\n",
+            "guest.init = \"/sbin/init\"\nguest.user-setup = [\"/s\"]\n",
+        ] {
+            let text = instance_file(template, "a", None, Some("bob")).unwrap();
+            assert!(!text.contains(" ,"), "{text}");
+            let settings = parse(&text, Role::Instance).unwrap();
+            assert_eq!(settings.guest.user.as_deref(), Some("bob"), "{text}");
+        }
+
+        // The instance needs a user for user-setup.
+        assert!(instance_file(template, "alpine", None, None).is_err());
+        assert!(instance_file(template, "alpine", None, Some("-x")).is_err());
+        assert!(instance_file("template = 1", "alpine", None, None).is_err());
+    }
+
+    #[test]
     fn guest() {
         let guest = |text: &str| parse(text, Role::Instance).map(|settings| settings.guest);
         let config = guest(
@@ -282,6 +493,7 @@ mod tests {
             "[guest]\nlauncher = \"wrapper\"\nwrapper = [\"su\"]",
             "[guest]\nwrapper = [\"{helper}\"]",
             "[guest]\nuser = \"alice\"\nuser-setup = []",
+            "[guest]\nuser = \"a/b\"",
             "[guest]\nuser-setup = [\"/setup\"]",
             "[guest]\ndisplay = \"systemd\"",
             "[guest]\nunknown = 1",

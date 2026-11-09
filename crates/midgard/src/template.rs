@@ -4,8 +4,9 @@
 //! disk that their disks start as a copy of (`disk.qcow2`, or `disk.qcow2.zst`, which is
 //! compressed with zstd).
 
-use std::io;
-use std::path::PathBuf;
+use std::fs::File;
+use std::io::{self, BufRead, BufReader, BufWriter, Write};
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use midgard_protocol::control::TemplateInfo;
@@ -18,10 +19,16 @@ use crate::settings::{self, Role, Settings};
 const TEMPLATE_FILE: &str = "template.toml";
 /// The disks that a template may have (exactly one of them).
 const DISKS: [&str; 2] = ["disk.qcow2.zst", "disk.qcow2"];
+/// The extension of a compressed disk.
+const COMPRESSED: &str = "zst";
 
 /// A template.
 pub struct Template {
+    /// Its settings file.
+    pub text: String,
     pub settings: Settings,
+    /// Its disk.
+    disk: PathBuf,
 }
 
 impl Template {
@@ -40,7 +47,7 @@ impl Template {
         };
         let settings =
             settings::parse(&text, Role::Template).with_context(|| format!("invalid {path:?}"))?;
-        let disks: Vec<PathBuf> = DISKS
+        let mut disks: Vec<PathBuf> = DISKS
             .iter()
             .map(|disk| dir.join(disk))
             .filter(|disk| disk.exists())
@@ -52,8 +59,42 @@ impl Template {
                 dir.display()
             );
         }
-        Ok(Self { settings })
+        Ok(Self {
+            text,
+            settings,
+            disk: disks.pop().unwrap(),
+        })
     }
+
+    /// Copies the template's disk to the new file `to` (decompressing it if it is
+    /// compressed) and syncs it.
+    pub fn copy_disk(&self, to: &Path) -> Result<()> {
+        let copied = (|| {
+            let input = File::open(&self.disk)?;
+            let mut output = File::create_new(to)?;
+            if self.disk.extension().is_some_and(|e| e == COMPRESSED) {
+                decompress(input, &mut output)?;
+            } else {
+                io::copy(&mut BufReader::new(input), &mut output)?;
+            }
+            output.sync_all()?;
+            anyhow::Ok(())
+        })();
+        copied.with_context(|| format!("failed to copy {:?} to {to:?}", self.disk))
+    }
+}
+
+/// Decompresses a file that zstd compressed (which may consist of several frames).
+fn decompress(input: File, output: &mut File) -> Result<()> {
+    let mut input = BufReader::new(input);
+    let mut output = BufWriter::new(output);
+    while !input.fill_buf()?.is_empty() {
+        let mut frame = ruzstd::decoding::StreamingDecoder::new(&mut input)
+            .map_err(|error| anyhow::anyhow!("invalid zstd frame: {error}"))?;
+        io::copy(&mut frame, &mut output)?;
+    }
+    output.flush()?;
+    Ok(())
 }
 
 /// The template `name` for `bifrost list`.

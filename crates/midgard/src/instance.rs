@@ -3,15 +3,17 @@
 //! [`crate::settings`]) and its disk (`disk.qcow2`), which midgard boots with its guest
 //! kernel and the agent.
 
-use std::io;
-use std::path::PathBuf;
+use std::fs::File;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use midgard_protocol::control::InstanceInfo;
 use midgard_protocol::machine::{ConsoleKind, Disk, MachineConfig};
 
-use crate::paths;
 use crate::settings::{self, Role, Settings};
+use crate::template::Template;
+use crate::{log, paths};
 
 /// The longest name of an instance.
 const MAX_NAME: usize = 64;
@@ -95,6 +97,75 @@ impl Instance {
             waypipe: paths::guest_waypipe(),
         }
     }
+}
+
+/// Writes a new file and syncs it.
+fn write_synced(path: &Path, text: &str) -> io::Result<()> {
+    let mut file = File::create_new(path)?;
+    file.write_all(text.as_bytes())?;
+    file.sync_all()
+}
+
+/// Syncs a directory, such that the entries in it are durable (best effort: not all file
+/// systems can sync directories).
+fn sync_dir(path: &Path) {
+    if let Ok(dir) = File::open(path) {
+        let _ = dir.sync_all();
+    }
+}
+
+/// Removes what creating instances left behind when midgard stopped in the middle (see
+/// [`create`]). Nothing may create instances meanwhile.
+pub fn remove_leftovers() {
+    let instances = paths::instances_dir();
+    let Ok(entries) = std::fs::read_dir(&instances) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') && name.ends_with(".partial") {
+            log!("removing {name}, which creating an instance left behind");
+            if let Err(error) = std::fs::remove_dir_all(entry.path()) {
+                log!("failed to remove {:?}: {error}", entry.path());
+            }
+        }
+    }
+}
+
+/// Creates the instance `name` from `template`: its directory is made next to where it
+/// belongs and moved there once it is complete. Nothing else may create or delete the
+/// instance meanwhile (see [`crate::daemon::Instances::reserve`]).
+pub fn create(name: &str, template: &str, user: Option<&str>, memory: Option<u64>) -> Result<()> {
+    validate_name(name)?;
+    let source = Template::load(template)?;
+    let instances = paths::instances_dir();
+    let dir = instances.join(name);
+    if dir.exists() {
+        bail!("the VM instance {name} exists already");
+    }
+    let text = settings::instance_file(&source.text, template, memory, user)
+        .with_context(|| format!("cannot create {name} from the template {template}"))?;
+    // (Names do not contain dots, so this is no instance.)
+    let partial = instances.join(format!(".{name}.partial"));
+    if partial.exists() {
+        std::fs::remove_dir_all(&partial)
+            .with_context(|| format!("failed to delete {partial:?}"))?;
+    }
+    std::fs::create_dir_all(&partial).with_context(|| format!("failed to create {partial:?}"))?;
+    let result = (|| {
+        log!("creating {name} from the template {template}");
+        source.copy_disk(&partial.join(DISK))?;
+        let file = partial.join(INSTANCE_FILE);
+        write_synced(&file, &text).with_context(|| format!("failed to write {file:?}"))?;
+        sync_dir(&partial);
+        std::fs::rename(&partial, &dir).with_context(|| format!("failed to create {dir:?}"))?;
+        sync_dir(&instances);
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_dir_all(&partial);
+    }
+    result
 }
 
 /// The instance `name` for `bifrost list` (`running`: whether its VM runs).
