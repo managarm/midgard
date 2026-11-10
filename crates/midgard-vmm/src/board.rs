@@ -1,14 +1,16 @@
 //! The guest's hardware (see [`Board`]).
 
-use std::io::Write;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use event_listener::Event;
 use midgard_hv::{GuestMemory, Hypervisor, Kicker};
 
 use crate::devices::pm1::{self, Pm1};
 use crate::devices::serial::{self, Serial};
 use crate::devices::{read_bytes, write_bytes};
+use crate::host::console::ConsoleOutput;
 use crate::logging::{ReportOnce, log};
 use crate::machine::Stop;
 use crate::virtio::vsock::Vsock;
@@ -41,6 +43,9 @@ pub(crate) struct Board {
     serial: Mutex<Serial>,
     /// The level of the serial port's interrupt line.
     serial_irq: AtomicBool,
+    /// Notified when the serial port's receive FIFO is empty (see
+    /// [`Board::feed_serial`]).
+    serial_drained: Event,
     pm1: Mutex<Pm1>,
     /// The vCPUs' kickers (see [`Board::stop`]).
     kickers: Mutex<Vec<Kicker>>,
@@ -61,7 +66,7 @@ impl Board {
         num_cpus: u32,
         tsc_hz: u64,
         hypervisor: Hypervisor,
-        console: Box<dyn Write + Send>,
+        console: ConsoleOutput,
         virtio: Vec<Transport>,
         vsock: Option<DeviceRef<Vsock>>,
     ) -> Self {
@@ -72,6 +77,7 @@ impl Board {
             tsc_hz,
             serial: Mutex::new(Serial::new(console)),
             serial_irq: AtomicBool::new(false),
+            serial_drained: Event::new(),
             pm1: Mutex::new(Pm1::default()),
             kickers: Mutex::new(Vec::new()),
             stopping: AtomicBool::new(false),
@@ -126,8 +132,33 @@ impl Board {
         self.set_irq_line(pin, false);
     }
 
-    pub(crate) fn flush_console(&self) {
-        self.serial.lock().unwrap().flush();
+    /// Passes the console's input to the serial port, as fast as the guest reads it (a
+    /// task on the VM's executor, which runs until the input ends).
+    pub(crate) async fn feed_serial(self: Arc<Self>, input: async_channel::Receiver<Vec<u8>>) {
+        let mut pending = VecDeque::new();
+        while let Ok(data) = input.recv().await {
+            pending.extend(data);
+            while !pending.is_empty() {
+                // Listen first, such that we do not miss the guest emptying the FIFO.
+                let drained = self.serial_drained.listen();
+                {
+                    let mut serial = self.serial.lock().unwrap();
+                    serial.push_input(&mut pending);
+                    self.set_serial_irq(serial.irq_level());
+                }
+                if !pending.is_empty() {
+                    drained.await;
+                }
+            }
+        }
+    }
+
+    /// Notifies [`Board::feed_serial`] if the guest emptied the serial port's receive
+    /// FIFO.
+    fn check_serial_drained(&self, serial: &Serial) {
+        if serial.input_empty() {
+            self.serial_drained.notify(1);
+        }
     }
 
     /// Runs `f` on a virtio device (for the host side of devices); raises its interrupt
@@ -173,6 +204,7 @@ impl Board {
             let mut serial = self.serial.lock().unwrap();
             let value = read_bytes(serial::NUM_PORTS, offset, size, |o| serial.read(o));
             self.set_serial_irq(serial.irq_level());
+            self.check_serial_drained(&serial);
             return value;
         }
         if let Some(offset) = port_offset(port, platform::PM1A_EVT_BLK, pm1::EVT_LEN) {
@@ -216,6 +248,8 @@ impl Board {
                 serial.write(o, byte)
             });
             self.set_serial_irq(serial.irq_level());
+            // E.g., the guest cleared the FIFO.
+            self.check_serial_drained(&serial);
             return None;
         }
         if let Some(offset) = port_offset(port, platform::PM1A_EVT_BLK, pm1::EVT_LEN) {

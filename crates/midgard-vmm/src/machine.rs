@@ -3,7 +3,7 @@
 use std::cell::OnceCell;
 use std::fmt;
 use std::future::Future;
-use std::io::{self, Write};
+use std::io;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -14,13 +14,15 @@ use anyhow::{Context, Result, anyhow, bail};
 use async_executor::Executor;
 use event_listener::Event;
 use midgard_protocol::guest::Ready;
-use midgard_protocol::machine::MachineConfig;
+use midgard_protocol::machine::{ConsoleKind, MachineConfig};
 use midgard_protocol::{SHARE_TAG, param};
 
 use crate::board::Board;
+use crate::host::console::ConsoleOutput;
 use crate::host::{image, net};
 use crate::logging::log;
 use crate::virtio::block::{self, Block};
+use crate::virtio::console::{self, Console};
 use crate::virtio::fs::{self, VirtioFs};
 use crate::virtio::net::VirtioNet;
 use crate::virtio::vsock::{Vsock, VsockListener, VsockStream};
@@ -70,6 +72,8 @@ fn validate(config: &MachineConfig) -> Result<()> {
 /// The VM's virtio devices, and handles to those that have a host side.
 struct Devices {
     list: DeviceList,
+    /// The console (which takes the console's input once the VM exists).
+    console: Option<DeviceRef<Console>>,
     vsock: Option<DeviceRef<Vsock>>,
     /// The virtio-net device and the frames for the network stack (which starts once
     /// the VM exists).
@@ -80,8 +84,12 @@ struct Devices {
     share: Option<(DeviceRef<VirtioFs>, fs::Backend)>,
 }
 
-fn create_devices(config: &MachineConfig) -> Result<Devices> {
+/// The devices of the VM that `config` describes; the console's output goes to
+/// `output`.
+fn create_devices(config: &MachineConfig, output: &ConsoleOutput) -> Result<Devices> {
     let mut list = DeviceList::default();
+    let console =
+        (config.console == ConsoleKind::Virtio).then(|| list.add(Console::new(output.clone())));
     // The agent talks to us over vsock.
     let vsock = config.agent.is_some().then(|| list.add(Vsock::default()));
     let network = config.network.then(|| {
@@ -112,6 +120,7 @@ fn create_devices(config: &MachineConfig) -> Result<Devices> {
     }
     Ok(Devices {
         list,
+        console,
         vsock,
         network,
         disks,
@@ -122,7 +131,11 @@ fn create_devices(config: &MachineConfig) -> Result<Devices> {
 /// The guest kernel's command line.
 fn kernel_cmdline(config: &MachineConfig, devices: &Devices) -> String {
     let base = config.cmdline.as_deref().unwrap_or(BASE_CMDLINE);
-    let mut cmdline = vec![base.to_string(), "console=ttyS0".to_string()];
+    let console = match config.console {
+        ConsoleKind::Virtio => "console=hvc0",
+        ConsoleKind::Serial => "console=ttyS0",
+    };
+    let mut cmdline = vec![base.to_string(), console.to_string()];
     for slot in 0..devices.list.len() {
         let (base, irq) = platform::virtio_slot(slot);
         cmdline.push(format!(
@@ -263,7 +276,7 @@ impl Machine {
     }
 
     /// Runs the VM's tasks on this thread until the guest stops (or a vCPU fails);
-    /// returns why. Flushes the console before returning.
+    /// returns why.
     pub fn run_until_stopped(&self) -> Result<Stop> {
         if self.stop.get().is_none() {
             // Each vCPU thread sends its result before it exits.
@@ -272,7 +285,6 @@ impl Machine {
                 .expect("all vCPU threads exited");
             self.record(result);
         }
-        self.board.flush_console();
         self.try_stopped().expect("the stop was recorded")
     }
 
@@ -313,12 +325,11 @@ impl Drop for Machine {
         for thread in self.threads.drain(..) {
             let _ = thread.join();
         }
-        self.board.flush_console();
     }
 }
 
-/// What other threads and tasks may do with a VM while it runs: stop it, flush its
-/// console, talk to the guest over vsock, and run tasks next to the VM's own.
+/// What other threads and tasks may do with a VM while it runs: stop it, talk to the
+/// guest over vsock, and run tasks next to the VM's own.
 ///
 /// Cheap to clone; usable from any thread. It does not keep the VM alive: once the
 /// owner's [`Machine`] is gone, operations fail or do nothing.
@@ -339,13 +350,6 @@ impl MachineHandle {
     pub fn stop(&self) {
         if let Ok(board) = self.board() {
             board.stop();
-        }
-    }
-
-    /// Flushes buffered console output to the sink given to [`start`].
-    pub fn flush_console(&self) {
-        if let Ok(board) = self.board() {
-            board.flush_console();
         }
     }
 
@@ -431,13 +435,22 @@ fn spawn_vcpus(
     Ok(machine)
 }
 
-/// Boots the VM that `config` describes. The guest's console output (the serial port)
-/// goes to `console`. The vCPUs start running on their own threads before this returns;
-/// the caller must then drive the VM with [`Machine::run`] or
-/// [`Machine::run_until_stopped`].
-pub fn start(config: &MachineConfig, console: Box<dyn Write + Send>) -> Result<Machine> {
+/// Boots the VM that `config` describes. The guest's console output (the serial port
+/// and virtio-console) goes to `console`, the writing side of a pipe; the guest does not
+/// wait for its reader (output that does not fit is dropped). The pipe closes once the
+/// `Machine` is dropped. `input` (if any) goes to the guest's console as fast as the
+/// guest reads it.
+///
+/// The vCPUs start running on their own threads before this returns; the caller must
+/// then drive the VM with [`Machine::run`] or [`Machine::run_until_stopped`].
+pub fn start(
+    config: &MachineConfig,
+    console: piper::Writer,
+    input: Option<async_channel::Receiver<Vec<u8>>>,
+) -> Result<Machine> {
     validate(config)?;
-    let devices = create_devices(config)?;
+    let console = ConsoleOutput::new(console);
+    let devices = create_devices(config, &console)?;
     let cmdline = kernel_cmdline(config, &devices);
     let (kernel, initrd) = load_images(config)?;
 
@@ -474,6 +487,12 @@ pub fn start(config: &MachineConfig, console: Box<dyn Write + Send>) -> Result<M
     let executor = Arc::new(Executor::new());
     for slot in 0..board.num_virtio() {
         executor.spawn(board.clone().process_virtio(slot)).detach();
+    }
+    if let Some(input) = input {
+        match devices.console {
+            Some(device) => console::start(&executor, board.clone(), device, input),
+            None => executor.spawn(board.clone().feed_serial(input)).detach(),
+        }
     }
     if let Some((device, from_guest)) = devices.network {
         let board = board.clone();

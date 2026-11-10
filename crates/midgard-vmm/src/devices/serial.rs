@@ -1,9 +1,14 @@
-//! A 16550A UART (COM1, IRQ 4) whose output goes to a sink (e.g., stdout).
+//! A 16550A UART (COM1, IRQ 4) whose output goes to the VM's console; the board feeds it
+//! the console's input (see [`Serial::push_input`]).
 
 use std::collections::VecDeque;
-use std::io::Write;
+
+use crate::host::console::ConsoleOutput;
 
 pub(crate) const NUM_PORTS: u16 = 8;
+/// The input that the receive FIFO holds (more than a 16550A's 16 bytes, such that
+/// the board feeds it less often).
+pub(crate) const INPUT_FIFO_SIZE: usize = 4096;
 
 const LCR_DLAB: u8 = 1 << 7;
 const MCR_LOOP: u8 = 1 << 4;
@@ -32,12 +37,11 @@ pub(crate) struct Serial {
     /// A "transmitter holding register empty" interrupt is pending.
     thr_pending: bool,
     input: VecDeque<u8>,
-    /// Where the output goes (the sink buffers it if it wants to).
-    output: Box<dyn Write + Send>,
+    output: ConsoleOutput,
 }
 
 impl Serial {
-    pub(crate) fn new(output: Box<dyn Write + Send>) -> Self {
+    pub(crate) fn new(output: ConsoleOutput) -> Self {
         Self {
             ier: 0,
             lcr: 0,
@@ -56,6 +60,19 @@ impl Serial {
     pub(crate) fn irq_level(&self) -> bool {
         (self.ier & IER_RDI != 0 && !self.input.is_empty())
             || (self.ier & IER_THRI != 0 && self.thr_pending)
+    }
+
+    /// Moves input from `pending` into the receive FIFO, as far as there is room.
+    pub(crate) fn push_input(&mut self, pending: &mut VecDeque<u8>) {
+        let count = INPUT_FIFO_SIZE
+            .saturating_sub(self.input.len())
+            .min(pending.len());
+        self.input.extend(pending.drain(..count));
+    }
+
+    /// Whether the receive FIFO is empty (such that it takes more input).
+    pub(crate) fn input_empty(&self) -> bool {
+        self.input.is_empty()
     }
 
     pub(crate) fn read(&mut self, offset: u16) -> u8 {
@@ -105,7 +122,7 @@ impl Serial {
             0 if dlab => self.dll = value,
             0 => {
                 if self.mcr & MCR_LOOP == 0 {
-                    let _ = self.output.write_all(&[value]);
+                    self.output.write(&[value]);
                 }
                 // The character is sent immediately; the THR is empty again.
                 self.thr_pending = true;
@@ -133,8 +150,26 @@ impl Serial {
             _ => {}
         }
     }
+}
 
-    pub(crate) fn flush(&mut self) {
-        let _ = self.output.flush();
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn input_waits_for_room_in_the_fifo() {
+        let mut serial = Serial::new(ConsoleOutput::new(piper::pipe(1).1));
+        let mut pending: VecDeque<u8> = vec![b'a'; INPUT_FIFO_SIZE + 1].into();
+        serial.push_input(&mut pending);
+        // The FIFO is full; the rest waits.
+        assert_eq!(pending.len(), 1);
+        assert_ne!(serial.read(5) & LSR_DATA_READY, 0);
+        serial.write(1, IER_RDI);
+        assert!(serial.irq_level());
+        for _ in 0..INPUT_FIFO_SIZE {
+            assert_eq!(serial.read(0), b'a');
+        }
+        assert!(serial.input_empty());
+        assert_eq!(serial.read(5) & LSR_DATA_READY, 0);
     }
 }

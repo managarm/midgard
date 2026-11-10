@@ -134,7 +134,7 @@ pub mod nonblocking {
 mod tests {
     use super::*;
     use crate::guest::{Display, GuestConfig, Launch, Launcher, Ready};
-    use crate::machine::{Disk, MachineConfig};
+    use crate::machine::{ConsoleKind, Disk, MachineConfig};
     use crate::session::{Exec, Request, Response, WindowSize};
 
     #[test]
@@ -147,6 +147,7 @@ mod tests {
             append: vec!["quiet".into(), "loglevel=3".into()],
             memory: 2 << 30,
             cpus: 4,
+            console: ConsoleKind::Virtio,
             disks: vec![Disk {
                 path: "/var/lib/midgard/alpine.qcow2".into(),
                 read_only: false,
@@ -194,12 +195,20 @@ mod tests {
     #[test]
     fn control_requests() {
         let mut stream = Vec::new();
-        let request = control::Request::Session {
-            name: "alpine".into(),
-            start: true,
-        };
-        write_message(&mut stream, &request).unwrap();
-        assert_eq!(read_message(&mut stream.as_slice()).unwrap(), Some(request));
+        let requests = [
+            control::Request::Session {
+                name: "alpine".into(),
+                start: true,
+            },
+            control::Request::Input(b"ls\r".to_vec()),
+        ];
+        for request in &requests {
+            write_message(&mut stream, request).unwrap();
+        }
+        let mut reader = stream.as_slice();
+        for request in requests {
+            assert_eq!(read_message(&mut reader).unwrap(), Some(request));
+        }
     }
 
     #[test]

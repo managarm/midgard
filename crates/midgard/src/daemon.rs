@@ -9,12 +9,13 @@
 
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io;
+use std::io::{self, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -26,8 +27,7 @@ use midgard_protocol::session::{Request, Response};
 use midgard_protocol::{AGENT_PORT, WAYPIPE_PORT, control, runtime};
 use midgard_vmm::{Machine, MachineHandle, VsockStream};
 
-use crate::instance;
-use crate::log;
+use crate::{CONSOLE_BUFFER, CONSOLE_CHUNK, instance, log};
 
 /// How long the guest may take to boot (managarm under nested virtualization is slow).
 const BOOT_TIMEOUT: Duration = Duration::from_secs(600);
@@ -352,6 +352,37 @@ impl Instances {
     }
 }
 
+/// Writes the console output of a VM into its console log, on a thread of its own.
+/// Dropping it waits until the thread wrote everything, which it does once the VM is
+/// gone (and the pipe closed).
+struct ConsoleLog(Option<JoinHandle<()>>);
+
+impl ConsoleLog {
+    /// Writes what the returned pipe gets into `log` (of the VM of `name`).
+    fn start(name: &str, mut log: File) -> Result<(Self, piper::Writer)> {
+        let (mut output, console) = piper::pipe(CONSOLE_BUFFER);
+        let thread = std::thread::Builder::new()
+            .name(format!("{name}-console"))
+            .spawn(move || {
+                let mut buffer = vec![0u8; CONSOLE_CHUNK];
+                // What has piled up is written at once.
+                while let Ok(count @ 1..) = future::block_on(output.read(&mut buffer)) {
+                    let _ = log.write_all(&buffer[..count]);
+                }
+            })
+            .context("failed to start the console's thread")?;
+        Ok((Self(Some(thread)), console))
+    }
+}
+
+impl Drop for ConsoleLog {
+    fn drop(&mut self) {
+        if let Some(thread) = self.0.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
 /// Runs the VM of `name` (see [`instance::config`]) until it stops.
 fn run_instance(name: &str, running: &Running) {
     let reason = match boot_instance(name, running) {
@@ -370,7 +401,9 @@ fn boot_instance(name: &str, running: &Running) -> Result<String> {
     let dir = runtime::runtime_dir(name);
     std::fs::create_dir_all(&dir).with_context(|| format!("failed to create {dir:?}"))?;
     let path = runtime::console_log(name);
-    let console = File::create(&path).with_context(|| format!("failed to create {path:?}"))?;
+    let log = File::create(&path).with_context(|| format!("failed to create {path:?}"))?;
+    // Dropped after the VM, such that the log is complete once we report why it stopped.
+    let (console_log, console) = ConsoleLog::start(name, log)?;
 
     // The guest gets a Wayland display only if we can forward its clients.
     let gui = config
@@ -381,7 +414,7 @@ fn boot_instance(name: &str, running: &Running) -> Result<String> {
     if gui.is_none() {
         config.waypipe = None;
     }
-    let machine = midgard_vmm::start(&config, Box::new(console))?;
+    let machine = midgard_vmm::start(&config, console, None)?;
     let handle = machine.handle();
     if let Some(gui) = &gui {
         forward_waypipe(&handle, gui);
@@ -396,5 +429,7 @@ fn boot_instance(name: &str, running: &Running) -> Result<String> {
 
     let result = machine.run_until_stopped();
     drop(gui);
+    drop(machine);
+    drop(console_log);
     Ok(result?.to_string())
 }

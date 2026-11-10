@@ -500,6 +500,7 @@ dependencies = [
  "libc",
  "midgard-protocol",
  "midgard-vmm",
+ "piper",
  "serde",
  "toml",
 ]
@@ -540,6 +541,7 @@ dependencies = [
  "libc",
  "midgard-hv",
  "midgard-protocol",
+ "piper",
  "smoltcp",
  "thiserror",
  "zerocopy",

@@ -73,10 +73,7 @@ impl Vcpu {
             match self.handle_exit(exit)? {
                 Handled::Continue => {}
                 Handled::Complete(result) => completion = Some(result),
-                Handled::Stop(stop) => {
-                    self.board.flush_console();
-                    return Ok(stop);
-                }
+                Handled::Stop(stop) => return Ok(stop),
             }
         }
     }
