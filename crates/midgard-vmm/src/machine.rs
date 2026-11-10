@@ -22,7 +22,7 @@ use crate::host::console::ConsoleOutput;
 use crate::host::{image, net};
 use crate::logging::log;
 use crate::virtio::block::{self, Block};
-use crate::virtio::console::Console;
+use crate::virtio::console::{self, Console};
 use crate::virtio::fs::{self, VirtioFs};
 use crate::virtio::net::VirtioNet;
 use crate::virtio::vsock::{Vsock, VsockListener, VsockStream};
@@ -72,6 +72,8 @@ fn validate(config: &MachineConfig) -> Result<()> {
 /// The VM's virtio devices, and handles to those that have a host side.
 struct Devices {
     list: DeviceList,
+    /// The console (which takes the console's input once the VM exists).
+    console: Option<DeviceRef<Console>>,
     vsock: Option<DeviceRef<Vsock>>,
     /// The virtio-net device and the frames for the network stack (which starts once
     /// the VM exists).
@@ -86,9 +88,8 @@ struct Devices {
 /// `output`.
 fn create_devices(config: &MachineConfig, output: &ConsoleOutput) -> Result<Devices> {
     let mut list = DeviceList::default();
-    if config.console == ConsoleKind::Virtio {
-        list.add(Console::new(output.clone()));
-    }
+    let console =
+        (config.console == ConsoleKind::Virtio).then(|| list.add(Console::new(output.clone())));
     // The agent talks to us over vsock.
     let vsock = config.agent.is_some().then(|| list.add(Vsock::default()));
     let network = config.network.then(|| {
@@ -119,6 +120,7 @@ fn create_devices(config: &MachineConfig, output: &ConsoleOutput) -> Result<Devi
     }
     Ok(Devices {
         list,
+        console,
         vsock,
         network,
         disks,
@@ -436,10 +438,16 @@ fn spawn_vcpus(
 /// Boots the VM that `config` describes. The guest's console output (the serial port
 /// and virtio-console) goes to `console`, the writing side of a pipe; the guest does not
 /// wait for its reader (output that does not fit is dropped). The pipe closes once the
-/// `Machine` is dropped. The vCPUs start running on their own threads before this
-/// returns; the caller must then drive the VM with [`Machine::run`] or
-/// [`Machine::run_until_stopped`].
-pub fn start(config: &MachineConfig, console: piper::Writer) -> Result<Machine> {
+/// `Machine` is dropped. `input` (if any) goes to the guest's console as fast as the
+/// guest reads it.
+///
+/// The vCPUs start running on their own threads before this returns; the caller must
+/// then drive the VM with [`Machine::run`] or [`Machine::run_until_stopped`].
+pub fn start(
+    config: &MachineConfig,
+    console: piper::Writer,
+    input: Option<async_channel::Receiver<Vec<u8>>>,
+) -> Result<Machine> {
     validate(config)?;
     let console = ConsoleOutput::new(console);
     let devices = create_devices(config, &console)?;
@@ -479,6 +487,12 @@ pub fn start(config: &MachineConfig, console: piper::Writer) -> Result<Machine> 
     let executor = Arc::new(Executor::new());
     for slot in 0..board.num_virtio() {
         executor.spawn(board.clone().process_virtio(slot)).detach();
+    }
+    if let Some(input) = input {
+        match devices.console {
+            Some(device) => console::start(&executor, board.clone(), device, input),
+            None => executor.spawn(board.clone().feed_serial(input)).detach(),
+        }
     }
     if let Some((device, from_guest)) = devices.network {
         let board = board.clone();

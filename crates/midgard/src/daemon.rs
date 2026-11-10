@@ -414,7 +414,7 @@ fn boot_instance(name: &str, running: &Running) -> Result<String> {
     if gui.is_none() {
         config.waypipe = None;
     }
-    let machine = midgard_vmm::start(&config, console)?;
+    let machine = midgard_vmm::start(&config, console, None)?;
     let handle = machine.handle();
     if let Some(gui) = &gui {
         forward_waypipe(&handle, gui);

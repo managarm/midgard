@@ -195,12 +195,20 @@ mod tests {
     #[test]
     fn control_requests() {
         let mut stream = Vec::new();
-        let request = control::Request::Session {
-            name: "alpine".into(),
-            start: true,
-        };
-        write_message(&mut stream, &request).unwrap();
-        assert_eq!(read_message(&mut stream.as_slice()).unwrap(), Some(request));
+        let requests = [
+            control::Request::Session {
+                name: "alpine".into(),
+                start: true,
+            },
+            control::Request::Input(b"ls\r".to_vec()),
+        ];
+        for request in &requests {
+            write_message(&mut stream, request).unwrap();
+        }
+        let mut reader = stream.as_slice();
+        for request in requests {
+            assert_eq!(read_message(&mut reader).unwrap(), Some(request));
+        }
     }
 
     #[test]

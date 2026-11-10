@@ -22,6 +22,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::{Arc, LazyLock};
 
 use anyhow::{Context, Result, bail};
+use async_channel::TrySendError;
 use async_executor::Executor;
 use async_io::Async;
 use clap::Parser;
@@ -59,6 +60,9 @@ const LISTEN_FDS_START: RawFd = 3;
 pub(crate) const CONSOLE_BUFFER: usize = 1 << 20;
 /// The most console output that we pass on at once.
 pub(crate) const CONSOLE_CHUNK: usize = 64 << 10;
+/// Console input (in messages) that waits for the guest; more is dropped (see
+/// [`forward_input`]).
+const INPUT_QUEUE: usize = 1024;
 
 /// The socket that systemd passes us (socket activation), if it does.
 fn systemd_listener() -> Result<Option<UnixListener>> {
@@ -111,17 +115,36 @@ enum Event {
 }
 
 /// Runs a VM on this (its own) thread until it stops.
-fn run_vm(config: &MachineConfig, console: piper::Writer, events: async_channel::Sender<Event>) {
-    let result = midgard_vmm::start(config, console).and_then(|machine| {
+fn run_vm(
+    config: &MachineConfig,
+    console: piper::Writer,
+    input: async_channel::Receiver<Vec<u8>>,
+    events: async_channel::Sender<Event>,
+) {
+    let result = midgard_vmm::start(config, console, Some(input)).and_then(|machine| {
         let _ = events.send_blocking(Event::Started(machine.handle()));
         Ok(machine.run_until_stopped()?.to_string())
     });
     let _ = events.send_blocking(Event::Stopped(result));
 }
 
-/// Stops the VM when bifrost closes the connection.
-async fn watch(stream: Arc<Async<UnixStream>>, machine: MachineHandle) {
-    let _ = read_message::<Request>(&mut &*stream).await;
+/// Passes bifrost's input to the VM's console; stops the VM when bifrost closes the
+/// connection. To notice that, we keep reading: input that the guest does not take is
+/// dropped once [`INPUT_QUEUE`] messages wait.
+async fn forward_input(
+    stream: Arc<Async<UnixStream>>,
+    input: async_channel::Sender<Vec<u8>>,
+    machine: MachineHandle,
+) {
+    let mut dropped = false;
+    while let Ok(Some(Request::Input(data))) = read_message(&mut &*stream).await {
+        if let Err(TrySendError::Full(_)) = input.try_send(data)
+            && !dropped
+        {
+            log!("dropping console input that the guest does not read");
+            dropped = true;
+        }
+    }
     machine.stop();
 }
 
@@ -131,7 +154,7 @@ async fn forward_console(stream: &Async<UnixStream>, mut output: piper::Reader) 
     // What has piled up goes in one message.
     while let Ok(count @ 1..) = output.read(&mut buffer).await {
         let data = buffer[..count].to_vec();
-        // If bifrost is gone, the watcher stops the VM.
+        // If bifrost is gone, the input's task stops the VM.
         let _ = write_message(&mut &*stream, &Response::Console(data)).await;
     }
 }
@@ -139,20 +162,22 @@ async fn forward_console(stream: &Async<UnixStream>, mut output: piper::Reader) 
 /// Runs a VM until it stops (or bifrost goes away); returns why it stopped.
 async fn boot(stream: &Arc<Async<UnixStream>>, config: MachineConfig) -> Result<String> {
     let (output, console) = piper::pipe(CONSOLE_BUFFER);
+    let (input, input_receiver) = async_channel::bounded(INPUT_QUEUE);
     let (sender, events) = async_channel::unbounded();
     std::thread::Builder::new()
         .name("vm".into())
-        .spawn(move || run_vm(&config, console, sender))
+        .spawn(move || run_vm(&config, console, input_receiver, sender))
         .context("failed to start the VM's thread")?;
     let watch_vm = async {
-        let mut watcher = None;
+        let mut forwarder = None;
         while let Ok(event) = events.recv().await {
             match event {
                 Event::Started(machine) => {
-                    watcher = Some(EXECUTOR.spawn(watch(stream.clone(), machine)))
+                    let task = forward_input(stream.clone(), input.clone(), machine);
+                    forwarder = Some(EXECUTOR.spawn(task));
                 }
                 Event::Stopped(result) => {
-                    drop(watcher);
+                    drop(forwarder);
                     return result;
                 }
             }
@@ -191,6 +216,7 @@ async fn serve(stream: Async<UnixStream>) -> Result<()> {
             }
         }
         Request::Running => Response::Running(INSTANCES.running()),
+        Request::Input(_) => Response::Error("no VM runs on this connection".into()),
         Request::Session { .. } => unreachable!(),
     };
     // bifrost may be gone already (which stopped the VM).
