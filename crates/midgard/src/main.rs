@@ -8,13 +8,14 @@
 //! The connections to bifrost are tasks on one executor ([`EXECUTOR`], on the main
 //! thread). Each VM runs on a thread of its own with its own executor (see
 //! [`midgard_vmm::Machine::run`]; its vCPUs have threads of their own); a VM in the
-//! foreground reports to its connection's task through a channel (see [`Event`]).
+//! foreground reports to its connection's task through channels (see [`Event`] and
+//! [`boot`]).
 
 mod daemon;
 mod instance;
 mod paths;
 
-use std::io::{self, Write};
+use std::io;
 use std::os::fd::{FromRawFd, RawFd};
 use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -24,6 +25,7 @@ use anyhow::{Context, Result, bail};
 use async_executor::Executor;
 use async_io::Async;
 use clap::Parser;
+use futures_lite::{AsyncReadExt, future};
 use midgard_protocol::control::{Request, Response};
 use midgard_protocol::machine::MachineConfig;
 use midgard_protocol::nonblocking::{read_message, write_message};
@@ -52,8 +54,11 @@ static INSTANCES: LazyLock<Instances> = LazyLock::new(Instances::default);
 
 /// The first file descriptor that systemd passes (see sd_listen_fds(3)).
 const LISTEN_FDS_START: RawFd = 3;
-/// Console output that we buffer (in messages) before the guest has to wait for bifrost.
-const CONSOLE_QUEUE: usize = 256;
+/// The console output that we buffer for its reader (bifrost, or the console log of a VM
+/// instance); more is dropped.
+pub(crate) const CONSOLE_BUFFER: usize = 1 << 20;
+/// The most console output that we pass on at once.
+pub(crate) const CONSOLE_CHUNK: usize = 64 << 10;
 
 /// The socket that systemd passes us (socket activation), if it does.
 fn systemd_listener() -> Result<Option<UnixListener>> {
@@ -101,33 +106,13 @@ fn own_listener() -> Result<UnixListener> {
 enum Event {
     /// The VM exists (its console may have written before).
     Started(MachineHandle),
-    /// Output of the VM's console.
-    Console(Vec<u8>),
-    /// The VM stopped (why), or did not start.
+    /// The VM stopped (why), or did not start. Its console is closed by then.
     Stopped(Result<String>),
 }
 
-/// The VM's console: [`Event::Console`]s for the connection's task. The guest waits
-/// while the queue is full (like for a slow serial line).
-struct Console(async_channel::Sender<Event>);
-
-impl Write for Console {
-    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
-        self.0
-            .send_blocking(Event::Console(data.to_vec()))
-            .map_err(|_| io::ErrorKind::BrokenPipe)?;
-        Ok(data.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
 /// Runs a VM on this (its own) thread until it stops.
-fn run_vm(config: &MachineConfig, events: async_channel::Sender<Event>) {
-    let console = Console(events.clone());
-    let result = midgard_vmm::start(config, Box::new(console)).and_then(|machine| {
+fn run_vm(config: &MachineConfig, console: piper::Writer, events: async_channel::Sender<Event>) {
+    let result = midgard_vmm::start(config, console).and_then(|machine| {
         let _ = events.send_blocking(Event::Started(machine.handle()));
         Ok(machine.run_until_stopped()?.to_string())
     });
@@ -140,34 +125,43 @@ async fn watch(stream: Arc<Async<UnixStream>>, machine: MachineHandle) {
     machine.stop();
 }
 
+/// Sends the VM's console output to bifrost until the VM is gone.
+async fn forward_console(stream: &Async<UnixStream>, mut output: piper::Reader) {
+    let mut buffer = vec![0u8; CONSOLE_CHUNK];
+    // What has piled up goes in one message.
+    while let Ok(count @ 1..) = output.read(&mut buffer).await {
+        let data = buffer[..count].to_vec();
+        // If bifrost is gone, the watcher stops the VM.
+        let _ = write_message(&mut &*stream, &Response::Console(data)).await;
+    }
+}
+
 /// Runs a VM until it stops (or bifrost goes away); returns why it stopped.
 async fn boot(stream: &Arc<Async<UnixStream>>, config: MachineConfig) -> Result<String> {
-    let (sender, events) = async_channel::bounded(CONSOLE_QUEUE);
+    let (output, console) = piper::pipe(CONSOLE_BUFFER);
+    let (sender, events) = async_channel::unbounded();
     std::thread::Builder::new()
         .name("vm".into())
-        .spawn(move || run_vm(&config, sender))
+        .spawn(move || run_vm(&config, console, sender))
         .context("failed to start the VM's thread")?;
-    let mut watcher = None;
-    while let Ok(event) = events.recv().await {
-        match event {
-            Event::Started(machine) => {
-                watcher = Some(EXECUTOR.spawn(watch(stream.clone(), machine)))
-            }
-            Event::Console(mut data) => {
-                // Send what has piled up in one message.
-                while let Ok(Event::Console(more)) = events.try_recv() {
-                    data.extend_from_slice(&more);
+    let watch_vm = async {
+        let mut watcher = None;
+        while let Ok(event) = events.recv().await {
+            match event {
+                Event::Started(machine) => {
+                    watcher = Some(EXECUTOR.spawn(watch(stream.clone(), machine)))
                 }
-                // If bifrost is gone, the watcher stops the VM.
-                let _ = write_message(&mut &**stream, &Response::Console(data)).await;
-            }
-            Event::Stopped(result) => {
-                drop(watcher);
-                return result;
+                Event::Stopped(result) => {
+                    drop(watcher);
+                    return result;
+                }
             }
         }
-    }
-    bail!("the VM's thread exited")
+        bail!("the VM's thread exited")
+    };
+    // All of the console output reaches bifrost before why the VM stopped.
+    let ((), result) = future::zip(forward_console(stream, output), watch_vm).await;
+    result
 }
 
 /// Serves one connection from bifrost.

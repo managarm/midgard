@@ -3,7 +3,7 @@
 use std::cell::OnceCell;
 use std::fmt;
 use std::future::Future;
-use std::io::{self, Write};
+use std::io;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -18,6 +18,7 @@ use midgard_protocol::machine::MachineConfig;
 use midgard_protocol::{SHARE_TAG, param};
 
 use crate::board::Board;
+use crate::host::console::ConsoleOutput;
 use crate::host::{image, net};
 use crate::logging::log;
 use crate::virtio::block::{self, Block};
@@ -263,7 +264,7 @@ impl Machine {
     }
 
     /// Runs the VM's tasks on this thread until the guest stops (or a vCPU fails);
-    /// returns why. Flushes the console before returning.
+    /// returns why.
     pub fn run_until_stopped(&self) -> Result<Stop> {
         if self.stop.get().is_none() {
             // Each vCPU thread sends its result before it exits.
@@ -272,7 +273,6 @@ impl Machine {
                 .expect("all vCPU threads exited");
             self.record(result);
         }
-        self.board.flush_console();
         self.try_stopped().expect("the stop was recorded")
     }
 
@@ -313,12 +313,11 @@ impl Drop for Machine {
         for thread in self.threads.drain(..) {
             let _ = thread.join();
         }
-        self.board.flush_console();
     }
 }
 
-/// What other threads and tasks may do with a VM while it runs: stop it, flush its
-/// console, talk to the guest over vsock, and run tasks next to the VM's own.
+/// What other threads and tasks may do with a VM while it runs: stop it, talk to the
+/// guest over vsock, and run tasks next to the VM's own.
 ///
 /// Cheap to clone; usable from any thread. It does not keep the VM alive: once the
 /// owner's [`Machine`] is gone, operations fail or do nothing.
@@ -339,13 +338,6 @@ impl MachineHandle {
     pub fn stop(&self) {
         if let Ok(board) = self.board() {
             board.stop();
-        }
-    }
-
-    /// Flushes buffered console output to the sink given to [`start`].
-    pub fn flush_console(&self) {
-        if let Ok(board) = self.board() {
-            board.flush_console();
         }
     }
 
@@ -432,10 +424,12 @@ fn spawn_vcpus(
 }
 
 /// Boots the VM that `config` describes. The guest's console output (the serial port)
-/// goes to `console`. The vCPUs start running on their own threads before this returns;
-/// the caller must then drive the VM with [`Machine::run`] or
+/// goes to `console`, the writing side of a pipe; the guest does not wait for its
+/// reader (output that does not fit is dropped). The pipe closes once the `Machine` is
+/// dropped. The vCPUs start running on their own threads before this returns; the
+/// caller must then drive the VM with [`Machine::run`] or
 /// [`Machine::run_until_stopped`].
-pub fn start(config: &MachineConfig, console: Box<dyn Write + Send>) -> Result<Machine> {
+pub fn start(config: &MachineConfig, console: piper::Writer) -> Result<Machine> {
     validate(config)?;
     let devices = create_devices(config)?;
     let cmdline = kernel_cmdline(config, &devices);
@@ -455,7 +449,7 @@ pub fn start(config: &MachineConfig, console: Box<dyn Write + Send>) -> Result<M
         config.cpus,
         tsc_hz,
         hypervisor,
-        console,
+        ConsoleOutput::new(console),
         devices.list.into_transports(),
         devices.vsock,
     ));

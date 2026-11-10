@@ -16,6 +16,7 @@ futures-lite.workspace = true
 libc.workspace = true
 midgard-hv.workspace = true
 midgard-protocol.workspace = true
+piper.workspace = true
 smoltcp = { version = "0.14", default-features = false, features = [
     "std",
     "medium-ethernet",

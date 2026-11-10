@@ -1,6 +1,5 @@
 //! The guest's hardware (see [`Board`]).
 
-use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -9,6 +8,7 @@ use midgard_hv::{GuestMemory, Hypervisor, Kicker};
 use crate::devices::pm1::{self, Pm1};
 use crate::devices::serial::{self, Serial};
 use crate::devices::{read_bytes, write_bytes};
+use crate::host::console::ConsoleOutput;
 use crate::logging::{ReportOnce, log};
 use crate::machine::Stop;
 use crate::virtio::vsock::Vsock;
@@ -61,7 +61,7 @@ impl Board {
         num_cpus: u32,
         tsc_hz: u64,
         hypervisor: Hypervisor,
-        console: Box<dyn Write + Send>,
+        console: ConsoleOutput,
         virtio: Vec<Transport>,
         vsock: Option<DeviceRef<Vsock>>,
     ) -> Self {
@@ -124,10 +124,6 @@ impl Board {
     fn pulse_irq(&self, pin: usize) {
         self.set_irq_line(pin, true);
         self.set_irq_line(pin, false);
-    }
-
-    pub(crate) fn flush_console(&self) {
-        self.serial.lock().unwrap().flush();
     }
 
     /// Runs `f` on a virtio device (for the host side of devices); raises its interrupt
