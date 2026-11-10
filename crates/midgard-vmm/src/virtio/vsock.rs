@@ -319,9 +319,8 @@ impl Vsock {
         packet
     }
 
-    /// Writes packets into the guest's receive buffers; returns whether it used any.
-    fn fill(&mut self, queues: &mut [Queue], memory: &GuestMemory) -> bool {
-        let mut added = false;
+    /// Writes packets into the guest's receive buffers.
+    fn fill(&mut self, queues: &mut [Queue], memory: &GuestMemory) {
         loop {
             // Only take a buffer if there is something to send.
             if self.control.is_empty() && !self.has_pending_data() {
@@ -334,16 +333,13 @@ impl Vsock {
             let Some((h, data)) = self.next_packet(room) else {
                 // Nothing fits after all (e.g., no credit); return the buffer unused.
                 queues[RX_QUEUE].push(memory, chain.head, 0);
-                added = true;
                 break;
             };
             let mut packet = h.as_bytes().to_vec();
             packet.extend_from_slice(&data);
             let written = chain.write(memory, &packet);
             queues[RX_QUEUE].push(memory, chain.head, written);
-            added = true;
         }
-        added
     }
 
     fn has_pending_data(&self) -> bool {
@@ -428,10 +424,9 @@ impl Device for Vsock {
         read_config(&GUEST_CID.to_le_bytes(), offset, data);
     }
 
-    fn process(&mut self, queue: usize, queues: &mut [Queue], memory: &GuestMemory) -> bool {
-        let mut added = false;
+    fn process(&mut self, queue: usize, queues: &mut [Queue], memory: &GuestMemory) {
         if queue == TX_QUEUE {
-            added = queues[TX_QUEUE].process(memory, NAME, |chain| {
+            queues[TX_QUEUE].process(memory, NAME, |chain| {
                 match read_packet(chain, memory) {
                     Ok((h, data)) => self.receive(h, data),
                     Err(error) => log!("{NAME}: {error}"),
@@ -440,7 +435,7 @@ impl Device for Vsock {
             });
         }
         // New receive buffers or replies to send.
-        self.fill(queues, memory) || added
+        self.fill(queues, memory);
     }
 
     fn reset(&mut self) {
@@ -507,8 +502,8 @@ impl VsockStream {
         let (key, shared) = board
             .with_vsock(|vsock, queues, memory| {
                 let connection = vsock.connect(port);
-                let added = vsock.fill(queues, memory);
-                (connection, added)
+                vsock.fill(queues, memory);
+                connection
             })
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "the VM has no vsock device"))?;
         let stream = Self::new(board, key, shared);
@@ -565,7 +560,7 @@ impl StreamHandle {
     /// Sends whatever the device can send now.
     fn flush_device(&self) {
         self.board
-            .with_vsock(|vsock, queues, memory| ((), vsock.fill(queues, memory)));
+            .with_vsock(|vsock, queues, memory| vsock.fill(queues, memory));
     }
 
     fn close(&self) {
@@ -575,7 +570,7 @@ impl StreamHandle {
                 vsock.control.push_back(header(key, OP_RST));
                 vsock.reset(key);
             }
-            ((), vsock.fill(queues, memory))
+            vsock.fill(queues, memory);
         });
     }
 }
@@ -660,7 +655,7 @@ impl VsockListener {
                 if free {
                     vsock.listeners.insert(port, shared.clone());
                 }
-                (free, false)
+                free
             })
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "the VM has no vsock device"))?;
         if !bound {
@@ -696,7 +691,7 @@ impl Drop for VsockListener {
                     vsock.reset(key);
                 }
             }
-            ((), vsock.fill(queues, memory))
+            vsock.fill(queues, memory);
         });
     }
 }

@@ -1,8 +1,8 @@
 //! The guest's hardware (see [`Board`]).
 
 use std::io::Write;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use midgard_hv::{GuestMemory, Hypervisor, Kicker};
 
@@ -29,8 +29,9 @@ enum Unhandled {
 /// interrupt lines to them. The local APICs and the I/O APIC are the hypervisor's. Also
 /// tracks whether the guest is done (stop requested).
 ///
-/// vCPU threads call into it on every exit; the host side of virtio devices reaches its
-/// device through [`Board::with_device`] (or [`Board::with_vsock`]).
+/// vCPU threads call into it on every exit. The virtio devices' queues are processed by
+/// tasks on the VM's executor (see [`Board::process_virtio`]); the host side of virtio
+/// devices reaches its device through [`Board::with_device`] (or [`Board::with_vsock`]).
 pub(crate) struct Board {
     hypervisor: Hypervisor,
     pub(crate) memory: GuestMemory,
@@ -46,7 +47,7 @@ pub(crate) struct Board {
     /// [`Board::stop`] was called.
     stopping: AtomicBool,
     /// The virtio devices, in the order of their slots (see [`platform::virtio_slot`]).
-    virtio: Vec<Mutex<Transport>>,
+    virtio: Vec<Transport>,
     vsock: Option<DeviceRef<Vsock>>,
     reported: ReportOnce<Unhandled>,
     /// What the vCPUs reported (each vCPU tends to do the same, e.g., probe an MSR).
@@ -74,7 +75,7 @@ impl Board {
             pm1: Mutex::new(Pm1::default()),
             kickers: Mutex::new(Vec::new()),
             stopping: AtomicBool::new(false),
-            virtio: virtio.into_iter().map(Mutex::new).collect(),
+            virtio,
             vsock,
             reported: ReportOnce::new(),
             vcpu_reported: ReportOnce::new(),
@@ -130,25 +131,32 @@ impl Board {
     }
 
     /// Runs `f` on a virtio device (for the host side of devices); raises its interrupt
-    /// if `f` added used buffers.
+    /// if `f` returned chains to the driver.
     pub(crate) fn with_device<D: virtio::Device, R>(
         &self,
         device: DeviceRef<D>,
-        f: impl FnOnce(&mut D, &mut [virtio::Queue], &GuestMemory) -> (R, bool),
+        f: impl FnOnce(&mut D, &mut [virtio::Queue], &GuestMemory) -> R,
     ) -> R {
-        let mut transport = self.virtio[device.slot()].lock().unwrap();
-        let (result, interrupt) = transport.with_device(&self.memory, f);
-        if interrupt {
-            // With the lock held (see mmio_write()).
-            self.pulse_irq(transport.irq);
-        }
-        result
+        let transport = &self.virtio[device.slot()];
+        transport.with_device(&self.memory, f, || self.pulse_irq(transport.irq))
+    }
+
+    /// The number of virtio devices.
+    pub(crate) fn num_virtio(&self) -> usize {
+        self.virtio.len()
+    }
+
+    /// Processes the queues of the virtio device in `slot` when the guest notifies them
+    /// (a task on the VM's executor, which runs as long as the VM does).
+    pub(crate) async fn process_virtio(self: Arc<Self>, slot: usize) {
+        let transport = &self.virtio[slot];
+        (transport.process_notified(&self.memory, || self.pulse_irq(transport.irq))).await;
     }
 
     /// Runs `f` on the vsock device; returns None without one.
     pub(crate) fn with_vsock<R>(
         &self,
-        f: impl FnOnce(&mut Vsock, &mut [virtio::Queue], &GuestMemory) -> (R, bool),
+        f: impl FnOnce(&mut Vsock, &mut [virtio::Queue], &GuestMemory) -> R,
     ) -> Option<R> {
         Some(self.with_device(self.vsock?, f))
     }
@@ -250,7 +258,7 @@ impl Board {
     /// MMIO read of `size` bytes.
     pub(crate) fn mmio_read(&self, address: u64, size: u8) -> u64 {
         if let Some((index, offset)) = self.virtio_device(address) {
-            return self.virtio[index].lock().unwrap().read(offset, size);
+            return self.virtio[index].read(offset, size);
         }
         self.report(
             Unhandled::Mmio(address),
@@ -262,19 +270,14 @@ impl Board {
     /// MMIO write of `size` bytes.
     pub(crate) fn mmio_write(&self, address: u64, size: u8, value: u64) {
         if let Some((index, offset)) = self.virtio_device(address) {
-            let mut transport = self.virtio[index].lock().unwrap();
-            match transport.write(offset, size, value, &self.memory) {
+            let transport = &self.virtio[index];
+            match transport.write(offset, size, value) {
                 Effect::None => {}
-                // With the lock held: the edges of two threads must not merge into one
-                // (after the guest saw the first one's used buffers, but not the second
-                // one's).
-                Effect::Interrupt => self.pulse_irq(transport.irq),
                 Effect::Reset(in_flight) => {
-                    drop(transport);
                     // The requests complete on the VM's executor, which keeps running
                     // while vCPUs exist (see Machine).
                     in_flight.wait();
-                    self.virtio[index].lock().unwrap().finish_reset();
+                    transport.finish_reset();
                 }
             }
             return;

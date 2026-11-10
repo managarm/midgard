@@ -1,8 +1,8 @@
 //! virtio-blk backed by a disk image (raw or qcow2).
 //!
-//! When the guest notifies the queue, the vCPU only takes the requests from it and checks
-//! them. Their I/O runs as tasks on the VM's executor (see [`start`]), concurrently and
-//! without holding up the vCPU; the image, which only those tasks use, moves the data
+//! When the guest notifies the queue, the device's queue task only takes the requests
+//! from it and checks them. Their I/O runs as tasks of their own on the VM's executor
+//! (see [`start`]), concurrently; the image, which only those tasks use, moves the data
 //! directly between the disk and guest memory (see [`Image`]). Requests then complete
 //! through [`Board::with_device`].
 
@@ -239,11 +239,11 @@ impl Block {
         }
     }
 
-    /// Returns a request whose I/O is done to the driver; returns whether it did (it does
-    /// not if the driver reset the device in the meantime).
-    fn complete(&self, completion: Completion, queues: &mut [Queue], memory: &GuestMemory) -> bool {
+    /// Returns a request whose I/O is done to the driver (unless the driver reset the
+    /// device in the meantime).
+    fn complete(&self, completion: Completion, queues: &mut [Queue], memory: &GuestMemory) {
         if completion.generation != self.generation.load(Ordering::SeqCst) {
-            return false;
+            return;
         }
         finish(
             &mut queues[0],
@@ -253,7 +253,6 @@ impl Block {
             completion.code,
             completion.written,
         );
-        true
     }
 }
 
@@ -351,7 +350,7 @@ pub(crate) fn start(
                 let memory = board.memory.clone();
                 let completion = request.execute(&*image, memory, &generation).await;
                 board.with_device(device, |block, queues, memory| {
-                    ((), block.complete(completion, queues, memory))
+                    block.complete(completion, queues, memory);
                 });
             }));
         }
@@ -387,8 +386,7 @@ impl Device for Block {
         read_config(config.as_bytes(), offset, data);
     }
 
-    fn process(&mut self, _queue: usize, queues: &mut [Queue], memory: &GuestMemory) -> bool {
-        let mut used = false;
+    fn process(&mut self, _queue: usize, queues: &mut [Queue], memory: &GuestMemory) {
         while let Some(chain) = queues[0].next_chain(memory, NAME) {
             // The status is the last byte of the request.
             let Some(status) = chain
@@ -399,7 +397,6 @@ impl Device for Block {
             else {
                 log!("{NAME}: request without a status byte");
                 queues[0].push(memory, chain.head, 0);
-                used = true;
                 continue;
             };
             let (code, written) = match self.check(&chain, memory) {
@@ -430,9 +427,7 @@ impl Device for Block {
                 }
             };
             finish(&mut queues[0], memory, chain.head, status, code, written);
-            used = true;
         }
-        used
     }
 
     fn reset(&mut self) {
@@ -452,7 +447,7 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::AtomicUsize;
 
-    use super::super::tests::{USED, descriptor, memory, offer, queue};
+    use super::super::tests::{USED, descriptor, memory, offer, queue, take_pushed};
     use super::super::{DESC_NEXT, DESC_WRITE};
     use super::*;
     use crate::host::image::Io;
@@ -561,9 +556,12 @@ mod tests {
             async_io::block_on(request.execute(image, self.memory.clone(), generation))
         }
 
+        /// Completes a request; returns whether it was returned to the driver.
         fn complete(&mut self, completion: Completion) -> bool {
+            take_pushed(&mut self.queues[0]);
             self.block
-                .complete(completion, &mut self.queues, &self.memory)
+                .complete(completion, &mut self.queues, &self.memory);
+            take_pushed(&mut self.queues[0])
         }
 
         /// Submits a request and completes it; returns the status and the length in the
@@ -671,7 +669,8 @@ mod tests {
         descriptor(memory, 2, 1 << 40, 512, DESC_NEXT, 3);
         descriptor(memory, 3, STATUS, 4, DESC_WRITE, 0);
         offer(memory, 0, 0);
-        assert!(test.block.process(0, &mut test.queues, memory));
+        test.block.process(0, &mut test.queues, memory);
+        assert!(take_pushed(&mut test.queues[0]));
         assert!(test.backend.requests.is_empty());
         let mut status = [0u8; 4];
         memory.read(STATUS, &mut status).unwrap();
