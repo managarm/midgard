@@ -85,7 +85,7 @@ pub(crate) struct UserNetHandle {
 }
 
 impl UserNetHandle {
-    /// A frame from the guest (from a vCPU thread).
+    /// A frame from the guest.
     pub(crate) fn send_from_guest(&self, frame: Vec<u8>) {
         // The channel is unbounded; it only fails once the stack is gone.
         let _ = self.from_guest.try_send(frame);

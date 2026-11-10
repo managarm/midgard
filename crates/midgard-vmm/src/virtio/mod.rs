@@ -16,6 +16,7 @@ use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU32, Ordering, fence};
 use std::sync::{Arc, Condvar, Mutex};
 
+use event_listener::Event;
 use midgard_hv::GuestMemory;
 
 use crate::logging::log;
@@ -396,8 +397,9 @@ pub(crate) trait Device: Send + std::any::Any {
     fn write_config(&mut self, _offset: u64, _data: &[u8]) {}
     /// Called when the driver negotiated features (before it sets DRIVER_OK).
     fn set_driver_features(&mut self, _features: u64) {}
-    /// Processes the available buffers of `queue`. Returns whether the device added
-    /// used buffers (to any queue).
+    /// Processes the available buffers of `queue` after the driver notified it (on the
+    /// VM's executor; see [`Transport::process_notified`]). Returns whether the device
+    /// added used buffers (to any queue).
     fn process(&mut self, queue: usize, queues: &mut [Queue], memory: &GuestMemory) -> bool;
     fn reset(&mut self) {}
     /// The requests that the device's host side works on (e.g., I/O into the driver's
@@ -570,6 +572,11 @@ pub(crate) struct Transport {
     registers: Mutex<Registers>,
     device: Mutex<DeviceState>,
     interrupt_status: AtomicU32,
+    /// The queues that the driver notified (a bit for each), which the device's queue
+    /// task did not process yet (see [`Transport::process_notified`]).
+    notified: AtomicU32,
+    /// Notified when the driver notifies a queue.
+    notify: Event,
     device_id: u32,
     device_features: u64,
     pub irq: usize,
@@ -578,6 +585,7 @@ pub(crate) struct Transport {
 impl Transport {
     pub(crate) fn new(device: Box<dyn Device>, irq: usize) -> Self {
         let sizes = device.queue_sizes();
+        assert!(sizes.len() <= u32::BITS as usize, "too many queues");
         Self {
             registers: Mutex::new(Registers {
                 status: 0,
@@ -595,6 +603,8 @@ impl Transport {
                 device,
             }),
             interrupt_status: AtomicU32::new(0),
+            notified: AtomicU32::new(0),
+            notify: Event::new(),
             irq,
         }
     }
@@ -656,16 +666,26 @@ impl Transport {
         value as u64
     }
 
-    /// A register write. `raise` raises the device's interrupt line (see
-    /// [`Transport::signal_used`]).
-    pub(crate) fn write(
-        &self,
-        offset: u64,
-        size: u8,
-        value: u64,
-        memory: &GuestMemory,
-        raise: impl FnOnce(),
-    ) -> Effect {
+    pub(crate) fn write(&self, offset: u64, size: u8, value: u64) -> Effect {
+        // Without the registers' lock: the driver notifies queues and acknowledges
+        // interrupts all the time.
+        match offset {
+            REG_QUEUE_NOTIFY => {
+                // The device's queue task processes the queue (see process_notified()).
+                let queue = value as u32 & 0xFFFF;
+                if queue < u32::BITS {
+                    self.notified.fetch_or(1 << queue, Ordering::SeqCst);
+                    self.notify.notify(1);
+                }
+                return Effect::None;
+            }
+            REG_INTERRUPT_ACK => {
+                self.interrupt_status
+                    .fetch_and(!(value as u32), Ordering::SeqCst);
+                return Effect::None;
+            }
+            _ => {}
+        }
         let mut registers = self.registers.lock().unwrap();
         // The driver must wait for the reset (see finish_reset()).
         if registers.resetting {
@@ -741,21 +761,6 @@ impl Transport {
             REG_QUEUE_DEVICE_HIGH => selected
                 .into_iter()
                 .for_each(|q| set_high(&mut q.used, value)),
-            REG_QUEUE_NOTIFY => {
-                drop(registers);
-                let queue = value as usize & 0xFFFF;
-                let mut state = self.device.lock().unwrap();
-                let state = &mut *state;
-                if state.queues.get(queue).is_some_and(Queue::is_ready) {
-                    let added = state.device.process(queue, &mut state.queues, memory);
-                    if self.signal_used(&mut state.queues, added) {
-                        raise();
-                    }
-                }
-            }
-            REG_INTERRUPT_ACK => {
-                self.interrupt_status.fetch_and(!value, Ordering::SeqCst);
-            }
             REG_STATUS => {
                 if value == 0 {
                     let status = registers.status;
@@ -807,14 +812,52 @@ impl Transport {
         state.device.reset();
         // With the device's lock held, such that no used buffers are signaled after this.
         self.interrupt_status.store(0, Ordering::SeqCst);
+        // Notifications from before the reset are for queues that are gone.
+        self.notified.store(0, Ordering::SeqCst);
         state.device.in_flight()
     }
 
     /// Completes a reset after the device's requests are done (see [`Effect::Reset`]).
     pub(crate) fn finish_reset(&self) {
+        // The driver may notify while it waits (e.g., another vCPU), but the queues are
+        // gone until it sets them up again.
+        self.notified.store(0, Ordering::SeqCst);
         let mut registers = self.registers.lock().unwrap();
         registers.resetting = false;
         registers.status = 0;
+    }
+
+    /// Processes the queues that the driver notifies, for as long as the future runs (on
+    /// the VM's executor, such that the vCPUs return to the guest right away). `raise`
+    /// raises the device's interrupt line (see [`Transport::signal_used`]).
+    pub(crate) async fn process_notified(&self, memory: &GuestMemory, raise: impl Fn()) {
+        loop {
+            let notified = self.notified.swap(0, Ordering::SeqCst);
+            if notified == 0 {
+                // Check again after listening, such that we do not miss a notification.
+                let listener = self.notify.listen();
+                if self.notified.load(Ordering::SeqCst) == 0 {
+                    listener.await;
+                }
+                continue;
+            }
+            {
+                // Notifications that arrive in the meantime are taken together.
+                let mut state = self.device.lock().unwrap();
+                let state = &mut *state;
+                let mut added = false;
+                for queue in 0..state.queues.len() {
+                    if notified & (1 << queue) != 0 && state.queues[queue].is_ready() {
+                        added |= state.device.process(queue, &mut state.queues, memory);
+                    }
+                }
+                if self.signal_used(&mut state.queues, added) {
+                    raise();
+                }
+            }
+            // The VM's other tasks run in between, also while the guest keeps notifying.
+            futures_lite::future::yield_now().await;
+        }
     }
 
     /// Runs `f` on the device, which is a `D` (e.g., for host-side requests). `f` returns
@@ -1016,17 +1059,16 @@ mod tests {
 
     #[test]
     fn reset_waits_for_requests() {
-        let memory = memory();
         let in_flight = InFlight::default();
         let request = in_flight.start();
         let transport = Transport::new(Box::new(Busy(in_flight.clone())), 5);
-        transport.write(REG_STATUS, 4, 1, &memory, || {});
-        let Effect::Reset(wait) = transport.write(REG_STATUS, 4, 0, &memory, || {}) else {
+        transport.write(REG_STATUS, 4, 1);
+        let Effect::Reset(wait) = transport.write(REG_STATUS, 4, 0) else {
             panic!("the reset does not wait");
         };
         // The reset is not complete, and the driver cannot use the device.
         assert_eq!(transport.read(REG_STATUS, 4), 1);
-        transport.write(REG_STATUS, 4, 3, &memory, || {});
+        transport.write(REG_STATUS, 4, 3);
         assert_eq!(transport.read(REG_STATUS, 4), 1);
         assert_eq!(wait.count(), 1);
         drop(request);
@@ -1035,12 +1077,69 @@ mod tests {
         assert_eq!(transport.read(REG_STATUS, 4), 0);
     }
 
+    /// A device that counts the notifications of its queues.
+    #[derive(Default)]
+    struct Counting(Vec<usize>);
+
+    impl Device for Counting {
+        fn device_id(&self) -> u32 {
+            0
+        }
+
+        fn queue_sizes(&self) -> Vec<u16> {
+            vec![SIZE; 3]
+        }
+
+        fn read_config(&self, _offset: u64, _data: &mut [u8]) {}
+
+        fn process(&mut self, queue: usize, _queues: &mut [Queue], _memory: &GuestMemory) -> bool {
+            self.0.push(queue);
+            queue == 2
+        }
+    }
+
+    #[test]
+    fn notified_queues_are_processed_by_the_task() {
+        let memory = memory();
+        let transport = Transport::new(Box::<Counting>::default(), 5);
+        for queue in 0..3 {
+            transport.write(REG_QUEUE_SEL, 4, queue);
+            transport.write(REG_QUEUE_READY, 4, 1);
+        }
+        // Queue 1 twice: the task takes the notifications together.
+        for queue in [1, 2, 1, 7] {
+            transport.write(REG_QUEUE_NOTIFY, 4, queue);
+        }
+        let raised = std::sync::atomic::AtomicUsize::new(0);
+        let raise = || {
+            raised.fetch_add(1, Ordering::SeqCst);
+        };
+        // Run the task until it waits for notifications.
+        futures_lite::future::block_on(futures_lite::future::or(
+            transport.process_notified(&memory, raise),
+            futures_lite::future::ready(()),
+        ));
+        let processed = transport.with_device(
+            &memory,
+            |c: &mut Counting, _, _| (c.0.clone(), false),
+            || {},
+        );
+        assert_eq!(processed, [1, 2]);
+        assert_eq!(raised.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            transport.read(REG_INTERRUPT_STATUS, 4),
+            INTERRUPT_USED_BUFFER as u64
+        );
+        transport.write(REG_INTERRUPT_ACK, 4, INTERRUPT_USED_BUFFER as u64);
+        assert_eq!(transport.read(REG_INTERRUPT_STATUS, 4), 0);
+    }
+
     #[test]
     fn queues_take_their_configuration_when_ready() {
         let memory = memory();
         let transport = Transport::new(Box::new(Busy(InFlight::default())), 5);
-        transport.write(REG_QUEUE_DRIVER_LOW, 4, 0x2000, &memory, || {});
-        transport.write(REG_QUEUE_READY, 4, 1, &memory, || {});
+        transport.write(REG_QUEUE_DRIVER_LOW, 4, 0x2000);
+        transport.write(REG_QUEUE_READY, 4, 1);
         let position = |transport: &Transport| {
             transport.with_device(
                 &memory,
@@ -1063,10 +1162,48 @@ mod tests {
             || {},
         );
         // Making the queue ready again does not move it back to the start of the rings.
-        transport.write(REG_QUEUE_READY, 4, 1, &memory, || {});
+        transport.write(REG_QUEUE_READY, 4, 1);
         assert_eq!(position(&transport), (true, 0x2000, 3));
-        transport.write(REG_QUEUE_READY, 4, 0, &memory, || {});
+        transport.write(REG_QUEUE_READY, 4, 0);
         assert_eq!(position(&transport), (false, 0, 0));
+    }
+
+    /// Counts its wakeups.
+    struct Wakeups(std::sync::atomic::AtomicUsize);
+
+    impl std::task::Wake for Wakeups {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn notifications_wake_the_waiting_task() {
+        use std::future::Future;
+        use std::task::{Context, Waker};
+
+        let memory = memory();
+        let transport = Transport::new(Box::<Counting>::default(), 5);
+        transport.write(REG_QUEUE_READY, 4, 1);
+        let wakeups = Arc::new(Wakeups(Default::default()));
+        let waker = Waker::from(wakeups.clone());
+        let mut context = Context::from_waker(&waker);
+        let mut task = std::pin::pin!(transport.process_notified(&memory, || {}));
+        // Nothing was notified: the task waits.
+        assert!(task.as_mut().poll(&mut context).is_pending());
+        assert_eq!(wakeups.0.load(Ordering::SeqCst), 0);
+        transport.write(REG_QUEUE_NOTIFY, 4, 0);
+        assert_eq!(wakeups.0.load(Ordering::SeqCst), 1);
+        // The task processes the queue, then lets other tasks run (it wakes itself to
+        // continue).
+        assert!(task.as_mut().poll(&mut context).is_pending());
+        assert_eq!(wakeups.0.load(Ordering::SeqCst), 2);
+        let processed = transport.with_device(
+            &memory,
+            |c: &mut Counting, _, _| (c.0.clone(), false),
+            || {},
+        );
+        assert_eq!(processed, [0]);
     }
 
     #[test]

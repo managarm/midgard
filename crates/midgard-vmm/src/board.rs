@@ -1,8 +1,8 @@
 //! The guest's hardware (see [`Board`]).
 
 use std::io::Write;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use midgard_hv::{GuestMemory, Hypervisor, Kicker};
 
@@ -29,8 +29,9 @@ enum Unhandled {
 /// interrupt lines to them. The local APICs and the I/O APIC are the hypervisor's. Also
 /// tracks whether the guest is done (stop requested).
 ///
-/// vCPU threads call into it on every exit; the host side of virtio devices reaches its
-/// device through [`Board::with_device`] (or [`Board::with_vsock`]).
+/// vCPU threads call into it on every exit. The virtio devices' queues are processed by
+/// tasks on the VM's executor (see [`Board::process_virtio`]); the host side of virtio
+/// devices reaches its device through [`Board::with_device`] (or [`Board::with_vsock`]).
 pub(crate) struct Board {
     hypervisor: Hypervisor,
     pub(crate) memory: GuestMemory,
@@ -138,6 +139,18 @@ impl Board {
     ) -> R {
         let transport = &self.virtio[device.slot()];
         transport.with_device(&self.memory, f, || self.pulse_irq(transport.irq))
+    }
+
+    /// The number of virtio devices.
+    pub(crate) fn num_virtio(&self) -> usize {
+        self.virtio.len()
+    }
+
+    /// Processes the queues of the virtio device in `slot` when the guest notifies them
+    /// (a task on the VM's executor, which runs as long as the VM does).
+    pub(crate) async fn process_virtio(self: Arc<Self>, slot: usize) {
+        let transport = &self.virtio[slot];
+        (transport.process_notified(&self.memory, || self.pulse_irq(transport.irq))).await;
     }
 
     /// Runs `f` on the vsock device; returns None without one.
@@ -258,8 +271,7 @@ impl Board {
     pub(crate) fn mmio_write(&self, address: u64, size: u8, value: u64) {
         if let Some((index, offset)) = self.virtio_device(address) {
             let transport = &self.virtio[index];
-            let raise = || self.pulse_irq(transport.irq);
-            match transport.write(offset, size, value, &self.memory, raise) {
+            match transport.write(offset, size, value) {
                 Effect::None => {}
                 Effect::Reset(in_flight) => {
                     // The requests complete on the VM's executor, which keeps running

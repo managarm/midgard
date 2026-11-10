@@ -1,8 +1,8 @@
 //! virtio-blk backed by a disk image (raw or qcow2).
 //!
-//! When the guest notifies the queue, the vCPU only takes the requests from it and checks
-//! them. Their I/O runs as tasks on the VM's executor (see [`start`]), concurrently and
-//! without holding up the vCPU; the image, which only those tasks use, moves the data
+//! When the guest notifies the queue, the device's queue task only takes the requests
+//! from it and checks them. Their I/O runs as tasks of their own on the VM's executor
+//! (see [`start`]), concurrently; the image, which only those tasks use, moves the data
 //! directly between the disk and guest memory (see [`Image`]). Requests then complete
 //! through [`Board::with_device`].
 

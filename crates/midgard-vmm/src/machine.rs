@@ -188,9 +188,9 @@ fn load_images(config: &MachineConfig) -> Result<(Vec<u8>, Option<Vec<u8>>)> {
 
 /// A running VM, owned by the thread that drives it.
 ///
-/// The vCPUs run on their own threads; the host side of the devices (e.g., disk I/O)
-/// and the tasks of [`MachineHandle::spawn`] run on an executor that only this thread
-/// runs (see [`Machine::run`]). Dropping the `Machine` stops the VM (if it still
+/// The vCPUs run on their own threads; the virtio devices' queues, the host side of the
+/// devices (e.g., disk I/O) and the tasks of [`MachineHandle::spawn`] run on an executor
+/// that only this thread runs (see [`Machine::run`]). Dropping the `Machine` stops the VM (if it still
 /// runs) and releases it. To interact with the VM from elsewhere, take a
 /// [`MachineHandle`].
 pub struct Machine {
@@ -472,6 +472,9 @@ pub fn start(config: &MachineConfig, console: Box<dyn Write + Send>) -> Result<M
         config.memory >> 20,
     );
     let executor = Arc::new(Executor::new());
+    for slot in 0..board.num_virtio() {
+        executor.spawn(board.clone().process_virtio(slot)).detach();
+    }
     if let Some((device, from_guest)) = devices.network {
         let board = board.clone();
         net::spawn(&executor, from_guest, move |frames| {

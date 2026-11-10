@@ -1,8 +1,8 @@
 //! virtio-fs: a directory of the host, mounted in the guest (`mount -t virtiofs <tag>`).
 //!
 //! The guest sends FUSE requests over the virtqueues; we answer them with file system
-//! calls on the host. When the guest notifies a queue, the vCPU only takes the requests
-//! from it and checks them. They run on [`blocking`]'s thread pool, started by tasks on
+//! calls on the host. When the guest notifies a queue, the device's queue task only takes
+//! the requests from it and checks them. They run on [`blocking`]'s thread pool, started by tasks on
 //! the VM's executor (see [`start`]), and complete through [`Board::with_device`]. Reads
 //! and writes move the data directly between the files and guest memory.
 //!
