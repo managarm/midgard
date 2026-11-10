@@ -36,7 +36,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use midgard_protocol::guest::{Display, GuestConfig, Launcher, Ready};
-use midgard_protocol::machine::{Disk, MachineConfig};
+use midgard_protocol::machine::{ConsoleKind, Disk, MachineConfig};
 use serde::Deserialize;
 
 use crate::paths;
@@ -214,6 +214,7 @@ pub fn config(name: &str) -> Result<MachineConfig> {
         append: Vec::new(),
         memory: DEFAULT_MEMORY,
         cpus: default_cpus(),
+        console: ConsoleKind::Virtio,
         disks: vec![Disk {
             path: disk,
             read_only: false,

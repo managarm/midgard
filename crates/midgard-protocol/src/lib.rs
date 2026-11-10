@@ -134,7 +134,7 @@ pub mod nonblocking {
 mod tests {
     use super::*;
     use crate::guest::{Display, GuestConfig, Launch, Launcher, Ready};
-    use crate::machine::{Disk, MachineConfig};
+    use crate::machine::{ConsoleKind, Disk, MachineConfig};
     use crate::session::{Exec, Request, Response, WindowSize};
 
     #[test]
@@ -147,6 +147,7 @@ mod tests {
             append: vec!["quiet".into(), "loglevel=3".into()],
             memory: 2 << 30,
             cpus: 4,
+            console: ConsoleKind::Virtio,
             disks: vec![Disk {
                 path: "/var/lib/midgard/alpine.qcow2".into(),
                 read_only: false,

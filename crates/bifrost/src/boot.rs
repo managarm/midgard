@@ -7,9 +7,9 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use midgard_protocol::control::{Request, Response};
 use midgard_protocol::guest::GuestConfig;
-use midgard_protocol::machine::{Disk, MachineConfig};
+use midgard_protocol::machine::{ConsoleKind, Disk, MachineConfig};
 
-use crate::cli::BootArgs;
+use crate::cli::{BootArgs, Console};
 use crate::client;
 
 /// The guest's RAM unless --memory says otherwise.
@@ -48,6 +48,10 @@ fn config(boot: &BootArgs) -> Result<MachineConfig> {
         append: boot.append.clone(),
         memory: boot.memory.unwrap_or(DEFAULT_MEMORY),
         cpus: boot.cpus.unwrap_or_else(default_cpus),
+        console: match boot.console {
+            Console::Virtio => ConsoleKind::Virtio,
+            Console::Serial => ConsoleKind::Serial,
+        },
         disks,
         network: !boot.no_network,
         share: match (&boot.share, boot.no_share) {
@@ -105,6 +109,7 @@ mod tests {
         assert!(config.append.is_empty());
         assert_eq!(config.memory, DEFAULT_MEMORY);
         assert!((1..=DEFAULT_MAX_CPUS).contains(&config.cpus));
+        assert_eq!(config.console, ConsoleKind::Virtio);
         assert!(config.disks.is_empty());
         assert!(config.network);
         assert_eq!(config.share, Some("/".into()));

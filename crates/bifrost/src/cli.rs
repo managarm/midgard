@@ -2,7 +2,7 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 
 use clap::error::ErrorKind;
-use clap::{Args, CommandFactory, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use midgard_protocol::machine::Disk;
 
 /// Runs a command, or your login shell, in the VM.
@@ -175,6 +175,11 @@ pub struct BootArgs {
     #[arg(long, value_name = "N")]
     pub cpus: Option<u32>,
 
+    /// The guest's console (serial also shows the kernel's messages before it finds
+    /// its virtio devices)
+    #[arg(long, value_name = "KIND", value_enum, default_value_t = Console::Virtio)]
+    pub console: Console,
+
     /// No network interface
     #[arg(long)]
     pub no_network: bool,
@@ -191,6 +196,13 @@ pub struct BootArgs {
     /// the root file system)
     #[arg(long, value_name = "FILE[,ro]", value_parser = parse_disk)]
     pub disk: Vec<Disk>,
+}
+
+/// See [`BootArgs::console`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum Console {
+    Virtio,
+    Serial,
 }
 
 impl Cli {
@@ -394,6 +406,16 @@ mod tests {
         };
         assert!(boot.no_share);
         assert!(parse(&["boot", "--kernel", "k", "--share", "/", "--no-share"]).is_err());
+    }
+
+    #[test]
+    fn boot_console() {
+        let cli = parse(&["boot", "--kernel", "bzImage", "--console", "serial"]).unwrap();
+        let Some(Action::Boot(boot)) = cli.action else {
+            panic!("not boot: {:?}", cli.action);
+        };
+        assert_eq!(boot.console, Console::Serial);
+        assert!(parse(&["boot", "--kernel", "k", "--console", "vga"]).is_err());
     }
 
     #[test]
