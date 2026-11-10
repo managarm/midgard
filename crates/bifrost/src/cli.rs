@@ -44,7 +44,8 @@ pub enum Action {
     /// Show a VM instance's log
     Log(LogArgs),
 
-    /// Boot a VM in the foreground, with its console on stdout (for debugging)
+    /// Boot a VM in the foreground, with its console on stdin / stdout (for debugging;
+    /// Ctrl-A x stops the VM, twice exits right away)
     Boot(BootArgs),
 }
 
