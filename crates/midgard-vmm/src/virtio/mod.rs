@@ -13,7 +13,7 @@ pub(crate) mod net;
 pub(crate) mod vsock;
 
 use std::marker::PhantomData;
-use std::sync::atomic::{Ordering, fence};
+use std::sync::atomic::{AtomicU32, Ordering, fence};
 use std::sync::{Arc, Condvar, Mutex};
 
 use midgard_hv::GuestMemory;
@@ -214,6 +214,19 @@ impl Queue {
         *self = Self::new(self.max_size);
     }
 
+    /// Takes the configuration that the driver wrote (when it makes the queue ready).
+    fn configure(&mut self, config: &QueueConfig) {
+        *self = Self {
+            max_size: config.max_size,
+            size: config.size,
+            ready: true,
+            desc: config.desc,
+            avail: config.avail,
+            used: config.used,
+            ..Default::default()
+        };
+    }
+
     pub(crate) fn is_ready(&self) -> bool {
         self.ready && self.size != 0
     }
@@ -373,7 +386,7 @@ impl Queue {
 pub(crate) trait Device: Send + std::any::Any {
     fn device_id(&self) -> u32;
     /// Device-specific feature bits (the transport adds VIRTIO_F_VERSION_1 and
-    /// VIRTIO_F_INDIRECT_DESC).
+    /// VIRTIO_F_INDIRECT_DESC). The transport asks once, when it is made.
     fn features(&self) -> u64 {
         0
     }
@@ -450,8 +463,6 @@ impl Drop for Pending {
 /// What the board does after a register write (see [`Transport::write`]).
 pub(crate) enum Effect {
     None,
-    /// Raise the device's interrupt.
-    Interrupt,
     /// The driver reset the device, whose host side may still work on requests (e.g.,
     /// I/O into the driver's buffers). With virtio-mmio version 2, the reset is complete
     /// when the write is, so the write must wait for them (without the device's lock,
@@ -507,94 +518,134 @@ impl DeviceList {
     }
 }
 
-/// The MMIO transport of one device.
-pub(crate) struct Transport {
-    device: Box<dyn Device>,
-    queues: Vec<Queue>,
-    pub irq: usize,
+/// The transport's registers, except for the configuration space (which is the
+/// device's) and the interrupt status (see [`Transport`]).
+struct Registers {
     status: u32,
     device_features_sel: u32,
     driver_features: u64,
     driver_features_sel: u32,
     queue_sel: u32,
-    interrupt_status: u32,
+    /// The queues' configuration; a queue takes it when the driver makes it ready.
+    queues: Vec<QueueConfig>,
     /// The driver reset the device, whose requests are not done yet (see
     /// [`Effect::Reset`]).
     resetting: bool,
 }
 
+/// The configuration registers of a queue.
+#[derive(Clone, Copy, Default)]
+struct QueueConfig {
+    max_size: u16,
+    size: u16,
+    ready: bool,
+    desc: u64,
+    avail: u64,
+    used: u64,
+}
+
+impl QueueConfig {
+    fn new(max_size: u16) -> Self {
+        Self {
+            max_size,
+            size: max_size,
+            ..Default::default()
+        }
+    }
+}
+
+/// A device and its queues (see [`Transport`]).
+struct DeviceState {
+    device: Box<dyn Device>,
+    queues: Vec<Queue>,
+}
+
+/// The MMIO transport of one device.
+///
+/// The registers and the device (with its queues) have locks of their own, such that
+/// the driver's register accesses do not wait while the device works on its queues
+/// (e.g., for its host side). The interrupt status is in neither. Where both locks are
+/// taken, the registers' lock comes first.
+pub(crate) struct Transport {
+    registers: Mutex<Registers>,
+    device: Mutex<DeviceState>,
+    interrupt_status: AtomicU32,
+    device_id: u32,
+    device_features: u64,
+    pub irq: usize,
+}
+
 impl Transport {
     pub(crate) fn new(device: Box<dyn Device>, irq: usize) -> Self {
-        let queues = device.queue_sizes().into_iter().map(Queue::new).collect();
+        let sizes = device.queue_sizes();
         Self {
-            device,
-            queues,
+            registers: Mutex::new(Registers {
+                status: 0,
+                device_features_sel: 0,
+                driver_features: 0,
+                driver_features_sel: 0,
+                queue_sel: 0,
+                queues: sizes.iter().copied().map(QueueConfig::new).collect(),
+                resetting: false,
+            }),
+            device_id: device.device_id(),
+            device_features: device.features() | F_VERSION_1 | F_INDIRECT_DESC,
+            device: Mutex::new(DeviceState {
+                queues: sizes.into_iter().map(Queue::new).collect(),
+                device,
+            }),
+            interrupt_status: AtomicU32::new(0),
             irq,
-            status: 0,
-            device_features_sel: 0,
-            driver_features: 0,
-            driver_features_sel: 0,
-            queue_sel: 0,
-            interrupt_status: 0,
-            resetting: false,
         }
-    }
-
-    fn device_features(&self) -> u64 {
-        self.device.features() | F_VERSION_1 | F_INDIRECT_DESC
-    }
-
-    fn reset(&mut self) {
-        for queue in &mut self.queues {
-            queue.reset();
-        }
-        self.device.reset();
-        self.status = 0;
-        self.driver_features = 0;
-        self.interrupt_status = 0;
-        self.queue_sel = 0;
-    }
-
-    fn selected(&mut self) -> Option<&mut Queue> {
-        self.queues.get_mut(self.queue_sel as usize)
     }
 
     /// Sets the used buffer interrupt if the device `added` used buffers (or any queue
     /// returned chains, e.g., malformed ones); returns whether to raise the interrupt
     /// line. (We ignore VRING_AVAIL_F_NO_INTERRUPT; spurious interrupts are harmless.)
-    fn signal_used(&mut self, added: bool) -> bool {
-        let pushed = self.queues.iter_mut().fold(false, |pushed, queue| {
+    ///
+    /// The line must be raised with the device's lock held: the edges of two threads must
+    /// not merge into one (after the driver saw the first one's used buffers, but not
+    /// the second one's).
+    fn signal_used(&self, queues: &mut [Queue], added: bool) -> bool {
+        let pushed = queues.iter_mut().fold(false, |pushed, queue| {
             std::mem::take(&mut queue.pushed) | pushed
         });
         if added || pushed {
-            self.interrupt_status |= INTERRUPT_USED_BUFFER;
+            self.interrupt_status
+                .fetch_or(INTERRUPT_USED_BUFFER, Ordering::SeqCst);
         }
         added || pushed
     }
 
-    pub(crate) fn read(&mut self, offset: u64, size: u8) -> u64 {
+    pub(crate) fn read(&self, offset: u64, size: u8) -> u64 {
         if offset >= REG_CONFIG {
             let mut data = [0u8; 8];
             let size = (size as usize).min(8);
-            self.device
+            let state = self.device.lock().unwrap();
+            state
+                .device
                 .read_config(offset - REG_CONFIG, &mut data[..size]);
             return u64::from_le_bytes(data);
         }
-        let features = self.device_features();
+        if offset == REG_INTERRUPT_STATUS {
+            return self.interrupt_status.load(Ordering::SeqCst) as u64;
+        }
+        let registers = self.registers.lock().unwrap();
+        let selected = registers.queues.get(registers.queue_sel as usize);
+        let features = self.device_features;
         let value = match offset {
             REG_MAGIC => MAGIC,
             REG_VERSION => VERSION,
-            REG_DEVICE_ID => self.device.device_id(),
+            REG_DEVICE_ID => self.device_id,
             REG_VENDOR_ID => VENDOR,
-            REG_DEVICE_FEATURES => match self.device_features_sel {
+            REG_DEVICE_FEATURES => match registers.device_features_sel {
                 0 => features as u32,
                 1 => (features >> 32) as u32,
                 _ => 0,
             },
-            REG_QUEUE_NUM_MAX => self.selected().map_or(0, |q| q.max_size as u32),
-            REG_QUEUE_READY => self.selected().map_or(0, |q| q.ready as u32),
-            REG_INTERRUPT_STATUS => self.interrupt_status,
-            REG_STATUS => self.status,
+            REG_QUEUE_NUM_MAX => selected.map_or(0, |q| q.max_size as u32),
+            REG_QUEUE_READY => selected.map_or(0, |q| q.ready as u32),
+            REG_STATUS => registers.status,
             // No shared memory regions: a length of all ones means "absent".
             REG_SHM_LEN_LOW | REG_SHM_LEN_HIGH => u32::MAX,
             REG_SHM_BASE_LOW | REG_SHM_BASE_HIGH => u32::MAX,
@@ -605,41 +656,51 @@ impl Transport {
         value as u64
     }
 
+    /// A register write. `raise` raises the device's interrupt line (see
+    /// [`Transport::signal_used`]).
     pub(crate) fn write(
-        &mut self,
+        &self,
         offset: u64,
         size: u8,
         value: u64,
         memory: &GuestMemory,
+        raise: impl FnOnce(),
     ) -> Effect {
+        let mut registers = self.registers.lock().unwrap();
         // The driver must wait for the reset (see finish_reset()).
-        if self.resetting {
+        if registers.resetting {
             return Effect::None;
         }
         if offset >= REG_CONFIG {
             let bytes = value.to_le_bytes();
-            self.device
+            let mut state = self.device.lock().unwrap();
+            state
+                .device
                 .write_config(offset - REG_CONFIG, &bytes[..(size as usize).min(8)]);
             return Effect::None;
         }
         let value = value as u32;
-        let set_low = |old: u64, value: u32| (old & !0xFFFF_FFFF) | value as u64;
-        let set_high = |old: u64, value: u32| (old & 0xFFFF_FFFF) | (value as u64) << 32;
+        let set_low = |old: &mut u64, value: u32| *old = (*old & !0xFFFF_FFFF) | value as u64;
+        let set_high =
+            |old: &mut u64, value: u32| *old = (*old & 0xFFFF_FFFF) | (value as u64) << 32;
+        let queue_sel = registers.queue_sel as usize;
+        let selected = registers.queues.get_mut(queue_sel);
         match offset {
-            REG_DEVICE_FEATURES_SEL => self.device_features_sel = value,
+            REG_DEVICE_FEATURES_SEL => registers.device_features_sel = value,
             REG_DRIVER_FEATURES => {
-                let shift = match self.driver_features_sel {
+                let shift = match registers.driver_features_sel {
                     0 => 0,
                     1 => 32,
                     _ => return Effect::None,
                 };
-                self.driver_features =
-                    (self.driver_features & !(0xFFFF_FFFFu64 << shift)) | ((value as u64) << shift);
+                registers.driver_features = (registers.driver_features
+                    & !(0xFFFF_FFFFu64 << shift))
+                    | ((value as u64) << shift);
             }
-            REG_DRIVER_FEATURES_SEL => self.driver_features_sel = value,
-            REG_QUEUE_SEL => self.queue_sel = value,
+            REG_DRIVER_FEATURES_SEL => registers.driver_features_sel = value,
+            REG_QUEUE_SEL => registers.queue_sel = value,
             REG_QUEUE_NUM => {
-                if let Some(queue) = self.selected()
+                if let Some(queue) = selected
                     && value <= queue.max_size as u32
                     && value.is_power_of_two()
                 {
@@ -647,67 +708,82 @@ impl Transport {
                 }
             }
             REG_QUEUE_READY => {
-                if let Some(queue) = self.selected() {
-                    queue.ready = value & 1 != 0;
-                }
-            }
-            REG_QUEUE_DESC_LOW => self
-                .selected()
-                .into_iter()
-                .for_each(|q| q.desc = set_low(q.desc, value)),
-            REG_QUEUE_DESC_HIGH => self
-                .selected()
-                .into_iter()
-                .for_each(|q| q.desc = set_high(q.desc, value)),
-            REG_QUEUE_DRIVER_LOW => self
-                .selected()
-                .into_iter()
-                .for_each(|q| q.avail = set_low(q.avail, value)),
-            REG_QUEUE_DRIVER_HIGH => self
-                .selected()
-                .into_iter()
-                .for_each(|q| q.avail = set_high(q.avail, value)),
-            REG_QUEUE_DEVICE_LOW => self
-                .selected()
-                .into_iter()
-                .for_each(|q| q.used = set_low(q.used, value)),
-            REG_QUEUE_DEVICE_HIGH => self
-                .selected()
-                .into_iter()
-                .for_each(|q| q.used = set_high(q.used, value)),
-            REG_QUEUE_NOTIFY => {
-                let queue = value as usize & 0xFFFF;
-                if queue < self.queues.len() && self.queues[queue].is_ready() {
-                    let added = self.device.process(queue, &mut self.queues, memory);
-                    if self.signal_used(added) {
-                        return Effect::Interrupt;
+                // Writing the current state again changes nothing (e.g., the queue
+                // keeps its position in the rings).
+                if let Some(config) = selected
+                    && config.ready != (value & 1 != 0)
+                {
+                    config.ready = !config.ready;
+                    let config = *config;
+                    let queue = &mut self.device.lock().unwrap().queues[queue_sel];
+                    if config.ready {
+                        queue.configure(&config);
+                    } else {
+                        queue.reset();
                     }
                 }
             }
-            REG_INTERRUPT_ACK => self.interrupt_status &= !value,
+            REG_QUEUE_DESC_LOW => selected
+                .into_iter()
+                .for_each(|q| set_low(&mut q.desc, value)),
+            REG_QUEUE_DESC_HIGH => selected
+                .into_iter()
+                .for_each(|q| set_high(&mut q.desc, value)),
+            REG_QUEUE_DRIVER_LOW => selected
+                .into_iter()
+                .for_each(|q| set_low(&mut q.avail, value)),
+            REG_QUEUE_DRIVER_HIGH => selected
+                .into_iter()
+                .for_each(|q| set_high(&mut q.avail, value)),
+            REG_QUEUE_DEVICE_LOW => selected
+                .into_iter()
+                .for_each(|q| set_low(&mut q.used, value)),
+            REG_QUEUE_DEVICE_HIGH => selected
+                .into_iter()
+                .for_each(|q| set_high(&mut q.used, value)),
+            REG_QUEUE_NOTIFY => {
+                drop(registers);
+                let queue = value as usize & 0xFFFF;
+                let mut state = self.device.lock().unwrap();
+                let state = &mut *state;
+                if state.queues.get(queue).is_some_and(Queue::is_ready) {
+                    let added = state.device.process(queue, &mut state.queues, memory);
+                    if self.signal_used(&mut state.queues, added) {
+                        raise();
+                    }
+                }
+            }
+            REG_INTERRUPT_ACK => {
+                self.interrupt_status.fetch_and(!value, Ordering::SeqCst);
+            }
             REG_STATUS => {
                 if value == 0 {
-                    let status = self.status;
-                    self.reset();
-                    if let Some(in_flight) = self.device.in_flight() {
+                    let status = registers.status;
+                    let in_flight = self.reset(&mut registers);
+                    if let Some(in_flight) = in_flight {
                         // Until the requests are done, the status shows (e.g., to other
                         // vCPUs) that the reset is not complete.
-                        self.status = status;
-                        self.resetting = true;
+                        registers.status = status;
+                        registers.resetting = true;
                         return Effect::Reset(in_flight);
                     }
                 } else {
-                    if value & STATUS_FEATURES_OK != 0 && self.status & STATUS_FEATURES_OK == 0 {
+                    if value & STATUS_FEATURES_OK != 0 && registers.status & STATUS_FEATURES_OK == 0
+                    {
                         // Only features that we offered can be accepted.
-                        let accepted = self.driver_features & self.device_features();
-                        if accepted != self.driver_features {
+                        let accepted = registers.driver_features & self.device_features;
+                        if accepted != registers.driver_features {
                             // Leave FEATURES_OK unset; the driver gives up.
-                            self.status = value & !STATUS_FEATURES_OK;
+                            registers.status = value & !STATUS_FEATURES_OK;
                             return Effect::None;
                         }
-                        self.device.set_driver_features(accepted);
+                        self.device
+                            .lock()
+                            .unwrap()
+                            .device
+                            .set_driver_features(accepted);
                     }
-                    self.status = value;
+                    registers.status = value;
                 }
             }
             _ => {}
@@ -715,24 +791,51 @@ impl Transport {
         Effect::None
     }
 
+    /// Resets the device and the registers; returns the device's requests (see
+    /// [`Device::in_flight`]).
+    fn reset(&self, registers: &mut Registers) -> Option<InFlight> {
+        for config in &mut registers.queues {
+            *config = QueueConfig::new(config.max_size);
+        }
+        registers.status = 0;
+        registers.driver_features = 0;
+        registers.queue_sel = 0;
+        let mut state = self.device.lock().unwrap();
+        for queue in &mut state.queues {
+            queue.reset();
+        }
+        state.device.reset();
+        // With the device's lock held, such that no used buffers are signaled after this.
+        self.interrupt_status.store(0, Ordering::SeqCst);
+        state.device.in_flight()
+    }
+
     /// Completes a reset after the device's requests are done (see [`Effect::Reset`]).
-    pub(crate) fn finish_reset(&mut self) {
-        self.resetting = false;
-        self.status = 0;
+    pub(crate) fn finish_reset(&self) {
+        let mut registers = self.registers.lock().unwrap();
+        registers.resetting = false;
+        registers.status = 0;
     }
 
     /// Runs `f` on the device, which is a `D` (e.g., for host-side requests). `f` returns
-    /// whether it added used buffers; the result is whether to raise the interrupt.
+    /// whether it added used buffers; then, `raise` raises the device's interrupt line
+    /// (see [`Transport::signal_used`]).
     pub(crate) fn with_device<D: Device, R>(
-        &mut self,
+        &self,
         memory: &GuestMemory,
         f: impl FnOnce(&mut D, &mut [Queue], &GuestMemory) -> (R, bool),
-    ) -> (R, bool) {
-        let device = (self.device.as_mut() as &mut dyn std::any::Any)
+        raise: impl FnOnce(),
+    ) -> R {
+        let mut state = self.device.lock().unwrap();
+        let state = &mut *state;
+        let device = (state.device.as_mut() as &mut dyn std::any::Any)
             .downcast_mut::<D>()
             .expect("DeviceRef of the wrong device type");
-        let (result, added) = f(device, &mut self.queues, memory);
-        (result, self.signal_used(added))
+        let (result, added) = f(device, &mut state.queues, memory);
+        if self.signal_used(&mut state.queues, added) {
+            raise();
+        }
+        result
     }
 }
 
@@ -916,20 +1019,54 @@ mod tests {
         let memory = memory();
         let in_flight = InFlight::default();
         let request = in_flight.start();
-        let mut transport = Transport::new(Box::new(Busy(in_flight.clone())), 5);
-        transport.write(REG_STATUS, 4, 1, &memory);
-        let Effect::Reset(wait) = transport.write(REG_STATUS, 4, 0, &memory) else {
+        let transport = Transport::new(Box::new(Busy(in_flight.clone())), 5);
+        transport.write(REG_STATUS, 4, 1, &memory, || {});
+        let Effect::Reset(wait) = transport.write(REG_STATUS, 4, 0, &memory, || {}) else {
             panic!("the reset does not wait");
         };
         // The reset is not complete, and the driver cannot use the device.
         assert_eq!(transport.read(REG_STATUS, 4), 1);
-        transport.write(REG_STATUS, 4, 3, &memory);
+        transport.write(REG_STATUS, 4, 3, &memory, || {});
         assert_eq!(transport.read(REG_STATUS, 4), 1);
         assert_eq!(wait.count(), 1);
         drop(request);
         wait.wait();
         transport.finish_reset();
         assert_eq!(transport.read(REG_STATUS, 4), 0);
+    }
+
+    #[test]
+    fn queues_take_their_configuration_when_ready() {
+        let memory = memory();
+        let transport = Transport::new(Box::new(Busy(InFlight::default())), 5);
+        transport.write(REG_QUEUE_DRIVER_LOW, 4, 0x2000, &memory, || {});
+        transport.write(REG_QUEUE_READY, 4, 1, &memory, || {});
+        let position = |transport: &Transport| {
+            transport.with_device(
+                &memory,
+                |_: &mut Busy, queues, _| {
+                    (
+                        (queues[0].is_ready(), queues[0].avail, queues[0].next_avail),
+                        false,
+                    )
+                },
+                || {},
+            )
+        };
+        assert_eq!(position(&transport), (true, 0x2000, 0));
+        transport.with_device(
+            &memory,
+            |_: &mut Busy, queues, _| {
+                queues[0].next_avail = 3;
+                ((), false)
+            },
+            || {},
+        );
+        // Making the queue ready again does not move it back to the start of the rings.
+        transport.write(REG_QUEUE_READY, 4, 1, &memory, || {});
+        assert_eq!(position(&transport), (true, 0x2000, 3));
+        transport.write(REG_QUEUE_READY, 4, 0, &memory, || {});
+        assert_eq!(position(&transport), (false, 0, 0));
     }
 
     #[test]
