@@ -479,7 +479,7 @@ pub fn start(config: &MachineConfig, console: Box<dyn Write + Send>) -> Result<M
         let board = board.clone();
         net::spawn(&executor, from_guest, move |frames| {
             board.with_device(device, |net, queues, memory| {
-                ((), net.deliver(frames, queues, memory))
+                net.deliver(frames, queues, memory)
             });
         });
     }

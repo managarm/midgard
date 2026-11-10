@@ -59,13 +59,13 @@ impl VirtioNet {
         }
     }
 
-    /// Queues frames for the guest; returns whether it used receive buffers.
+    /// Queues frames for the guest.
     pub(crate) fn deliver(
         &mut self,
         frames: Vec<Vec<u8>>,
         queues: &mut [Queue],
         memory: &GuestMemory,
-    ) -> bool {
+    ) {
         for frame in frames {
             if self.pending.len() < MAX_PENDING {
                 self.pending.push_back(frame);
@@ -78,8 +78,7 @@ impl VirtioNet {
         self.fill(queues, memory)
     }
 
-    fn fill(&mut self, queues: &mut [Queue], memory: &GuestMemory) -> bool {
-        let mut added = false;
+    fn fill(&mut self, queues: &mut [Queue], memory: &GuestMemory) {
         while let Some(frame) = self.pending.front() {
             let Some(chain) = queues[RX_QUEUE].next_chain(memory, NAME) else {
                 break;
@@ -94,9 +93,7 @@ impl VirtioNet {
             let written = chain.write(memory, &packet);
             queues[RX_QUEUE].push(memory, chain.head, written);
             self.pending.pop_front();
-            added = true;
         }
-        added
     }
 }
 
@@ -118,10 +115,9 @@ impl Device for VirtioNet {
         read_config(&self.mac, offset, data);
     }
 
-    fn process(&mut self, queue: usize, queues: &mut [Queue], memory: &GuestMemory) -> bool {
-        let mut added = false;
+    fn process(&mut self, queue: usize, queues: &mut [Queue], memory: &GuestMemory) {
         if queue == TX_QUEUE {
-            added = queues[TX_QUEUE].process(memory, NAME, |chain| {
+            queues[TX_QUEUE].process(memory, NAME, |chain| {
                 match chain.read(memory, MAX_PACKET) {
                     Ok(mut packet) if packet.len() > HEADER_SIZE => {
                         self.stack.send_from_guest(packet.split_off(HEADER_SIZE));
@@ -133,7 +129,7 @@ impl Device for VirtioNet {
             });
         }
         // New receive buffers (or room after sending).
-        self.fill(queues, memory) || added
+        self.fill(queues, memory);
     }
 
     fn reset(&mut self) {
@@ -143,7 +139,7 @@ impl Device for VirtioNet {
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::{USED, descriptor, memory, offer, queue};
+    use super::super::tests::{USED, descriptor, memory, offer, queue, take_pushed};
     use super::super::{DESC_NEXT, DESC_WRITE};
     use super::*;
 
@@ -160,7 +156,8 @@ mod tests {
         offer(&memory, 0, 0);
         let mut queues = [queue(), queue()];
 
-        assert!(net.process(TX_QUEUE, &mut queues, &memory));
+        net.process(TX_QUEUE, &mut queues, &memory);
+        assert!(take_pushed(&mut queues[TX_QUEUE]));
         assert_eq!(from_guest.try_recv().unwrap(), b"frame");
     }
 
@@ -172,10 +169,12 @@ mod tests {
         let mut queues = [queue(), queue()];
 
         // No receive buffers yet.
-        assert!(!net.deliver(vec![b"frame".to_vec()], &mut queues, &memory));
+        net.deliver(vec![b"frame".to_vec()], &mut queues, &memory);
+        assert!(!take_pushed(&mut queues[RX_QUEUE]));
         descriptor(&memory, 0, 0x4000, 1514, DESC_WRITE, 0);
         offer(&memory, 0, 0);
-        assert!(net.process(RX_QUEUE, &mut queues, &memory));
+        net.process(RX_QUEUE, &mut queues, &memory);
+        assert!(take_pushed(&mut queues[RX_QUEUE]));
 
         let mut packet = [0u8; HEADER_SIZE + 5];
         memory.read(0x4000, &mut packet).unwrap();
@@ -195,7 +194,8 @@ mod tests {
         let memory = memory();
         let mut queues = [queue(), queue()];
         let frames = vec![b"frame".to_vec(); MAX_PENDING + 1];
-        assert!(!net.deliver(frames, &mut queues, &memory));
+        net.deliver(frames, &mut queues, &memory);
+        assert!(!take_pushed(&mut queues[RX_QUEUE]));
         assert_eq!(net.pending.len(), MAX_PENDING);
         assert!(net.reported_drop);
     }

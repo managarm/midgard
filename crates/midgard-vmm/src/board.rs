@@ -131,11 +131,11 @@ impl Board {
     }
 
     /// Runs `f` on a virtio device (for the host side of devices); raises its interrupt
-    /// if `f` added used buffers.
+    /// if `f` returned chains to the driver.
     pub(crate) fn with_device<D: virtio::Device, R>(
         &self,
         device: DeviceRef<D>,
-        f: impl FnOnce(&mut D, &mut [virtio::Queue], &GuestMemory) -> (R, bool),
+        f: impl FnOnce(&mut D, &mut [virtio::Queue], &GuestMemory) -> R,
     ) -> R {
         let transport = &self.virtio[device.slot()];
         transport.with_device(&self.memory, f, || self.pulse_irq(transport.irq))
@@ -156,7 +156,7 @@ impl Board {
     /// Runs `f` on the vsock device; returns None without one.
     pub(crate) fn with_vsock<R>(
         &self,
-        f: impl FnOnce(&mut Vsock, &mut [virtio::Queue], &GuestMemory) -> (R, bool),
+        f: impl FnOnce(&mut Vsock, &mut [virtio::Queue], &GuestMemory) -> R,
     ) -> Option<R> {
         Some(self.with_device(self.vsock?, f))
     }

@@ -1631,14 +1631,13 @@ impl VirtioFs {
         })
     }
 
-    /// Returns a request that is done to the driver; returns whether it did (it does not
-    /// if the driver reset the device in the meantime).
-    fn complete(&self, completion: Completion, queues: &mut [Queue], memory: &GuestMemory) -> bool {
+    /// Returns a request that is done to the driver (unless the driver reset the device in
+    /// the meantime).
+    fn complete(&self, completion: Completion, queues: &mut [Queue], memory: &GuestMemory) {
         if completion.generation != self.generation.load(Ordering::SeqCst) {
-            return false;
+            return;
         }
         queues[completion.queue].push(memory, completion.head, completion.written);
-        true
     }
 }
 
@@ -1686,7 +1685,7 @@ pub(crate) fn start(
                 let completion = unblock(move || request.execute(&fs, &memory, &generation)).await;
                 if let Some(completion) = completion {
                     board.with_device(device, |fs, queues, memory| {
-                        ((), fs.complete(completion, queues, memory))
+                        fs.complete(completion, queues, memory);
                     });
                 }
             }));
@@ -1718,8 +1717,7 @@ impl Device for VirtioFs {
         read_config(config.as_bytes(), offset, data);
     }
 
-    fn process(&mut self, queue: usize, queues: &mut [Queue], memory: &GuestMemory) -> bool {
-        let mut used = false;
+    fn process(&mut self, queue: usize, queues: &mut [Queue], memory: &GuestMemory) {
         while let Some(chain) = queues[queue].next_chain(memory, NAME) {
             let written = match self.check(queue, &chain, memory) {
                 Ok(request) => {
@@ -1743,9 +1741,7 @@ impl Device for VirtioFs {
                 }
             };
             queues[queue].push(memory, chain.head, written);
-            used = true;
         }
-        used
     }
 
     fn reset(&mut self) {
@@ -1764,7 +1760,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::AtomicUsize;
 
-    use super::super::tests::{USED, descriptor, memory, offer, queue};
+    use super::super::tests::{USED, descriptor, memory, offer, queue, take_pushed};
     use super::super::{DESC_NEXT, DESC_WRITE};
     use super::*;
 
@@ -2496,14 +2492,16 @@ mod tests {
         descriptor(&memory, 0, 0x4000, request.len() as u32, DESC_NEXT, 1);
         descriptor(&memory, 1, 0x5000, 256, DESC_WRITE, 0);
         offer(&memory, 0, 0);
-        assert!(!device.process(1, &mut queues, &memory));
+        device.process(1, &mut queues, &memory);
+        assert!(!take_pushed(&mut queues[1]));
         assert_eq!(device.in_flight.count(), 1);
 
         let request = backend.requests.try_recv().unwrap();
         let completion = request
             .execute(&backend.fs, &memory, &backend.generation)
             .unwrap();
-        assert!(device.complete(completion, &mut queues, &memory));
+        device.complete(completion, &mut queues, &memory);
+        assert!(take_pushed(&mut queues[1]));
         assert_eq!(device.in_flight.count(), 0);
         assert_eq!(memory.read_volatile::<u16>(USED + 2).unwrap(), 1);
         assert_eq!(
@@ -2528,7 +2526,8 @@ mod tests {
         memory.write(0x4000, &request).unwrap();
         descriptor(&memory, 0, 0x4000, request.len() as u32, DESC_NEXT, 1);
         offer(&memory, 1, 0);
-        assert!(device.process(1, &mut queues, &memory));
+        device.process(1, &mut queues, &memory);
+        assert!(take_pushed(&mut queues[1]));
         assert!(backend.requests.is_empty());
         assert_eq!(
             memory.read_volatile::<u32>(USED + 16).unwrap(),

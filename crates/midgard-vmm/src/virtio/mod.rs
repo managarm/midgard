@@ -340,20 +340,17 @@ impl Queue {
     }
 
     /// Hands each available chain to `handle`, which returns how many bytes it wrote
-    /// into the chain, and returns the chains to the driver. Returns whether it used any.
+    /// into the chain, and returns the chains to the driver.
     pub(crate) fn process(
         &mut self,
         memory: &GuestMemory,
         device: &str,
         mut handle: impl FnMut(&Chain) -> u32,
-    ) -> bool {
-        let mut used = false;
+    ) {
         while let Some(chain) = self.next_chain(memory, device) {
             let written = handle(&chain);
             self.push(memory, chain.head, written);
-            used = true;
         }
-        used
     }
 
     /// Returns a chain to the driver; `written` is the number of bytes that we wrote.
@@ -398,9 +395,9 @@ pub(crate) trait Device: Send + std::any::Any {
     /// Called when the driver negotiated features (before it sets DRIVER_OK).
     fn set_driver_features(&mut self, _features: u64) {}
     /// Processes the available buffers of `queue` after the driver notified it (on the
-    /// VM's executor; see [`Transport::process_notified`]). Returns whether the device
-    /// added used buffers (to any queue).
-    fn process(&mut self, queue: usize, queues: &mut [Queue], memory: &GuestMemory) -> bool;
+    /// VM's executor; see [`Transport::process_notified`]). The transport interrupts the
+    /// driver if the device returned chains to it (see [`Queue::push`]).
+    fn process(&mut self, queue: usize, queues: &mut [Queue], memory: &GuestMemory);
     fn reset(&mut self) {}
     /// The requests that the device's host side works on (e.g., I/O into the driver's
     /// buffers), if it does that outside of [`Device::process`]. A reset completes when
@@ -609,22 +606,22 @@ impl Transport {
         }
     }
 
-    /// Sets the used buffer interrupt if the device `added` used buffers (or any queue
-    /// returned chains, e.g., malformed ones); returns whether to raise the interrupt
-    /// line. (We ignore VRING_AVAIL_F_NO_INTERRUPT; spurious interrupts are harmless.)
+    /// Sets the used buffer interrupt if any queue returned chains to the driver since
+    /// the last call; returns whether to raise the interrupt line. (We ignore
+    /// VRING_AVAIL_F_NO_INTERRUPT; spurious interrupts are harmless.)
     ///
     /// The line must be raised with the device's lock held: the edges of two threads must
     /// not merge into one (after the driver saw the first one's used buffers, but not
     /// the second one's).
-    fn signal_used(&self, queues: &mut [Queue], added: bool) -> bool {
+    fn signal_used(&self, queues: &mut [Queue]) -> bool {
         let pushed = queues.iter_mut().fold(false, |pushed, queue| {
             std::mem::take(&mut queue.pushed) | pushed
         });
-        if added || pushed {
+        if pushed {
             self.interrupt_status
                 .fetch_or(INTERRUPT_USED_BUFFER, Ordering::SeqCst);
         }
-        added || pushed
+        pushed
     }
 
     pub(crate) fn read(&self, offset: u64, size: u8) -> u64 {
@@ -845,13 +842,12 @@ impl Transport {
                 // Notifications that arrive in the meantime are taken together.
                 let mut state = self.device.lock().unwrap();
                 let state = &mut *state;
-                let mut added = false;
                 for queue in 0..state.queues.len() {
                     if notified & (1 << queue) != 0 && state.queues[queue].is_ready() {
-                        added |= state.device.process(queue, &mut state.queues, memory);
+                        state.device.process(queue, &mut state.queues, memory);
                     }
                 }
-                if self.signal_used(&mut state.queues, added) {
+                if self.signal_used(&mut state.queues) {
                     raise();
                 }
             }
@@ -860,13 +856,13 @@ impl Transport {
         }
     }
 
-    /// Runs `f` on the device, which is a `D` (e.g., for host-side requests). `f` returns
-    /// whether it added used buffers; then, `raise` raises the device's interrupt line
-    /// (see [`Transport::signal_used`]).
+    /// Runs `f` on the device, which is a `D` (e.g., for host-side requests). If it
+    /// returned chains to the driver, `raise` raises the device's interrupt line (see
+    /// [`Transport::signal_used`]).
     pub(crate) fn with_device<D: Device, R>(
         &self,
         memory: &GuestMemory,
-        f: impl FnOnce(&mut D, &mut [Queue], &GuestMemory) -> (R, bool),
+        f: impl FnOnce(&mut D, &mut [Queue], &GuestMemory) -> R,
         raise: impl FnOnce(),
     ) -> R {
         let mut state = self.device.lock().unwrap();
@@ -874,8 +870,8 @@ impl Transport {
         let device = (state.device.as_mut() as &mut dyn std::any::Any)
             .downcast_mut::<D>()
             .expect("DeviceRef of the wrong device type");
-        let (result, added) = f(device, &mut state.queues, memory);
-        if self.signal_used(&mut state.queues, added) {
+        let result = f(device, &mut state.queues, memory);
+        if self.signal_used(&mut state.queues) {
             raise();
         }
         result
@@ -909,6 +905,11 @@ mod tests {
             next_used: 0,
             pushed: false,
         }
+    }
+
+    /// Whether the queue returned chains to the driver since the last call.
+    pub(super) fn take_pushed(queue: &mut Queue) -> bool {
+        std::mem::take(&mut queue.pushed)
     }
 
     pub(super) fn descriptor(
@@ -1048,9 +1049,7 @@ mod tests {
 
         fn read_config(&self, _offset: u64, _data: &mut [u8]) {}
 
-        fn process(&mut self, _queue: usize, _queues: &mut [Queue], _memory: &GuestMemory) -> bool {
-            false
-        }
+        fn process(&mut self, _queue: usize, _queues: &mut [Queue], _memory: &GuestMemory) {}
 
         fn in_flight(&self) -> Option<InFlight> {
             Some(self.0.clone())
@@ -1092,9 +1091,11 @@ mod tests {
 
         fn read_config(&self, _offset: u64, _data: &mut [u8]) {}
 
-        fn process(&mut self, queue: usize, _queues: &mut [Queue], _memory: &GuestMemory) -> bool {
+        fn process(&mut self, queue: usize, queues: &mut [Queue], memory: &GuestMemory) {
             self.0.push(queue);
-            queue == 2
+            if queue == 2 {
+                queues[queue].push(memory, 0, 0);
+            }
         }
     }
 
@@ -1119,11 +1120,7 @@ mod tests {
             transport.process_notified(&memory, raise),
             futures_lite::future::ready(()),
         ));
-        let processed = transport.with_device(
-            &memory,
-            |c: &mut Counting, _, _| (c.0.clone(), false),
-            || {},
-        );
+        let processed = transport.with_device(&memory, |c: &mut Counting, _, _| c.0.clone(), || {});
         assert_eq!(processed, [1, 2]);
         assert_eq!(raised.load(Ordering::SeqCst), 1);
         assert_eq!(
@@ -1144,10 +1141,7 @@ mod tests {
             transport.with_device(
                 &memory,
                 |_: &mut Busy, queues, _| {
-                    (
-                        (queues[0].is_ready(), queues[0].avail, queues[0].next_avail),
-                        false,
-                    )
+                    (queues[0].is_ready(), queues[0].avail, queues[0].next_avail)
                 },
                 || {},
             )
@@ -1155,10 +1149,7 @@ mod tests {
         assert_eq!(position(&transport), (true, 0x2000, 0));
         transport.with_device(
             &memory,
-            |_: &mut Busy, queues, _| {
-                queues[0].next_avail = 3;
-                ((), false)
-            },
+            |_: &mut Busy, queues, _| queues[0].next_avail = 3,
             || {},
         );
         // Making the queue ready again does not move it back to the start of the rings.
@@ -1198,11 +1189,7 @@ mod tests {
         // continue).
         assert!(task.as_mut().poll(&mut context).is_pending());
         assert_eq!(wakeups.0.load(Ordering::SeqCst), 2);
-        let processed = transport.with_device(
-            &memory,
-            |c: &mut Counting, _, _| (c.0.clone(), false),
-            || {},
-        );
+        let processed = transport.with_device(&memory, |c: &mut Counting, _, _| c.0.clone(), || {});
         assert_eq!(processed, [0]);
     }
 
