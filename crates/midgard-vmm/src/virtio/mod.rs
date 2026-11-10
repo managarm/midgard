@@ -32,6 +32,8 @@ const VENDOR: u32 = 0x4D47_524D; // "MRGM"
 pub(crate) const F_VERSION_1: u64 = 1 << 32;
 /// We support indirect descriptors for all devices.
 const F_INDIRECT_DESC: u64 = 1 << 28;
+/// And notification suppression (see [`Queue::event_idx`]).
+const F_EVENT_IDX: u64 = 1 << 29;
 
 // Device status bits.
 const STATUS_FEATURES_OK: u32 = 8;
@@ -200,6 +202,13 @@ pub(crate) struct Queue {
     /// Chains were returned to the driver since the transport last looked (see
     /// [`Transport::signal_used`]).
     pushed: bool,
+    /// The driver negotiated VIRTIO_RING_F_EVENT_IDX: it tells us after which used
+    /// index it wants an interrupt (used_event), and we tell it after which available
+    /// index we want a notification (avail_event).
+    event_idx: bool,
+    /// The used index that we last decided on an interrupt for (None after a reset, such
+    /// that the driver gets the next interrupt in any case).
+    signaled_used: Option<u16>,
 }
 
 impl Queue {
@@ -216,7 +225,7 @@ impl Queue {
     }
 
     /// Takes the configuration that the driver wrote (when it makes the queue ready).
-    fn configure(&mut self, config: &QueueConfig) {
+    fn configure(&mut self, config: &QueueConfig, event_idx: bool) {
         *self = Self {
             max_size: config.max_size,
             size: config.size,
@@ -224,6 +233,7 @@ impl Queue {
             desc: config.desc,
             avail: config.avail,
             used: config.used,
+            event_idx,
             ..Default::default()
         };
     }
@@ -269,12 +279,17 @@ impl Queue {
         if !self.is_ready() {
             return Ok(Popped::Empty);
         }
-        let avail_idx = self
-            .avail
-            .checked_add(2)
-            .and_then(|address| memory.read_volatile::<u16>(address).ok())
-            .ok_or(Error::OutsideRam("avail ring"))?;
-        let available = avail_idx.wrapping_sub(self.next_avail);
+        let mut available = self.available(memory)?;
+        if available == 0 && self.event_idx {
+            // Ask for a notification when the driver adds the next chain, then look
+            // again: it may have added one before it saw that (it reads avail_event after
+            // it writes its index).
+            if let Some(address) = self.avail_event() {
+                let _ = memory.write_volatile::<u16>(address, self.next_avail);
+            }
+            fence(Ordering::SeqCst);
+            available = self.available(memory)?;
+        }
         if available == 0 {
             return Ok(Popped::Empty);
         }
@@ -293,6 +308,26 @@ impl Queue {
             Ok(descriptors) => Popped::Chain(Chain { head, descriptors }),
             Err(error) => Popped::Malformed(head, error),
         })
+    }
+
+    /// The number of chains that the driver made available and we did not take yet.
+    fn available(&self, memory: &GuestMemory) -> Result<u16, Error> {
+        let avail_idx = self
+            .avail
+            .checked_add(2)
+            .and_then(|address| memory.read_volatile::<u16>(address).ok())
+            .ok_or(Error::OutsideRam("avail ring"))?;
+        Ok(avail_idx.wrapping_sub(self.next_avail))
+    }
+
+    /// The address of used_event (after the available ring).
+    fn used_event(&self) -> Option<u64> {
+        self.avail.checked_add(4 + self.size as u64 * 2)
+    }
+
+    /// The address of avail_event (after the used ring).
+    fn avail_event(&self) -> Option<u64> {
+        self.used.checked_add(4 + self.size as u64 * 8)
     }
 
     /// Reads the descriptors of the chain at `head`.
@@ -378,13 +413,43 @@ impl Queue {
             let _ = memory.write_volatile::<u16>(index, self.next_used);
         }
     }
+
+    /// Whether the driver wants an interrupt for the chains that were returned to it
+    /// since the last call.
+    fn take_interrupt(&mut self, memory: &GuestMemory) -> bool {
+        if !std::mem::take(&mut self.pushed) {
+            return false;
+        }
+        if !self.event_idx {
+            return true;
+        }
+        let old = self.signaled_used.replace(self.next_used);
+        // Read used_event after the used index was written: the driver writes
+        // used_event, then reads the used index.
+        fence(Ordering::SeqCst);
+        let used_event = self
+            .used_event()
+            .and_then(|address| memory.read_volatile::<u16>(address).ok());
+        match (old, used_event) {
+            (Some(old), Some(event)) => need_event(event, self.next_used, old),
+            // After a reset (or the driver put the ring outside of RAM).
+            _ => true,
+        }
+    }
+}
+
+/// Whether the index moved from `old` to `new` past `event`, i.e., whether `event` is in
+/// [old, new) (vring_need_event() of the specification).
+fn need_event(event: u16, new: u16, old: u16) -> bool {
+    new.wrapping_sub(event).wrapping_sub(1) < new.wrapping_sub(old)
 }
 
 /// A virtio device behind the transport.
 pub(crate) trait Device: Send + std::any::Any {
     fn device_id(&self) -> u32;
     /// Device-specific feature bits (the transport adds VIRTIO_F_VERSION_1 and
-    /// VIRTIO_F_INDIRECT_DESC). The transport asks once, when it is made.
+    /// VIRTIO_F_INDIRECT_DESC and VIRTIO_RING_F_EVENT_IDX). The transport asks once,
+    /// when it is made.
     fn features(&self) -> u64 {
         0
     }
@@ -594,7 +659,7 @@ impl Transport {
                 resetting: false,
             }),
             device_id: device.device_id(),
-            device_features: device.features() | F_VERSION_1 | F_INDIRECT_DESC,
+            device_features: device.features() | F_VERSION_1 | F_INDIRECT_DESC | F_EVENT_IDX,
             device: Mutex::new(DeviceState {
                 queues: sizes.into_iter().map(Queue::new).collect(),
                 device,
@@ -607,21 +672,23 @@ impl Transport {
     }
 
     /// Sets the used buffer interrupt if any queue returned chains to the driver since
-    /// the last call; returns whether to raise the interrupt line. (We ignore
-    /// VRING_AVAIL_F_NO_INTERRUPT; spurious interrupts are harmless.)
+    /// the last call (and the driver wants an interrupt for them, see
+    /// [`Queue::event_idx`]); returns whether to raise the interrupt line. (Without
+    /// VIRTIO_RING_F_EVENT_IDX, we ignore VRING_AVAIL_F_NO_INTERRUPT; spurious interrupts
+    /// are harmless.)
     ///
     /// The line must be raised with the device's lock held: the edges of two threads must
     /// not merge into one (after the driver saw the first one's used buffers, but not
     /// the second one's).
-    fn signal_used(&self, queues: &mut [Queue]) -> bool {
-        let pushed = queues.iter_mut().fold(false, |pushed, queue| {
-            std::mem::take(&mut queue.pushed) | pushed
+    fn signal_used(&self, queues: &mut [Queue], memory: &GuestMemory) -> bool {
+        let interrupt = queues.iter_mut().fold(false, |interrupt, queue| {
+            queue.take_interrupt(memory) | interrupt
         });
-        if pushed {
+        if interrupt {
             self.interrupt_status
                 .fetch_or(INTERRUPT_USED_BUFFER, Ordering::SeqCst);
         }
-        pushed
+        interrupt
     }
 
     pub(crate) fn read(&self, offset: u64, size: u8) -> u64 {
@@ -701,6 +768,7 @@ impl Transport {
         let set_high =
             |old: &mut u64, value: u32| *old = (*old & 0xFFFF_FFFF) | (value as u64) << 32;
         let queue_sel = registers.queue_sel as usize;
+        let event_idx = registers.driver_features & F_EVENT_IDX != 0;
         let selected = registers.queues.get_mut(queue_sel);
         match offset {
             REG_DEVICE_FEATURES_SEL => registers.device_features_sel = value,
@@ -734,7 +802,7 @@ impl Transport {
                     let config = *config;
                     let queue = &mut self.device.lock().unwrap().queues[queue_sel];
                     if config.ready {
-                        queue.configure(&config);
+                        queue.configure(&config, event_idx);
                     } else {
                         queue.reset();
                     }
@@ -847,7 +915,7 @@ impl Transport {
                         state.device.process(queue, &mut state.queues, memory);
                     }
                 }
-                if self.signal_used(&mut state.queues) {
+                if self.signal_used(&mut state.queues, memory) {
                     raise();
                 }
             }
@@ -871,7 +939,7 @@ impl Transport {
             .downcast_mut::<D>()
             .expect("DeviceRef of the wrong device type");
         let result = f(device, &mut state.queues, memory);
-        if self.signal_used(&mut state.queues) {
+        if self.signal_used(&mut state.queues, memory) {
             raise();
         }
         result
@@ -904,6 +972,8 @@ mod tests {
             next_avail: 0,
             next_used: 0,
             pushed: false,
+            event_idx: false,
+            signaled_used: None,
         }
     }
 
@@ -1022,6 +1092,46 @@ mod tests {
             queue.pop_one(&memory),
             Ok(Popped::Malformed(0, Error::OutsideRam("descriptor table")))
         ));
+    }
+
+    #[test]
+    fn event_idx_suppresses_interrupts() {
+        let memory = memory();
+        let mut queue = queue();
+        queue.event_idx = true;
+        let used_event = queue.used_event().unwrap();
+        // The first interrupt goes out in any case.
+        queue.push(&memory, 0, 0);
+        assert!(queue.take_interrupt(&memory));
+        // The driver wants an interrupt once the chain at used index 4 is returned.
+        memory.write(used_event, &4u16.to_le_bytes()).unwrap();
+        for _ in 1..4 {
+            queue.push(&memory, 0, 0);
+            assert!(!queue.take_interrupt(&memory));
+        }
+        queue.push(&memory, 0, 0);
+        queue.push(&memory, 0, 0);
+        assert!(queue.take_interrupt(&memory));
+        // Nothing was returned since.
+        assert!(!queue.take_interrupt(&memory));
+        assert!(need_event(u16::MAX, 1, u16::MAX - 1));
+        assert!(!need_event(1, 1, u16::MAX - 1));
+    }
+
+    #[test]
+    fn event_idx_asks_for_notifications_when_empty() {
+        let memory = memory();
+        let mut queue = queue();
+        queue.event_idx = true;
+        let avail_event = queue.avail_event().unwrap();
+        memory.write(avail_event, &7u16.to_le_bytes()).unwrap();
+        descriptor(&memory, 0, 0x4000, 1, 0, 0);
+        offer(&memory, 0, 0);
+        // Taking a chain does not ask for a notification; finding the queue empty does.
+        assert!(queue.next_chain(&memory, "test").is_some());
+        assert_eq!(memory.read_volatile::<u16>(avail_event), Ok(7));
+        assert!(queue.next_chain(&memory, "test").is_none());
+        assert_eq!(memory.read_volatile::<u16>(avail_event), Ok(1));
     }
 
     #[test]
@@ -1157,6 +1267,28 @@ mod tests {
         assert_eq!(position(&transport), (true, 0x2000, 3));
         transport.write(REG_QUEUE_READY, 4, 0);
         assert_eq!(position(&transport), (false, 0, 0));
+    }
+
+    #[test]
+    fn queues_use_event_idx_once_negotiated() {
+        let memory = memory();
+        let event_idx = |accept: u64| {
+            let transport = Transport::new(Box::<Counting>::default(), 5);
+            for (select, features) in [(0, accept as u32), (1, (accept >> 32) as u32)] {
+                transport.write(REG_DRIVER_FEATURES_SEL, 4, select);
+                transport.write(REG_DRIVER_FEATURES, 4, features as u64);
+            }
+            transport.write(REG_STATUS, 4, STATUS_FEATURES_OK as u64);
+            assert_eq!(transport.read(REG_STATUS, 4), STATUS_FEATURES_OK as u64);
+            transport.write(REG_QUEUE_READY, 4, 1);
+            transport.with_device(
+                &memory,
+                |_: &mut Counting, queues, _| queues[0].event_idx,
+                || {},
+            )
+        };
+        assert!(event_idx(F_VERSION_1 | F_EVENT_IDX));
+        assert!(!event_idx(F_VERSION_1));
     }
 
     /// Counts its wakeups.
