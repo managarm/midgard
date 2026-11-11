@@ -1,0 +1,13 @@
+# The settings of the VM instances made from the Alpine image: bifrost create copies this
+# file into each instance, with the user that sessions run as (which user-setup creates).
+
+[template]
+description = "Alpine Linux 3.24"
+
+[guest]
+init = "/sbin/init"
+ready = "notify"
+user-setup = ["/etc/midgard/user-setup"]
+launcher = "wrapper"
+wrapper = ["runuser", "-l", "{user}", "-s", "{helper}"]
+display = "guest"

@@ -1,6 +1,7 @@
 //! Talking to midgard (on its socket, see [`midgard_protocol::control`]): runs commands
-//! (or a login shell) in a VM instance, stops VMs and shows their console logs. midgard starts an instance's VM
-//! for the first session with it; the VM stays up for later commands.
+//! (or a login shell) in a VM instance, stops VMs, shows their console logs and manages
+//! the VM instances. midgard starts an instance's VM for the first session with it; the
+//! VM stays up for later commands.
 
 use std::fs::File;
 use std::io::{self, Read, Seek, Write};
@@ -11,11 +12,13 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use midgard_protocol::control::Listing;
 use midgard_protocol::session::{Exec, Request, Response, WindowSize};
+use midgard_protocol::size::format_size;
 use midgard_protocol::{control, runtime};
 
-use crate::cli::RunArgs;
-use crate::{log, terminal};
+use crate::cli::{CreateArgs, RunArgs};
+use crate::{EXIT_FAILURE, log, terminal};
 
 // The libc crate does not define these for managarm; mlibc uses the Linux ABI values.
 const TIOCGWINSZ: libc::c_ulong = 0x5413;
@@ -62,6 +65,238 @@ fn ask(request: control::Request) -> Result<control::Response> {
     }
 }
 
+/// The VM instances and the templates.
+fn listing() -> Result<Listing> {
+    match ask(control::Request::List)? {
+        control::Response::List(listing) => Ok(listing),
+        other => bail!("unexpected answer from midgard: {other:?}"),
+    }
+}
+
+/// Formats rows as a table with aligned columns (the first row is the heading).
+fn table<const N: usize>(rows: &[[String; N]]) -> String {
+    let mut widths = [0; N];
+    for row in rows {
+        for (width, cell) in widths.iter_mut().zip(row) {
+            *width = (*width).max(cell.chars().count());
+        }
+    }
+    let mut out = String::new();
+    for row in rows {
+        let mut line = String::new();
+        for (column, (cell, width)) in row.iter().zip(widths).enumerate() {
+            if column + 1 < N {
+                line += &format!("{cell:width$}  ");
+            } else {
+                line += cell;
+            }
+        }
+        out += line.trim_end();
+        out.push('\n');
+    }
+    out
+}
+
+/// Formats the VM instances and the templates for people.
+fn format_listing(listing: &Listing) -> String {
+    let mut out = String::new();
+    if listing.instances.is_empty() {
+        out += "No VM instances (bifrost create makes one).\n";
+    } else {
+        let mut rows = vec![["NAME", "TEMPLATE", "STATE", "DISK"].map(String::from)];
+        for instance in &listing.instances {
+            let state = if instance.error.is_some() {
+                "invalid"
+            } else if instance.running {
+                "running"
+            } else {
+                "stopped"
+            };
+            rows.push([
+                instance.name.clone(),
+                instance.template.clone().unwrap_or_else(|| "-".into()),
+                state.into(),
+                instance.disk_size.map_or_else(|| "-".into(), format_size),
+            ]);
+        }
+        out += &table(&rows);
+    }
+    out.push('\n');
+    if listing.templates.is_empty() {
+        out += &format!(
+            "No templates in {} (guest/build.py install installs them).\n",
+            listing.templates_dir.display()
+        );
+    } else {
+        let mut rows = vec![["TEMPLATE", "DESCRIPTION"].map(String::from)];
+        for template in &listing.templates {
+            let description = match &template.error {
+                Some(_) => "(invalid)".into(),
+                None => template.description.clone().unwrap_or_default(),
+            };
+            rows.push([template.name.clone(), description]);
+        }
+        out += &table(&rows);
+    }
+    out
+}
+
+/// Lists the VM instances and the templates (and what is wrong with broken ones).
+pub fn list() -> Result<i32> {
+    let listing = listing()?;
+    for (name, error) in listing
+        .instances
+        .iter()
+        .map(|instance| (&instance.name, &instance.error))
+        .chain(
+            listing
+                .templates
+                .iter()
+                .map(|template| (&template.name, &template.error)),
+        )
+    {
+        if let Some(error) = error {
+            log!("{name}: {error}");
+        }
+    }
+    match io::stdout().write_all(format_listing(&listing).as_bytes()) {
+        // E.g., `bifrost list | head`.
+        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(0),
+        result => result.map(|()| 0).map_err(Into::into),
+    }
+}
+
+/// Asks a question on the terminal; returns the answer (without surrounding blanks).
+fn prompt(question: &str) -> Result<String> {
+    eprint!("{question}");
+    io::stderr().flush()?;
+    let mut answer = String::new();
+    if io::stdin().read_line(&mut answer)? == 0 {
+        bail!("no answer (end of input)");
+    }
+    Ok(answer.trim().to_string())
+}
+
+/// The user that sessions of a new VM instance run as: the answer to a question whose
+/// default is our user name (which `yes`, or no terminal, takes without asking).
+fn ask_user(yes: bool) -> Result<String> {
+    let default = ["USER", "LOGNAME"]
+        .iter()
+        .find_map(|name| std::env::var(name).ok().filter(|user| !user.is_empty()));
+    if yes || !is_tty(0) {
+        return default.context(
+            "the template needs a user for the VM instance (bifrost create --user names it)",
+        );
+    }
+    loop {
+        let answer = match &default {
+            Some(default) => prompt(&format!("User in the VM instance [{default}]: "))?,
+            None => prompt("User in the VM instance: ")?,
+        };
+        match (answer.is_empty(), &default) {
+            (false, _) => return Ok(answer),
+            (true, Some(default)) => return Ok(default.clone()),
+            (true, None) => {}
+        }
+    }
+}
+
+/// Creates the VM instance `name` from `template` (asking for the user if the template
+/// needs one and `user` does not name it).
+fn create_instance(
+    name: &str,
+    template: &str,
+    user: Option<String>,
+    memory: Option<u64>,
+    yes: bool,
+) -> Result<()> {
+    let listing = listing()?;
+    if listing
+        .instances
+        .iter()
+        .any(|instance| instance.name == name)
+    {
+        bail!("the VM instance {name} exists already");
+    }
+    let Some(info) = listing.templates.iter().find(|info| info.name == template) else {
+        let names: Vec<_> = listing.templates.iter().map(|info| &*info.name).collect();
+        if names.is_empty() {
+            bail!(
+                "no template {template} (there are no templates in {}; guest/build.py \
+                 install installs them)",
+                listing.templates_dir.display()
+            );
+        }
+        bail!("no template {template} (there are {})", names.join(", "));
+    };
+    if let Some(error) = &info.error {
+        bail!("{error}");
+    }
+    let user = match user {
+        None if info.needs_user => Some(ask_user(yes)?),
+        user => user,
+    };
+    log!("creating {name} from the template {template}...");
+    match ask(control::Request::Create {
+        name: name.to_string(),
+        template: template.to_string(),
+        user,
+        memory,
+    })? {
+        control::Response::Done => Ok(()),
+        other => bail!("unexpected answer from midgard: {other:?}"),
+    }
+}
+
+/// Creates a VM instance (`bifrost create`).
+pub fn create(args: &CreateArgs) -> Result<i32> {
+    let template = args.template.as_deref().unwrap_or(&args.name);
+    create_instance(
+        &args.name,
+        template,
+        args.user.clone(),
+        args.memory,
+        args.yes,
+    )?;
+    log!("created {}", args.name);
+    Ok(0)
+}
+
+/// Deletes the VM instance `name` and its disk after asking (unless `yes`).
+pub fn delete(name: &str, yes: bool) -> Result<i32> {
+    let listing = listing()?;
+    let Some(instance) = listing
+        .instances
+        .iter()
+        .find(|instance| instance.name == name)
+    else {
+        bail!("no VM instance {name}");
+    };
+    if instance.running {
+        bail!("{name} is running (bifrost shutdown {name} stops it)");
+    }
+    if !yes {
+        if !is_tty(0) {
+            bail!("not deleting {name} without --yes (stdin is not a terminal)");
+        }
+        let answer = prompt(&format!(
+            "Delete the VM instance {name} and its disk? [y/N] "
+        ))?;
+        if !matches!(answer.as_str(), "y" | "Y" | "yes") {
+            return Ok(EXIT_FAILURE.into());
+        }
+    }
+    match ask(control::Request::Delete {
+        name: name.to_string(),
+    })? {
+        control::Response::Done => {
+            log!("deleted {name}");
+            Ok(0)
+        }
+        other => bail!("unexpected answer from midgard: {other:?}"),
+    }
+}
+
 /// Prints the console log of the VM of `name`; with `follow`, keeps printing what is
 /// written to it (from the start again when its VM starts again).
 pub fn log(name: &str, follow: bool) -> Result<i32> {
@@ -102,8 +337,20 @@ pub fn log(name: &str, follow: bool) -> Result<i32> {
     }
 }
 
+/// midgard has no VM instance of this name.
+#[derive(Debug)]
+struct NoInstance(String);
+
+impl std::fmt::Display for NoInstance {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "no VM instance {} (bifrost create makes one)", self.0)
+    }
+}
+
+impl std::error::Error for NoInstance {}
+
 /// Connects to the agent in the VM of `name`, which midgard starts first if it does
-/// not run (and `start`).
+/// not run (and `start`). Fails with [`NoInstance`] if there is no such instance.
 fn connect(name: &str, start: bool) -> Result<UnixStream> {
     let mut stream = connect_daemon()?;
     let request = control::Request::Session {
@@ -121,6 +368,7 @@ fn connect(name: &str, start: bool) -> Result<UnixStream> {
                 }
             }
             Some(control::Response::Ready) => return Ok(stream),
+            Some(control::Response::NoInstance) => return Err(NoInstance(name.into()).into()),
             Some(control::Response::Error(message)) => bail!("{message}"),
             Some(other) => bail!("unexpected answer from midgard: {other:?}"),
             None => bail!("midgard closed the connection"),
@@ -163,9 +411,42 @@ fn install_signal_handlers(tty: bool) -> Result<std::fs::File> {
     Ok(unsafe { std::fs::File::from_raw_fd(fds[0]) })
 }
 
-/// Runs a command in the VM of `name`; returns its exit code.
+/// Creates the missing VM instance `name` from the template of the same name, if there
+/// is one, after asking (unless `yes`).
+fn offer_instance(name: &str, yes: bool) -> Result<()> {
+    let listing = listing()?;
+    if !listing
+        .templates
+        .iter()
+        .any(|template| template.name == name)
+    {
+        return Err(NoInstance(name.into()).into());
+    }
+    if !yes {
+        if !is_tty(0) {
+            bail!(
+                "no VM instance {name} (bifrost create {name} creates it from the template \
+                 {name})"
+            );
+        }
+        let question = format!("No VM instance {name}. Create it from the template {name}? [Y/n] ");
+        if !matches!(prompt(&question)?.as_str(), "" | "y" | "Y" | "yes") {
+            return Err(NoInstance(name.into()).into());
+        }
+    }
+    create_instance(name, name, None, None, yes)
+}
+
+/// Runs a command in the VM of `name` (which is created first if it is missing, see
+/// [`offer_instance`]); returns its exit code.
 pub fn run(name: &str, args: &RunArgs) -> Result<i32> {
-    let stream = connect(name, !args.no_start)?;
+    let stream = match connect(name, !args.no_start) {
+        Err(error) if !args.no_start && error.is::<NoInstance>() => {
+            offer_instance(name, args.yes)?;
+            connect(name, true)?
+        }
+        result => result?,
+    };
     let tty = args.tty().unwrap_or_else(|| is_tty(0) && is_tty(1));
     let mut env = Vec::new();
     if tty && let Ok(term) = std::env::var("TERM") {
@@ -356,4 +637,58 @@ pub fn shutdown(name: &str) -> Result<()> {
         std::thread::sleep(Duration::from_millis(100));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use midgard_protocol::control::{InstanceInfo, TemplateInfo};
+
+    #[test]
+    fn listing() {
+        let listing = Listing {
+            instances: vec![
+                InstanceInfo {
+                    name: "alpine".into(),
+                    template: Some("alpine".into()),
+                    running: true,
+                    disk_size: Some(3 << 29),
+                    error: None,
+                },
+                InstanceInfo {
+                    name: "broken".into(),
+                    template: None,
+                    running: false,
+                    disk_size: None,
+                    error: Some("invalid instance.toml".into()),
+                },
+            ],
+            templates: vec![TemplateInfo {
+                name: "debian".into(),
+                description: Some("Debian".into()),
+                needs_user: true,
+                error: None,
+            }],
+            templates_dir: "/templates".into(),
+        };
+        assert_eq!(
+            format_listing(&listing),
+            "NAME    TEMPLATE  STATE    DISK\n\
+             alpine  alpine    running  1.5 GiB\n\
+             broken  -         invalid  -\n\
+             \n\
+             TEMPLATE  DESCRIPTION\n\
+             debian    Debian\n"
+        );
+        let empty = Listing {
+            instances: Vec::new(),
+            templates: Vec::new(),
+            templates_dir: "/templates".into(),
+        };
+        assert_eq!(
+            format_listing(&empty),
+            "No VM instances (bifrost create makes one).\n\n\
+             No templates in /templates (guest/build.py install installs them).\n"
+        );
+    }
 }

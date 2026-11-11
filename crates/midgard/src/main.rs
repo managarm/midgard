@@ -3,17 +3,21 @@
 //! `systemd/`) once bifrost connects to its socket. bifrost asks it to run VMs (see
 //! [`midgard_protocol::control`]): VMs in the foreground that bifrost describes, and the
 //! VMs of VM instances, which midgard keeps running for bifrost's sessions (see
-//! [`daemon`]).
+//! [`daemon`]). midgard also manages the VM instances (see [`instance`]) and the
+//! templates that they are created from (see [`template`]).
 //!
 //! The connections to bifrost are tasks on one executor ([`EXECUTOR`], on the main
 //! thread). Each VM runs on a thread of its own with its own executor (see
 //! [`midgard_vmm::Machine::run`]; its vCPUs have threads of their own); a VM in the
 //! foreground reports to its connection's task through channels (see [`Event`] and
-//! [`boot`]).
+//! [`boot`]). Work on files that takes a while (e.g., creating a VM instance) runs on
+//! [`blocking`]'s thread pool.
 
 mod daemon;
 mod instance;
 mod paths;
+mod settings;
+mod template;
 
 use std::io;
 use std::os::fd::{FromRawFd, RawFd};
@@ -25,9 +29,10 @@ use anyhow::{Context, Result, bail};
 use async_channel::TrySendError;
 use async_executor::Executor;
 use async_io::Async;
+use blocking::unblock;
 use clap::Parser;
 use futures_lite::{AsyncReadExt, future};
-use midgard_protocol::control::{Request, Response};
+use midgard_protocol::control::{Listing, Request, Response};
 use midgard_protocol::machine::MachineConfig;
 use midgard_protocol::nonblocking::{read_message, write_message};
 use midgard_protocol::runtime;
@@ -189,6 +194,31 @@ async fn boot(stream: &Arc<Async<UnixStream>>, config: MachineConfig) -> Result<
     result
 }
 
+/// Runs `job` on [`blocking`]'s thread pool and answers [`Response::Done`] or its error.
+async fn answer(job: impl FnOnce() -> Result<()> + Send + 'static) -> Response {
+    match unblock(job).await {
+        Ok(()) => Response::Done,
+        Err(error) => Response::Error(format!("{error:#}")),
+    }
+}
+
+/// The VM instances and the templates.
+fn list() -> Listing {
+    let instances = paths::names(&paths::instances_dir())
+        .iter()
+        .map(|name| instance::info(name, INSTANCES.is_running(name)))
+        .collect();
+    let templates = paths::names(&paths::templates_dir())
+        .iter()
+        .map(|name| template::info(name))
+        .collect();
+    Listing {
+        instances,
+        templates,
+        templates_dir: paths::templates_dir(),
+    }
+}
+
 /// Serves one connection from bifrost.
 async fn serve(stream: Async<UnixStream>) -> Result<()> {
     let Some(request) = read_message::<Request>(&mut &stream).await? else {
@@ -217,6 +247,26 @@ async fn serve(stream: Async<UnixStream>) -> Result<()> {
         }
         Request::Running => Response::Running(INSTANCES.running()),
         Request::Input(_) => Response::Error("no VM runs on this connection".into()),
+        Request::List => Response::List(list()),
+        Request::Create {
+            name,
+            template,
+            user,
+            memory,
+        } => {
+            answer(move || {
+                let _reservation = INSTANCES.reserve(&name)?;
+                instance::create(&name, &template, user.as_deref(), memory)
+            })
+            .await
+        }
+        Request::Delete { name } => {
+            answer(move || {
+                let _reservation = INSTANCES.reserve(&name)?;
+                instance::delete(&name)
+            })
+            .await
+        }
         Request::Session { .. } => unreachable!(),
     };
     // bifrost may be gone already (which stopped the VM).
@@ -253,5 +303,7 @@ fn main() {
             std::process::exit(1);
         }
     };
+    // (Before any request can create or delete instances.)
+    instance::remove_leftovers();
     async_io::block_on(EXECUTOR.run(accept(listener)));
 }

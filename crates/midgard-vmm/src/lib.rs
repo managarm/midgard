@@ -28,5 +28,5 @@ mod platform;
 mod vcpu;
 mod virtio;
 
-pub use machine::{Machine, MachineHandle, Stop, start};
+pub use machine::{Machine, MachineHandle, Stop, start, validate_memory};
 pub use virtio::vsock::{VsockListener, VsockStream};

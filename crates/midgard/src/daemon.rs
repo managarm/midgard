@@ -7,7 +7,7 @@
 //! For Wayland forwarding, midgard runs `waypipe client` next to the compositor and
 //! connects each connection from the guest's waypipe (vsock port [`WAYPIPE_PORT`]) to it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{self, Write};
 use std::net::Shutdown;
@@ -27,7 +27,8 @@ use midgard_protocol::session::{Request, Response};
 use midgard_protocol::{AGENT_PORT, WAYPIPE_PORT, control, runtime};
 use midgard_vmm::{Machine, MachineHandle, VsockStream};
 
-use crate::{CONSOLE_BUFFER, CONSOLE_CHUNK, instance, log};
+use crate::instance::{self, Instance};
+use crate::{CONSOLE_BUFFER, CONSOLE_CHUNK, log};
 
 /// How long the guest may take to boot (managarm under nested virtualization is slow).
 const BOOT_TIMEOUT: Duration = Duration::from_secs(600);
@@ -277,10 +278,25 @@ impl Running {
     }
 }
 
-/// The VMs of VM instances that run (or start), by name.
+/// The VMs of VM instances that run (or start), by name, and the instances that are
+/// being created or deleted (whose VMs cannot start meanwhile). Whoever locks both takes
+/// `running` first.
 #[derive(Default)]
 pub struct Instances {
     running: Arc<Mutex<BTreeMap<String, Arc<Running>>>>,
+    reserved: Mutex<BTreeSet<String>>,
+}
+
+/// A VM instance that is being created or deleted (see [`Instances::reserve`]).
+pub struct Reservation<'a> {
+    instances: &'a Instances,
+    name: String,
+}
+
+impl Drop for Reservation<'_> {
+    fn drop(&mut self) {
+        self.instances.reserved.lock().unwrap().remove(&self.name);
+    }
 }
 
 async fn respond(stream: &Async<UnixStream>, response: control::Response) -> Result<()> {
@@ -289,8 +305,29 @@ async fn respond(stream: &Async<UnixStream>, response: control::Response) -> Res
 }
 
 impl Instances {
+    pub fn is_running(&self, name: &str) -> bool {
+        self.running.lock().unwrap().contains_key(name)
+    }
+
     pub fn running(&self) -> Vec<String> {
         self.running.lock().unwrap().keys().cloned().collect()
+    }
+
+    /// Reserves the VM instance `name` for creating or deleting it, which fails if its VM
+    /// runs or someone else reserved it.
+    pub fn reserve(&self, name: &str) -> Result<Reservation<'_>> {
+        let running = self.running.lock().unwrap();
+        let mut reserved = self.reserved.lock().unwrap();
+        if running.contains_key(name) {
+            bail!("{name} is running (bifrost shutdown {name} stops it)");
+        }
+        if !reserved.insert(name.to_string()) {
+            bail!("{name} is being created or deleted");
+        }
+        Ok(Reservation {
+            instances: self,
+            name: name.to_string(),
+        })
     }
 
     /// Connects `stream` to the agent in the VM of `name` (see
@@ -302,8 +339,12 @@ impl Instances {
         let running = {
             let mut instances = self.running.lock().unwrap();
             match instances.get(name) {
-                Some(running) => Some(running.clone()),
-                None if !start => None,
+                Some(running) => Ok(running.clone()),
+                None if self.reserved.lock().unwrap().contains(name) => Err(
+                    control::Response::Error(format!("{name} is being created or deleted")),
+                ),
+                None if !instance::exists(name) => Err(control::Response::NoInstance),
+                None if !start => Err(control::Response::Error(format!("{name} is not running"))),
                 None => {
                     let running = Arc::new(Running {
                         state: Mutex::new(State::Booting),
@@ -323,13 +364,13 @@ impl Instances {
                             instances.remove(&name);
                         }
                     });
-                    Some(running)
+                    Ok(running)
                 }
             }
         };
-        let Some(running) = running else {
-            let error = format!("{name} is not running");
-            return respond(&stream, control::Response::Error(error)).await;
+        let running = match running {
+            Ok(running) => running,
+            Err(response) => return respond(&stream, response).await,
         };
         if running.booting() {
             respond(&stream, control::Response::Starting).await?;
@@ -383,7 +424,7 @@ impl Drop for ConsoleLog {
     }
 }
 
-/// Runs the VM of `name` (see [`instance::config`]) until it stops.
+/// Runs the VM of `name` (see [`Instance::config`]) until it stops.
 fn run_instance(name: &str, running: &Running) {
     let reason = match boot_instance(name, running) {
         Ok(reason) => reason,
@@ -396,7 +437,7 @@ fn run_instance(name: &str, running: &Running) {
 /// Boots the VM of `name`, makes it ready for sessions and runs it until it stops;
 /// returns why it stopped.
 fn boot_instance(name: &str, running: &Running) -> Result<String> {
-    let mut config = instance::config(name)?;
+    let mut config = Instance::load(name)?.config();
     config.guest.waypipe_debug = waypipe_debug();
     let dir = runtime::runtime_dir(name);
     std::fs::create_dir_all(&dir).with_context(|| format!("failed to create {dir:?}"))?;

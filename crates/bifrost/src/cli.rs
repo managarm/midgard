@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use clap::error::ErrorKind;
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use midgard_protocol::machine::Disk;
+use midgard_protocol::size::parse_size;
 
 /// Runs a command, or your login shell, in the VM.
 ///
@@ -103,13 +104,14 @@ pub struct CreateArgs {
     #[arg(long, value_name = "NAME")]
     pub template: Option<String>,
 
+    /// The user that sessions run as, if the template creates one [default: ask, with
+    /// your user name as the answer's default]
+    #[arg(short = 'u', long, value_name = "NAME")]
+    pub user: Option<String>,
+
     /// The VM instance's memory, e.g. 2G
     #[arg(long, value_name = "SIZE", value_parser = parse_size)]
     pub memory: Option<u64>,
-
-    /// The size of the VM instance's disk, e.g. 64G
-    #[arg(long, value_name = "SIZE", value_parser = parse_size)]
-    pub disk_size: Option<u64>,
 
     /// Answer questions with their defaults
     #[arg(short = 'y', long)]
@@ -259,27 +261,6 @@ fn parse_disk(text: &str) -> Result<Disk, String> {
         path: path.into(),
         read_only,
     })
-}
-
-fn parse_size(text: &str) -> Result<u64, String> {
-    let digits = text
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(text.len());
-    let (number, suffix) = text.split_at(digits);
-    let number: u64 = number
-        .parse()
-        .map_err(|_| format!("invalid size {text:?}"))?;
-    let shift = match suffix.to_ascii_lowercase().as_str() {
-        "" | "b" => 0,
-        "k" | "kib" => 10,
-        "m" | "mib" => 20,
-        "g" | "gib" => 30,
-        "t" | "tib" => 40,
-        _ => return Err(format!("invalid size suffix {suffix:?} (use K, M, G or T)")),
-    };
-    number
-        .checked_mul(1 << shift)
-        .ok_or_else(|| format!("size {text:?} is too large"))
 }
 
 #[cfg(test)]
@@ -433,13 +414,22 @@ mod tests {
     }
 
     #[test]
-    fn create_with_memory() {
-        let cli = parse(&["create", "alpine", "--memory", "512M"]).unwrap();
+    fn create() {
+        let cli = parse(&["create", "dev", "--template", "debian", "--memory", "512M"]).unwrap();
         let Some(Action::Create(create)) = cli.action else {
             panic!("not create: {:?}", cli.action);
         };
-        assert_eq!(create.name, "alpine");
+        assert_eq!(create.name, "dev");
+        assert_eq!(create.template.as_deref(), Some("debian"));
         assert_eq!(create.memory, Some(512 << 20));
+        assert_eq!(create.user, None);
+        let cli = parse(&["create", "-y", "-u", "alice", "alpine"]).unwrap();
+        let Some(Action::Create(create)) = cli.action else {
+            panic!("not create: {:?}", cli.action);
+        };
+        assert_eq!(create.user.as_deref(), Some("alice"));
+        assert!(create.yes);
+        assert!(parse(&["create"]).is_err());
     }
 
     #[test]

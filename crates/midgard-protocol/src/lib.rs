@@ -3,7 +3,7 @@
 //! asks midgard to run it (see [`control`]) on midgard's socket (see [`runtime`]);
 //! bifrost and the agent speak the session protocol (see [`session`]); midgard tells the
 //! agent how to set up the guest (see [`guest`]). It also has the constants that both
-//! sides of the VM need to agree on.
+//! sides of the VM need to agree on, and how sizes are written (see [`size`]).
 //!
 //! Each message is a frame: a little-endian u32 length and the message in postcard.
 //! bifrost, midgard and the agent come from the same installation, so the encoding does
@@ -20,6 +20,7 @@ pub mod guest;
 pub mod machine;
 pub mod runtime;
 pub mod session;
+pub mod size;
 
 /// The vsock CID of the host (midgard itself).
 pub const HOST_CID: u32 = 2;
@@ -180,7 +181,25 @@ mod tests {
             control::Response::Stopped("the guest powered off".into()),
             control::Response::Starting,
             control::Response::Ready,
+            control::Response::NoInstance,
             control::Response::Running(vec!["alpine".into()]),
+            control::Response::List(control::Listing {
+                instances: vec![control::InstanceInfo {
+                    name: "dev".into(),
+                    template: Some("debian".into()),
+                    running: true,
+                    disk_size: Some(1 << 30),
+                    error: None,
+                }],
+                templates: vec![control::TemplateInfo {
+                    name: "debian".into(),
+                    description: None,
+                    needs_user: true,
+                    error: Some("no disk".into()),
+                }],
+                templates_dir: "/var/lib/midgard/templates".into(),
+            }),
+            control::Response::Done,
             control::Response::Error("no such file".into()),
         ];
         for response in &responses {
@@ -201,6 +220,13 @@ mod tests {
                 start: true,
             },
             control::Request::Input(b"ls\r".to_vec()),
+            control::Request::Create {
+                name: "dev".into(),
+                template: "debian".into(),
+                user: Some("alice".into()),
+                memory: Some(2 << 30),
+            },
+            control::Request::Delete { name: "dev".into() },
         ];
         for request in &requests {
             write_message(&mut stream, request).unwrap();
