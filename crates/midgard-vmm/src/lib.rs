@@ -17,6 +17,7 @@
 #![warn(unreachable_pub)]
 
 mod acpi;
+mod aml;
 mod board;
 mod boot;
 mod clock;

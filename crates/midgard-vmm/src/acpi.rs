@@ -8,6 +8,7 @@ use midgard_hv::{GuestMemory, MemoryError};
 use zerocopy::little_endian::{U16, U32, U64};
 use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout};
 
+use crate::aml;
 use crate::devices::{pm1, rtc};
 use crate::platform::{IOAPIC_BASE, LAPIC_BASE, PM1A_CNT_BLK, PM1A_EVT_BLK, SCI_IRQ};
 
@@ -265,13 +266,21 @@ impl Layout {
     }
 }
 
-/// The DSDT: \_S5 only, i.e., Name (_S5, Package () { 5, 5, 0, 0 }).
+/// The DSDT: \_S5 only.
 fn dsdt() -> Vec<u8> {
-    let s5 = pm1::S5_SLP_TYP as u8;
-    // NameOp "_S5_" PackageOp PkgLength NumElements BytePrefix 5 BytePrefix 5 Zero Zero.
-    let aml = [
-        0x08, b'_', b'S', b'5', b'_', 0x12, 0x08, 0x04, 0x0A, s5, 0x0A, s5, 0x00, 0x00,
-    ];
+    let s5 = u64::from(pm1::S5_SLP_TYP);
+    let aml = aml::term_list(&[
+        // SLP_TYPa and SLP_TYPb, then two reserved values.
+        aml::name(
+            "_S5",
+            aml::package(&[
+                aml::integer(s5),
+                aml::integer(s5),
+                aml::integer(0),
+                aml::integer(0),
+            ]),
+        ),
+    ]);
     sdt(b"DSDT", 2, &aml)
 }
 
