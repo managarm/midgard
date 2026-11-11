@@ -32,14 +32,26 @@ use crate::{acpi, boot, platform, vcpu, virtio};
 /// Kernel parameters that every guest needs (unless the configuration replaces them);
 /// the console and the virtio devices are added.
 const BASE_CMDLINE: &str = "pci=off reboot=k panic=-1";
+/// The default number of vCPUs: the host's CPUs, up to this many.
+const DEFAULT_MAX_CPUS: u32 = 8;
 
-/// Checks that midgard can run the VM.
-fn validate(config: &MachineConfig) -> Result<()> {
-    if config.cpus == 0 || config.cpus > platform::MAX_CPUS {
-        bail!(
-            "the number of vCPUs must be between 1 and {}",
-            platform::MAX_CPUS
-        );
+/// The most vCPUs that a VM can have (on this hypervisor).
+// Only some backends (Hel) have a limit below the platform's.
+#[allow(clippy::unnecessary_min_or_max)]
+fn max_cpus() -> u32 {
+    platform::MAX_CPUS.min(midgard_hv::MAX_VCPUS)
+}
+
+/// The host's CPUs, up to [`DEFAULT_MAX_CPUS`] (and what the hypervisor supports).
+fn default_cpus() -> u32 {
+    let host = std::thread::available_parallelism().map_or(1, |n| n.get());
+    (host as u32).clamp(1, DEFAULT_MAX_CPUS.min(max_cpus()))
+}
+
+/// Checks that midgard can run the VM (with `cpus` vCPUs).
+fn validate(config: &MachineConfig, cpus: u32) -> Result<()> {
+    if cpus == 0 || cpus > max_cpus() {
+        bail!("the number of vCPUs must be between 1 and {}", max_cpus());
     }
     if !config.memory.is_multiple_of(4096) || config.memory < (64 << 20) {
         bail!("guest memory must be a multiple of 4 KiB and at least 64 MiB");
@@ -448,7 +460,8 @@ pub fn start(
     console: piper::Writer,
     input: Option<async_channel::Receiver<Vec<u8>>>,
 ) -> Result<Machine> {
-    validate(config)?;
+    let cpus = config.cpus.unwrap_or_else(default_cpus);
+    validate(config, cpus)?;
     let console = ConsoleOutput::new(console);
     let devices = create_devices(config, &console)?;
     let cmdline = kernel_cmdline(config, &devices);
@@ -459,12 +472,11 @@ pub fn start(
     log!("TSC runs at {} kHz", tsc_hz / 1000);
     let entry = boot::load(&memory, &kernel, initrd.as_deref(), &cmdline)?;
     drop((kernel, initrd));
-    acpi::write(&memory, platform::ACPI_TABLES, config.cpus)
-        .context("failed to write the ACPI tables")?;
+    acpi::write(&memory, platform::ACPI_TABLES, cpus).context("failed to write the ACPI tables")?;
 
     let board = Arc::new(Board::new(
         memory,
-        config.cpus,
+        cpus,
         vcpu::Timebase::new(tsc_hz),
         hypervisor,
         console,
@@ -472,7 +484,7 @@ pub fn start(
         devices.vsock,
     ));
     let mut vcpus = Vec::new();
-    for id in 0..config.cpus {
+    for id in 0..cpus {
         vcpus.push(vcpu::Vcpu::new(board.clone(), id)?);
     }
     vcpus[0].set_registers(&boot::entry_registers(&entry))?;
@@ -480,7 +492,7 @@ pub fn start(
     log!(
         "booting {} with {} vCPU(s) and {} MiB of memory: {cmdline}",
         config.kernel.display(),
-        config.cpus,
+        cpus,
         config.memory >> 20,
     );
     let executor = Arc::new(Executor::new());

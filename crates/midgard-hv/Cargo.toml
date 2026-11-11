@@ -2,13 +2,18 @@
 name = "midgard-hv"
 version = "0.1.0"
 edition = "2024"
-description = "The hypervisor that midgard runs on"
+description = "The hypervisor that midgard runs on: Hel (thor's virtualization API) or KVM"
 license = "MIT"
 
 [dependencies]
 anyhow.workspace = true
 thiserror.workspace = true
 zerocopy.workspace = true
+
+[target.'cfg(target_os = "managarm")'.dependencies]
+hel.workspace = true
+hel-sys.workspace = true
+managarm.workspace = true
 
 # On Linux, midgard runs on KVM (for development).
 [target.'cfg(target_os = "linux")'.dependencies]

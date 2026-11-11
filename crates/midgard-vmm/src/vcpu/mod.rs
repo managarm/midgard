@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use anyhow::{Result, bail};
 use midgard_hv::x86::{EFER_LMA, msr};
-use midgard_hv::{Completion, Exit, MmioAccess, Msrs, Regs};
+use midgard_hv::{Completion, Exit, Msrs, Regs};
 
 use crate::board::Board;
 use crate::clock;
@@ -97,10 +97,12 @@ impl Vcpu {
                 log!("vCPU {}: triple fault", self.id);
                 Handled::Stop(Stop::Reset)
             }
-            Exit::Mmio { address, access } => {
-                self.mmio(address, access)?;
-                Handled::Continue
-            }
+            Exit::Mmio {
+                address,
+                size,
+                write,
+                data,
+            } => Handled::Complete(self.mmio(address, size, write, data)),
             Exit::Hypercall => Handled::Complete(self.hypercall()?),
             Exit::Failed(reason) => {
                 let rip = self.backend.basic_regs().map(|regs| regs.rip).unwrap_or(0);
@@ -109,22 +111,14 @@ impl Vcpu {
         })
     }
 
-    /// Handles an access to device memory that the backend decoded.
-    fn mmio(&mut self, address: u64, access: Option<MmioAccess>) -> Result<()> {
-        let Some(access) = access else {
-            let rip = self.backend.basic_regs()?.rip;
-            bail!(
-                "vCPU {}: cannot emulate the access to {address:#x} at RIP {rip:#x}",
-                self.id
-            );
-        };
-        if access.write {
-            self.board.mmio_write(address, access.size, access.data);
+    /// Handles an access to device memory.
+    fn mmio(&mut self, address: u64, size: u8, write: bool, data: u64) -> Completion {
+        if write {
+            self.board.mmio_write(address, size, data);
+            Completion::Done(0)
         } else {
-            let value = self.board.mmio_read(address, access.size);
-            self.backend.complete_mmio_read(value)?;
+            Completion::Done(self.board.mmio_read(address, size))
         }
-        Ok(())
     }
 
     /// KVM hypercalls (the number is in RAX). We implement none of them; like KVM, we

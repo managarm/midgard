@@ -146,7 +146,7 @@ mod tests {
             cmdline: None,
             append: vec!["quiet".into(), "loglevel=3".into()],
             memory: 2 << 30,
-            cpus: 4,
+            cpus: Some(4),
             console: ConsoleKind::Virtio,
             disks: vec![Disk {
                 path: "/var/lib/midgard/alpine.qcow2".into(),

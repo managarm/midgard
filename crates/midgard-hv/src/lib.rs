@@ -1,11 +1,12 @@
 //! The hypervisor interface that midgard runs on.
 //!
-//! The model is Hel's (thor's virtualization API): the hypervisor emulates the local
-//! APICs (including HLT, IPIs and INIT / SIPI), the I/O APIC and CPUID (from a table).
-//! Exits report *what* the guest did; port I/O, MSR and hypercall exits leave the
-//! instruction unfinished until the next run completes it (see [`Completion`]). A kick
-//! makes the running (or next) run return. Other backends (KVM, for development on
-//! Linux) translate to this model.
+//! The model: the backend emulates the local APICs (including HLT, IPIs and INIT / SIPI),
+//! the I/O APIC and CPUID (from a table). (On Hel, thor emulates the local APIC of a
+//! single vCPU; the backend emulates the I/O APIC and CPUID, and decodes MMIO
+//! instructions.) Exits report *what* the guest did; port I/O, MMIO, MSR and hypercall
+//! exits leave the instruction unfinished until the next run completes it (see
+//! [`Completion`]). A kick makes the running (or next) run return. Other backends (KVM,
+//! for development on Linux) translate to this model.
 //!
 //! A kick may be observed more than once: a run may return [`Exit::Kicked`] for other
 //! reasons (e.g., a signal on KVM), and one kick may make more than one run return.
@@ -22,6 +23,10 @@
 
 use anyhow::Result;
 
+#[cfg(any(target_os = "managarm", test))]
+mod decode;
+#[cfg(any(target_os = "managarm", test))]
+mod ioapic;
 pub mod memory;
 pub mod x86;
 
@@ -71,15 +76,19 @@ macro_rules! receiver {
     };
 }
 
+#[cfg(target_os = "managarm")]
+mod hel;
+#[cfg(target_os = "managarm")]
+use hel as imp;
 #[cfg(target_os = "linux")]
 mod kvm;
 #[cfg(target_os = "linux")]
 use kvm as imp;
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "managarm", target_os = "linux")))]
 compile_error!("midgard-hv has no backend for this target OS");
 
-pub use imp::{Hypervisor, Kicker, Vcpu};
+pub use imp::{Hypervisor, Kicker, MAX_VCPUS, Vcpu};
 
 /// Guest-physical addresses that the backend may use for itself, which the VMM must
 /// leave alone (KVM puts its identity map and real-mode TSS there).
@@ -203,26 +212,6 @@ impl Msrs {
     }
 }
 
-/// Whether a vCPU runs (see [`Vcpu::mp_state`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MpState {
-    Runnable,
-    /// HLT: the vCPU waits for an interrupt.
-    Halted,
-    /// The vCPU waits for a startup IPI (an AP before it was started, or after INIT).
-    WaitForStartup,
-}
-
-/// An MMIO access that the backend already decoded (KVM decodes MMIO instructions in
-/// the kernel; Hel does not).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MmioAccess {
-    pub write: bool,
-    pub size: u8,
-    /// The written value.
-    pub data: u64,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Exit {
     /// Port I/O (needs a [`Completion`]; for IN, its value is the result). `data` is the
@@ -234,12 +223,14 @@ pub enum Exit {
         string: bool,
         data: u32,
     },
-    /// An access to guest-physical memory that is not RAM. Without `access`, the VMM
-    /// decodes the instruction (and skips it); with it, the backend completes the
-    /// instruction (see [`Vcpu::complete_mmio_read`]).
+    /// An access to guest-physical memory that is not RAM and not a device of the
+    /// backend (needs a [`Completion`]; for a read, its value is the result). `size` is
+    /// 1, 2, 4 or 8 bytes; `data` is the written value (of `size` bytes).
     Mmio {
         address: u64,
-        access: Option<MmioAccess>,
+        size: u8,
+        write: bool,
+        data: u64,
     },
     /// RDMSR (needs a [`Completion`] with the value).
     Rdmsr { index: u32 },
@@ -256,8 +247,8 @@ pub enum Exit {
     Failed(String),
 }
 
-/// Finishes an instruction that exited (I/O, MSR and hypercall exits): the next run
-/// either completes it or makes it raise #GP(0).
+/// Finishes an instruction that exited (I/O, MMIO, MSR and hypercall exits): the next run
+/// either completes it or makes it raise #GP(0) (which port I/O and MMIO do not support).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Completion {
     /// The instruction completes with this result (if it has one).
@@ -290,13 +281,6 @@ backend! {
         fn set_regs(&mut self, regs: &Regs) -> Result<()>;
         fn msrs(&mut self) -> Result<Msrs>;
         fn set_msrs(&mut self, msrs: &Msrs) -> Result<()>;
-        fn mp_state(&mut self) -> Result<MpState>;
-        /// Accesses a 32-bit register of an in-kernel device (the local APIC in xAPIC
-        /// mode or the I/O APIC) for an MMIO exit that the VMM decoded; `write` is the
-        /// value to write. Returns None if no in-kernel device is at `address`.
-        fn kernel_mmio(&mut self, address: u64, write: Option<u32>) -> Result<Option<u32>>;
-        /// Provides the result of a decoded MMIO read ([`Exit::Mmio`] with an access).
-        fn complete_mmio_read(&mut self, value: u64) -> Result<()>;
         /// The vCPU's kicker (which other threads use while it runs).
         fn kicker(&self) -> Kicker;
     }
@@ -319,7 +303,8 @@ backend! {
     /// What a backend's [`Hypervisor`] (a VM) does; it is shared by all vCPU threads.
     pub struct Hypervisor;
     trait HypervisorOps {
-        /// Creates a vCPU (`id` is its x2APIC ID). The local APIC starts in x2APIC mode.
+        /// Creates a vCPU (`id` is its x2APIC ID, below [`MAX_VCPUS`]). The local APIC
+        /// starts in x2APIC mode.
         /// vCPU 0 is the bootstrap processor (it starts in its reset state; the VMM sets
         /// its registers); the others wait for a startup IPI.
         fn create_vcpu(&self, id: u32, cpuid: &[CpuidEntry]) -> Result<Vcpu>;

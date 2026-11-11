@@ -23,16 +23,8 @@ const FORCE_QUIT: Duration = Duration::from_secs(1);
 
 /// The guest's RAM unless --memory says otherwise.
 const DEFAULT_MEMORY: u64 = 1 << 30;
-/// The default number of vCPUs: the host's CPUs, up to this many.
-const DEFAULT_MAX_CPUS: u32 = 8;
 
 const CTRL_A: u8 = 0x01;
-
-/// The host's CPUs, up to [`DEFAULT_MAX_CPUS`].
-fn default_cpus() -> u32 {
-    let host = std::thread::available_parallelism().map_or(1, |n| n.get());
-    (host as u32).clamp(1, DEFAULT_MAX_CPUS)
-}
 
 /// `path` for midgard, which does not run in our working directory.
 fn absolute(path: &Path) -> Result<std::path::PathBuf> {
@@ -58,7 +50,7 @@ fn config(boot: &BootArgs) -> Result<MachineConfig> {
         cmdline: boot.cmdline.clone(),
         append: boot.append.clone(),
         memory: boot.memory.unwrap_or(DEFAULT_MEMORY),
-        cpus: boot.cpus.unwrap_or_else(default_cpus),
+        cpus: boot.cpus,
         console: match boot.console {
             Console::Virtio => ConsoleKind::Virtio,
             Console::Serial => ConsoleKind::Serial,
@@ -201,7 +193,7 @@ mod tests {
         assert_eq!(config.cmdline, None);
         assert!(config.append.is_empty());
         assert_eq!(config.memory, DEFAULT_MEMORY);
-        assert!((1..=DEFAULT_MAX_CPUS).contains(&config.cpus));
+        assert_eq!(config.cpus, None);
         assert_eq!(config.console, ConsoleKind::Virtio);
         assert!(config.disks.is_empty());
         assert!(config.network);

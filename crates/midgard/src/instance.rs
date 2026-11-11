@@ -45,8 +45,6 @@ use crate::paths;
 const MAX_NAME: usize = 64;
 /// The guest's RAM.
 const DEFAULT_MEMORY: u64 = 1 << 30;
-/// The default number of vCPUs: the host's CPUs, up to this many.
-const DEFAULT_MAX_CPUS: u32 = 8;
 
 /// Checks the name of an instance: it names files, so it consists of letters, digits,
 /// `-` and `_` and does not start with `-`.
@@ -64,12 +62,6 @@ pub fn validate_name(name: &str) -> Result<()> {
         );
     }
     Ok(())
-}
-
-/// The host's CPUs, up to [`DEFAULT_MAX_CPUS`].
-fn default_cpus() -> u32 {
-    let host = std::thread::available_parallelism().map_or(1, |n| n.get());
-    (host as u32).clamp(1, DEFAULT_MAX_CPUS)
 }
 
 /// The contents of an instance file.
@@ -213,7 +205,7 @@ pub fn config(name: &str) -> Result<MachineConfig> {
         cmdline: None,
         append: Vec::new(),
         memory: DEFAULT_MEMORY,
-        cpus: default_cpus(),
+        cpus: None,
         console: ConsoleKind::Virtio,
         disks: vec![Disk {
             path: disk,
