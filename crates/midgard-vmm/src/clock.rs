@@ -21,26 +21,3 @@ pub(crate) fn host_ns() -> u64 {
     unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut time) };
     time.tv_sec as u64 * 1_000_000_000 + time.tv_nsec as u64
 }
-
-/// Other kernels do not tell us how they convert the TSC; we measure it.
-#[cfg(not(target_os = "managarm"))]
-fn kernel_tsc_hz() -> Option<u64> {
-    None
-}
-
-/// Determines the TSC frequency: exactly from the kernel's clock if possible
-/// (then kvmclock agrees with helGetClock()), otherwise by measuring it.
-pub(crate) fn calibrate() -> u64 {
-    if let Some(hz) = kernel_tsc_hz() {
-        return hz;
-    }
-    const DURATION_NS: u64 = 200_000_000;
-    let (start_ns, start_tsc) = (host_ns(), rdtsc());
-    let (end_ns, end_tsc) = loop {
-        let (ns, tsc) = (host_ns(), rdtsc());
-        if ns - start_ns >= DURATION_NS {
-            break (ns, tsc);
-        }
-    };
-    ((end_tsc - start_tsc) as u128 * 1_000_000_000 / (end_ns - start_ns) as u128) as u64
-}

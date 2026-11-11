@@ -38,6 +38,8 @@ vmm_sys_util::ioctl_iow_nr!(
     0xE1,
     kvm_device_attr
 );
+// kvm-ioctls only wraps KVM_GET_TSC_KHZ for vCPUs.
+vmm_sys_util::ioctl_io_nr!(KVM_GET_TSC_KHZ, kvm_bindings::KVMIO, 0xA3);
 
 /// Where KVM puts its identity map (one page) and real-mode TSS (three pages; both are
 /// only needed on Intel without unrestricted guest), in [`RESERVED_BASE`].
@@ -284,6 +286,18 @@ impl HypervisorOps for Hypervisor {
         self.vm
             .set_irq_line(pin, level)
             .with_context(|| format!("KVM_IRQ_LINE for pin {pin} failed"))
+    }
+
+    fn tsc_hz(&self) -> Result<u64> {
+        // The VM's default TSC frequency, which its vCPUs get: the host's (KVM only
+        // scales the TSC if it is set to something else), as the host kernel calibrated it.
+        // SAFETY: KVM_GET_TSC_KHZ takes no argument.
+        let khz = unsafe { vmm_sys_util::ioctl::ioctl(&self.vm, KVM_GET_TSC_KHZ()) };
+        if khz <= 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("KVM_GET_TSC_KHZ for the VM failed (KVM is too old?)");
+        }
+        Ok(khz as u64 * 1000)
     }
 }
 

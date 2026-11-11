@@ -326,6 +326,9 @@ backend! {
         /// Sets the level of an I/O APIC pin. An edge-triggered pin interrupts on the
         /// rising edge.
         fn set_irq_line(&self, pin: u32, level: bool) -> Result<()>;
+        /// The frequency (in Hz) of the vCPUs' TSC, which is the host's TSC, as the host
+        /// kernel knows it (such that the VMM does not have to measure it).
+        fn tsc_hz(&self) -> Result<u64>;
     }
 }
 
