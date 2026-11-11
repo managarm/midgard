@@ -9,18 +9,32 @@ const BYTE_PREFIX: u8 = 0x0A;
 const WORD_PREFIX: u8 = 0x0B;
 const DWORD_PREFIX: u8 = 0x0C;
 const QWORD_PREFIX: u8 = 0x0E;
+const SCOPE_OP: u8 = 0x10;
+const BUFFER_OP: u8 = 0x11;
 const PACKAGE_OP: u8 = 0x12;
 const DUAL_NAME_PREFIX: u8 = 0x2E;
 const MULTI_NAME_PREFIX: u8 = 0x2F;
 const ROOT_CHAR: u8 = b'\\';
 const PARENT_PREFIX_CHAR: u8 = b'^';
 const NULL_NAME: u8 = 0x00;
+const EXT_OP_PREFIX: u8 = 0x5B;
+const DEVICE_OP: u8 = 0x82;
+
+// Small resource descriptors: their types, and flags.
+const SMALL_IRQ: u8 = 0x04;
+const SMALL_IO: u8 = 0x08;
+const SMALL_END_TAG: u8 = 0x0F;
+/// IO: the device decodes 16 address bits.
+const IO_DECODE_16: u8 = 1 << 0;
 
 /// An encoded term (an element of a TermList), e.g., a Name.
 pub(crate) struct Term(Vec<u8>);
 
 /// An encoded data object (a DataRefObject), e.g., an integer or a package.
 pub(crate) struct Data(Vec<u8>);
+
+/// An encoded resource descriptor, an element of a [`resource_template`].
+pub(crate) struct Resource(Vec<u8>);
 
 /// The encoding of a TermList, e.g., the body of a definition block.
 pub(crate) fn term_list(terms: &[Term]) -> Vec<u8> {
@@ -96,6 +110,25 @@ fn name_string(path: &str) -> Vec<u8> {
     bytes
 }
 
+/// `op`, then the PkgLength, the NameString and the TermList of a named scope.
+fn named_scope(op: &[u8], path: &str, terms: &[Term]) -> Term {
+    let mut contents = name_string(path);
+    contents.extend(term_list(terms));
+    let mut bytes = op.to_vec();
+    bytes.extend(with_pkg_length(&contents));
+    Term(bytes)
+}
+
+/// `Scope (path) { terms }`.
+pub(crate) fn scope(path: &str, terms: &[Term]) -> Term {
+    named_scope(&[SCOPE_OP], path, terms)
+}
+
+/// `Device (path) { terms }`.
+pub(crate) fn device(path: &str, terms: &[Term]) -> Term {
+    named_scope(&[EXT_OP_PREFIX, DEVICE_OP], path, terms)
+}
+
 /// `Name (path, data)`.
 pub(crate) fn name(path: &str, data: Data) -> Term {
     let mut bytes = vec![NAME_OP];
@@ -129,6 +162,63 @@ pub(crate) fn package(elements: &[Data]) -> Data {
     let mut bytes = vec![PACKAGE_OP];
     bytes.extend(with_pkg_length(&contents));
     Data(bytes)
+}
+
+/// `EisaId (id)`: a PNP ID like `PNP0501` (three uppercase letters and four hexadecimal
+/// digits), compressed into 32 bits.
+pub(crate) fn eisa_id(id: &str) -> Data {
+    let bytes = id.as_bytes();
+    let valid = bytes.len() == 7
+        && bytes[..3].iter().all(u8::is_ascii_uppercase)
+        && bytes[3..].iter().all(u8::is_ascii_hexdigit);
+    assert!(valid, "invalid EISA ID {id:?}");
+    // Five bits per letter, then the product number; stored big-endian.
+    let vendor = bytes[..3]
+        .iter()
+        .fold(0u32, |vendor, &c| vendor << 5 | u32::from(c - b'@'));
+    let product = u32::from_str_radix(&id[3..], 16).unwrap();
+    integer(u64::from((vendor << 16 | product).swap_bytes()))
+}
+
+/// `Buffer () { bytes }`.
+pub(crate) fn buffer(bytes: &[u8]) -> Data {
+    let mut contents = integer(bytes.len() as u64).0;
+    contents.extend_from_slice(bytes);
+    let mut encoded = vec![BUFFER_OP];
+    encoded.extend(with_pkg_length(&contents));
+    Data(encoded)
+}
+
+/// `ResourceTemplate () { resources }`: a buffer with the descriptors and an end tag.
+pub(crate) fn resource_template(resources: &[Resource]) -> Data {
+    let mut bytes: Vec<u8> = resources
+        .iter()
+        .flat_map(|resource| resource.0.iter().copied())
+        .collect();
+    // A zero checksum means that there is none (iasl emits it like this, too).
+    bytes.extend(small_resource(SMALL_END_TAG, &[0]).0);
+    buffer(&bytes)
+}
+
+/// A small resource descriptor: the tag (its type and length), then `data`.
+fn small_resource(kind: u8, data: &[u8]) -> Resource {
+    assert!(data.len() <= 7);
+    let mut bytes = vec![kind << 3 | data.len() as u8];
+    bytes.extend_from_slice(data);
+    Resource(bytes)
+}
+
+/// `IO (Decode16, base, base, 1, len)`: `len` ports at a fixed `base`.
+pub(crate) fn io(base: u16, len: u16) -> Resource {
+    let len = u8::try_from(len).expect("I/O port range too long");
+    let [low, high] = base.to_le_bytes();
+    small_resource(SMALL_IO, &[IO_DECODE_16, low, high, low, high, 1, len])
+}
+
+/// `IRQNoFlags () { irq }`: an ISA IRQ (edge-triggered, active high, exclusive).
+pub(crate) fn irq_no_flags(irq: usize) -> Resource {
+    assert!(irq < 16, "invalid ISA IRQ {irq}");
+    small_resource(SMALL_IRQ, &(1u16 << irq).to_le_bytes())
 }
 
 #[cfg(test)]
@@ -185,6 +275,47 @@ mod tests {
             term_list(&[name("_S5", package(&elements))]),
             [
                 0x08, 0x5F, 0x53, 0x35, 0x5F, 0x12, 0x08, 0x04, 0x0A, 0x05, 0x0A, 0x05, 0x00, 0x00
+            ]
+        );
+    }
+
+    #[test]
+    fn eisa_ids() {
+        assert_eq!(eisa_id("PNP0A03").0, [DWORD_PREFIX, 0x41, 0xD0, 0x0A, 0x03]);
+    }
+
+    #[test]
+    #[should_panic]
+    fn eisa_id_lowercase() {
+        eisa_id("pnp0501");
+    }
+
+    #[test]
+    fn devices() {
+        // As iasl encodes it:
+        //   Scope (_SB) {
+        //     Device (COM1) {
+        //       Name (_HID, EisaId ("PNP0501"))
+        //       Name (_CRS, ResourceTemplate () {
+        //         IO (Decode16, 0x3F8, 0x3F8, 0x01, 0x08)
+        //         IRQNoFlags () {4}
+        //       })
+        //     }
+        //   }
+        let com1 = device(
+            "COM1",
+            &[
+                name("_HID", eisa_id("PNP0501")),
+                name("_CRS", resource_template(&[io(0x3F8, 8), irq_no_flags(4)])),
+            ],
+        );
+        assert_eq!(
+            term_list(&[scope("_SB", &[com1])]),
+            [
+                0x10, 0x2C, 0x5F, 0x53, 0x42, 0x5F, 0x5B, 0x82, 0x25, 0x43, 0x4F, 0x4D, 0x31, 0x08,
+                0x5F, 0x48, 0x49, 0x44, 0x0C, 0x41, 0xD0, 0x05, 0x01, 0x08, 0x5F, 0x43, 0x52, 0x53,
+                0x11, 0x10, 0x0A, 0x0D, 0x47, 0x01, 0xF8, 0x03, 0xF8, 0x03, 0x01, 0x08, 0x22, 0x10,
+                0x00, 0x79, 0x00
             ]
         );
     }
