@@ -14,6 +14,7 @@ pub const CR0_PG: u64 = 1 << 31;
 pub const CR4_PSE: u64 = 1 << 4;
 pub const CR4_PAE: u64 = 1 << 5;
 pub const CR4_LA57: u64 = 1 << 12;
+pub const CR4_OSXSAVE: u64 = 1 << 18;
 
 pub const EFER_LME: u64 = 1 << 8;
 pub const EFER_LMA: u64 = 1 << 10;
@@ -69,6 +70,7 @@ pub mod msr {
 pub mod cpuid {
     pub const LEAF1_ECX_X2APIC: u32 = 1 << 21;
     pub const LEAF1_ECX_TSC_DEADLINE: u32 = 1 << 24;
+    pub const LEAF1_ECX_OSXSAVE: u32 = 1 << 27;
     pub const LEAF1_ECX_HYPERVISOR: u32 = 1 << 31;
     pub const LEAF1_EDX_APIC: u32 = 1 << 9;
 }

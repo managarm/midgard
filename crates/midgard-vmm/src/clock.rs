@@ -10,6 +10,14 @@ pub(crate) fn rdtsc() -> u64 {
     return 0;
 }
 
+/// Nanoseconds since the host booted (helGetClock()).
+#[cfg(target_os = "managarm")]
+pub(crate) fn host_ns() -> u64 {
+    hel::Time::new_since_boot()
+        .expect("helGetClock cannot fail")
+        .nanos()
+}
+
 /// Nanoseconds since the host booted (CLOCK_MONOTONIC).
 #[cfg(not(target_os = "managarm"))]
 pub(crate) fn host_ns() -> u64 {

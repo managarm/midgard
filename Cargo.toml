@@ -30,3 +30,8 @@ zerocopy = { version = "0.8", features = ["derive"] }
 midgard-hv = { path = "crates/midgard-hv" }
 midgard-protocol = { path = "crates/midgard-protocol" }
 midgard-vmm = { path = "crates/midgard-vmm" }
+
+# Cargo needs the Managarm crates even when we're building on Linux.
+hel = { git = "https://github.com/managarm/managarm" }
+hel-sys = { git = "https://github.com/managarm/managarm" }
+managarm = { git = "https://github.com/managarm/managarm" }

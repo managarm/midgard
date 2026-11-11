@@ -1,11 +1,12 @@
 //! The hypervisor interface that midgard runs on.
 //!
-//! The model is Hel's (thor's virtualization API): the hypervisor emulates the local
-//! APICs (including HLT, IPIs and INIT / SIPI), the I/O APIC and CPUID (from a table).
-//! Exits report *what* the guest did; port I/O, MMIO, MSR and hypercall exits leave the
-//! instruction unfinished until the next run completes it (see [`Completion`]). A kick
-//! makes the running (or next) run return. Other backends (KVM, for development on
-//! Linux) translate to this model.
+//! The model: the backend emulates the local APICs (including HLT, IPIs and INIT / SIPI),
+//! the I/O APIC and CPUID (from a table). (On Hel, thor emulates the local APIC of a
+//! single vCPU; the backend emulates the I/O APIC and CPUID, and decodes MMIO
+//! instructions.) Exits report *what* the guest did; port I/O, MMIO, MSR and hypercall
+//! exits leave the instruction unfinished until the next run completes it (see
+//! [`Completion`]). A kick makes the running (or next) run return. Other backends (KVM,
+//! for development on Linux) translate to this model.
 //!
 //! A kick may be observed more than once: a run may return [`Exit::Kicked`] for other
 //! reasons (e.g., a signal on KVM), and one kick may make more than one run return.
@@ -75,12 +76,16 @@ macro_rules! receiver {
     };
 }
 
+#[cfg(target_os = "managarm")]
+mod hel;
+#[cfg(target_os = "managarm")]
+use hel as imp;
 #[cfg(target_os = "linux")]
 mod kvm;
 #[cfg(target_os = "linux")]
 use kvm as imp;
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "managarm", target_os = "linux")))]
 compile_error!("midgard-hv has no backend for this target OS");
 
 pub use imp::{Hypervisor, Kicker, MAX_VCPUS, Vcpu};

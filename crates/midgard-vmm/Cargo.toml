@@ -31,3 +31,6 @@ smoltcp = { version = "0.14", default-features = false, features = [
 ] }
 thiserror.workspace = true
 zerocopy.workspace = true
+
+[target.'cfg(target_os = "managarm")'.dependencies]
+hel.workspace = true
