@@ -22,6 +22,8 @@
 
 use anyhow::Result;
 
+#[cfg(any(target_os = "managarm", test))]
+mod decode;
 pub mod memory;
 pub mod x86;
 
