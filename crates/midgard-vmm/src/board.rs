@@ -8,6 +8,7 @@ use event_listener::Event;
 use midgard_hv::{GuestMemory, Hypervisor, Kicker};
 
 use crate::devices::pm1::{self, Pm1};
+use crate::devices::rtc::{self, Rtc};
 use crate::devices::serial::{self, Serial};
 use crate::devices::{read_bytes, write_bytes};
 use crate::host::console::ConsoleOutput;
@@ -27,9 +28,9 @@ enum Unhandled {
 }
 
 /// The guest's hardware, shared by all vCPUs: RAM, the devices that are not in the
-/// hypervisor (UART, PM1, the virtio transports) and the routing of port I/O, MMIO and
-/// interrupt lines to them. The local APICs and the I/O APIC are the hypervisor's. Also
-/// tracks whether the guest is done (stop requested).
+/// hypervisor (UART, RTC, PM1, the virtio transports) and the routing of port I/O,
+/// MMIO and interrupt lines to them. The local APICs and the I/O APIC are the
+/// hypervisor's. Also tracks whether the guest is done (stop requested).
 ///
 /// vCPU threads call into it on every exit. The virtio devices' queues are processed by
 /// tasks on the VM's executor (see [`Board::process_virtio`]); the host side of virtio
@@ -46,6 +47,7 @@ pub(crate) struct Board {
     /// Notified when the serial port's receive FIFO is empty (see
     /// [`Board::feed_serial`]).
     serial_drained: Event,
+    rtc: Mutex<Rtc>,
     pm1: Mutex<Pm1>,
     /// The vCPUs' kickers (see [`Board::stop`]).
     kickers: Mutex<Vec<Kicker>>,
@@ -78,6 +80,7 @@ impl Board {
             serial: Mutex::new(Serial::new(console)),
             serial_irq: AtomicBool::new(false),
             serial_drained: Event::new(),
+            rtc: Mutex::new(Rtc::default()),
             pm1: Mutex::new(Pm1::default()),
             kickers: Mutex::new(Vec::new()),
             stopping: AtomicBool::new(false),
@@ -207,6 +210,10 @@ impl Board {
             self.check_serial_drained(&serial);
             return value;
         }
+        if let Some(offset) = port_offset(port, platform::RTC_PORT, rtc::NUM_PORTS) {
+            let rtc = self.rtc.lock().unwrap();
+            return read_bytes(rtc::NUM_PORTS, offset, size, |o| rtc.read(o));
+        }
         if let Some(offset) = port_offset(port, platform::PM1A_EVT_BLK, pm1::EVT_LEN) {
             let pm1 = self.pm1.lock().unwrap();
             return read_bytes(pm1::EVT_LEN, offset, size, |o| pm1.read_event(o));
@@ -250,6 +257,13 @@ impl Board {
             self.set_serial_irq(serial.irq_level());
             // E.g., the guest cleared the FIFO.
             self.check_serial_drained(&serial);
+            return None;
+        }
+        if let Some(offset) = port_offset(port, platform::RTC_PORT, rtc::NUM_PORTS) {
+            let mut rtc = self.rtc.lock().unwrap();
+            write_bytes(rtc::NUM_PORTS, offset, size, value, |o, byte| {
+                rtc.write(o, byte)
+            });
             return None;
         }
         if let Some(offset) = port_offset(port, platform::PM1A_EVT_BLK, pm1::EVT_LEN) {

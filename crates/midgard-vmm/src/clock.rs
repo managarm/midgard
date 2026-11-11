@@ -1,5 +1,7 @@
-//! Host time: the TSC (the guest's TSC is the host's TSC) and the host's monotonic
-//! clock.
+//! Host time: the TSC (the guest's TSC is the host's TSC), the host's monotonic clock
+//! and its wall clock.
+
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub(crate) fn rdtsc() -> u64 {
     #[cfg(target_arch = "x86_64")]
@@ -28,4 +30,11 @@ pub(crate) fn host_ns() -> u64 {
     // SAFETY: clock_gettime() only writes the timespec.
     unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut time) };
     time.tv_sec as u64 * 1_000_000_000 + time.tv_nsec as u64
+}
+
+/// The host's wall clock: the time since the Unix epoch (zero before it).
+pub(crate) fn unix_time() -> Duration {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
 }

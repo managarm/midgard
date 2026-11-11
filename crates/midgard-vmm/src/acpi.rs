@@ -8,7 +8,7 @@ use midgard_hv::{GuestMemory, MemoryError};
 use zerocopy::little_endian::{U16, U32, U64};
 use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout};
 
-use crate::devices::pm1;
+use crate::devices::{pm1, rtc};
 use crate::platform::{IOAPIC_BASE, LAPIC_BASE, PM1A_CNT_BLK, PM1A_EVT_BLK, SCI_IRQ};
 
 const OEM_ID: &[u8; 6] = b"MIDGRD";
@@ -298,6 +298,7 @@ fn fadt(facs: u64, dsdt: u64) -> Vec<u8> {
     // C2 and C3 are not supported.
     fadt.p_lvl2_lat.set(101);
     fadt.p_lvl3_lat.set(1001);
+    fadt.century = rtc::REG_CENTURY;
     fadt.iapc_boot_arch.set(IAPC_BOOT_ARCH_NO_VGA);
     fadt.flags
         .set(FADT_WBINVD | FADT_PWR_BUTTON | FADT_SLP_BUTTON);
