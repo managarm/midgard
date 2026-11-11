@@ -32,6 +32,8 @@ pub(crate) const LAPIC_SIZE: u64 = 0x1000;
 
 /// The 16550A UART (eight ports).
 pub(crate) const COM1_PORT: u16 = 0x3F8;
+/// The CMOS RTC (an index and a data port).
+pub(crate) const RTC_PORT: u16 = 0x70;
 /// The ACPI PM1a event block (status and enable registers).
 pub(crate) const PM1A_EVT_BLK: u16 = 0x600;
 /// The ACPI PM1a control block.

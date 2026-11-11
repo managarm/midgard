@@ -1,8 +1,9 @@
-//! The guest's legacy PC devices on I/O ports: the 16550A UART and the ACPI PM1 blocks.
-//! Their registers are byte-wide; [`read_bytes`] and [`write_bytes`] split wider
-//! accesses.
+//! The guest's legacy PC devices on I/O ports: the 16550A UART, the CMOS RTC and the
+//! ACPI PM1 blocks. Their registers are byte-wide; [`read_bytes`] and [`write_bytes`]
+//! split wider accesses.
 
 pub(crate) mod pm1;
+pub(crate) mod rtc;
 pub(crate) mod serial;
 
 /// Reads `size` bytes at `offset` of a device with `len` byte-wide registers, one
