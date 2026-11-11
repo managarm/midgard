@@ -38,8 +38,8 @@ pub(crate) struct Board {
     hypervisor: Hypervisor,
     pub(crate) memory: GuestMemory,
     pub(crate) num_cpus: u32,
-    /// The TSC frequency in Hz.
-    pub(crate) tsc_hz: u64,
+    /// What kvmclock tells the guest.
+    pub(crate) timebase: vcpu::Timebase,
     serial: Mutex<Serial>,
     /// The level of the serial port's interrupt line.
     serial_irq: AtomicBool,
@@ -64,7 +64,7 @@ impl Board {
     pub(crate) fn new(
         memory: GuestMemory,
         num_cpus: u32,
-        tsc_hz: u64,
+        timebase: vcpu::Timebase,
         hypervisor: Hypervisor,
         console: ConsoleOutput,
         virtio: Vec<Transport>,
@@ -74,7 +74,7 @@ impl Board {
             hypervisor,
             memory,
             num_cpus,
-            tsc_hz,
+            timebase,
             serial: Mutex::new(Serial::new(console)),
             serial_irq: AtomicBool::new(false),
             serial_drained: Event::new(),

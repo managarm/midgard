@@ -465,7 +465,7 @@ pub fn start(
     let board = Arc::new(Board::new(
         memory,
         config.cpus,
-        tsc_hz,
+        vcpu::Timebase::new(tsc_hz),
         hypervisor,
         console,
         devices.list.into_transports(),
