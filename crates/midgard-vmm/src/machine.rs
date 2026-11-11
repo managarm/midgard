@@ -27,7 +27,7 @@ use crate::virtio::fs::{self, VirtioFs};
 use crate::virtio::net::VirtioNet;
 use crate::virtio::vsock::{Vsock, VsockListener, VsockStream};
 use crate::virtio::{DeviceList, DeviceRef};
-use crate::{acpi, boot, clock, platform, vcpu, virtio};
+use crate::{acpi, boot, platform, vcpu, virtio};
 
 /// Kernel parameters that every guest needs (unless the configuration replaces them);
 /// the console and the virtio devices are added.
@@ -454,10 +454,9 @@ pub fn start(
     let cmdline = kernel_cmdline(config, &devices);
     let (kernel, initrd) = load_images(config)?;
 
-    let tsc_hz = clock::calibrate();
-    log!("TSC runs at {} kHz", tsc_hz / 1000);
-
     let (hypervisor, memory) = midgard_hv::create(config.memory)?;
+    let tsc_hz = hypervisor.tsc_hz()?;
+    log!("TSC runs at {} kHz", tsc_hz / 1000);
     let entry = boot::load(&memory, &kernel, initrd.as_deref(), &cmdline)?;
     drop((kernel, initrd));
     acpi::write(&memory, platform::ACPI_TABLES, config.cpus)
@@ -466,7 +465,7 @@ pub fn start(
     let board = Arc::new(Board::new(
         memory,
         config.cpus,
-        tsc_hz,
+        vcpu::Timebase::new(tsc_hz),
         hypervisor,
         console,
         devices.list.into_transports(),

@@ -29,6 +29,7 @@ const KVM_FEATURES_LEAF: u32 = 0x4000_0001;
 const KVM_FEATURE_CLOCKSOURCE: u32 = 1 << 0;
 const KVM_FEATURE_NOP_IO_DELAY: u32 = 1 << 1;
 const KVM_FEATURE_CLOCKSOURCE2: u32 = 1 << 3;
+const KVM_FEATURE_CLOCKSOURCE_STABLE_BIT: u32 = 1 << 24;
 
 const fn bits(list: &[u32]) -> u32 {
     let mut mask = 0;
@@ -223,7 +224,10 @@ fn emulate(leaf: u32, subleaf: u32, apic_id: u32, num_cpus: u32) -> [u32; 4] {
             [KVM_FEATURES_LEAF, word(0), word(4), word(8)]
         }
         KVM_FEATURES_LEAF => [
-            KVM_FEATURE_CLOCKSOURCE | KVM_FEATURE_NOP_IO_DELAY | KVM_FEATURE_CLOCKSOURCE2,
+            KVM_FEATURE_CLOCKSOURCE
+                | KVM_FEATURE_NOP_IO_DELAY
+                | KVM_FEATURE_CLOCKSOURCE2
+                | KVM_FEATURE_CLOCKSOURCE_STABLE_BIT,
             0,
             0,
             0,

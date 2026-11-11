@@ -17,6 +17,7 @@ mod cpuid;
 mod kvmclock;
 
 use kvmclock::Kvmclock;
+pub(crate) use kvmclock::Timebase;
 
 /// KVM's hypercall error for unknown hypercalls.
 const KVM_ENOSYS: i64 = -1000;
@@ -51,7 +52,7 @@ impl Vcpu {
             .hypervisor()
             .create_vcpu(id, &cpuid::table(id, board.num_cpus))?;
         board.add_kicker(backend.kicker());
-        let kvmclock = Kvmclock::new(board.tsc_hz);
+        let kvmclock = Kvmclock::new();
         Ok(Self {
             id,
             backend,
@@ -91,11 +92,7 @@ impl Vcpu {
             Exit::Wrmsr { index, value } => Handled::Complete(self.wrmsr(index, value)?),
             // E.g., a signal interrupted the run, or the VM stops.
             Exit::Kicked if self.board.stopping() => Handled::Stop(Stop::Requested),
-            Exit::Kicked => {
-                // A failure was reported when the guest set the MSR.
-                let _ = self.kvmclock.update(&self.board.memory);
-                Handled::Continue
-            }
+            Exit::Kicked => Handled::Continue,
             Exit::Shutdown => {
                 log!("vCPU {}: triple fault", self.id);
                 Handled::Stop(Stop::Reset)
@@ -246,14 +243,19 @@ impl Vcpu {
             // We do not offset the TSC.
             msr::TSC => true,
             msr::KVM_SYSTEM_TIME | msr::KVM_SYSTEM_TIME_NEW => {
-                if let Err(error) = self.kvmclock.set_msr(&self.board.memory, value) {
+                if let Err(error) =
+                    self.kvmclock
+                        .set_msr(&self.board.memory, &self.board.timebase, value)
+                {
                     log!("vCPU {}: kvmclock: {error}", self.id);
                 }
                 true
             }
             msr::KVM_WALL_CLOCK | msr::KVM_WALL_CLOCK_NEW => {
                 self.msrs.insert(index, value);
-                if let Err(error) = kvmclock::write_wall_clock(&self.board.memory, value) {
+                if let Err(error) =
+                    kvmclock::write_wall_clock(&self.board.memory, &self.board.timebase, value)
+                {
                     log!("vCPU {}: wall clock: {error}", self.id);
                 }
                 true
