@@ -1,9 +1,9 @@
 //! A backend for Linux' KVM API, for developing midgard on Linux.
 //!
-//! KVM runs with its in-kernel irqchip (local APICs, the I/O APIC and the 8259 PICs,
-//! which Hel does not have, but Linux masks them) and with an MSR filter that sends all
-//! MSR accesses except the local APIC's to midgard. KVM's model is close to Hel's (see
-//! [`crate`]):
+//! KVM runs with a split irqchip, like Hel: the local APICs are in the kernel, the I/O
+//! APIC is [`Ioapic`] (whose interrupts we send as MSIs) and there are no 8259 PICs. An
+//! MSR filter sends all MSR accesses except the local APIC's to midgard. KVM's model is
+//! close to Hel's (see [`crate`]):
 //! - KVM completes I/O, MMIO and MSR instructions on the next KVM_RUN, with the data in
 //!   `kvm_run`; we put the [`Completion`] there.
 //! - KVM decodes MMIO instructions; we pass the decoded access on.
@@ -15,16 +15,18 @@ use std::sync::{Arc, Mutex, Once};
 
 use anyhow::{Context, Result, bail};
 use kvm_bindings::{
-    CpuId, KVM_CPUID_FLAG_SIGNIFCANT_INDEX, KVM_MAX_CPUID_ENTRIES, KVM_MSR_EXIT_REASON_FILTER,
-    KVM_MSR_EXIT_REASON_INVAL, KVM_MSR_EXIT_REASON_UNKNOWN, KVM_VCPU_TSC_CTRL, KVM_VCPU_TSC_OFFSET,
-    Msrs as KvmMsrs, kvm_cpuid_entry2, kvm_device_attr, kvm_dtable, kvm_enable_cap, kvm_msr_entry,
+    CpuId, KVM_CPUID_FLAG_SIGNIFCANT_INDEX, KVM_IRQ_ROUTING_MSI, KVM_MAX_CPUID_ENTRIES,
+    KVM_MSR_EXIT_REASON_FILTER, KVM_MSR_EXIT_REASON_INVAL, KVM_MSR_EXIT_REASON_UNKNOWN,
+    KVM_VCPU_TSC_CTRL, KVM_VCPU_TSC_OFFSET, KvmIrqRouting, Msrs as KvmMsrs, kvm_cpuid_entry2,
+    kvm_device_attr, kvm_dtable, kvm_enable_cap, kvm_irq_routing_entry, kvm_msi, kvm_msr_entry,
     kvm_regs, kvm_run, kvm_segment, kvm_userspace_memory_region, kvm_xcrs,
 };
 use kvm_ioctls::{
     Cap, Kvm, MsrFilterDefaultAction, MsrFilterRange, MsrFilterRangeFlags, VcpuExit, VcpuFd, VmFd,
 };
 
-use crate::x86::{LAPIC_BASE, cpuid, msr};
+use crate::ioapic::{self, Interrupt, Ioapic};
+use crate::x86::{IOAPIC_BASE, LAPIC_BASE, cpuid, msr};
 use crate::{
     BasicRegs, Completion, CpuidEntry, DescriptorTable, Exit, GuestMemory, HypervisorOps,
     KickerOps, Msrs, RESERVED_BASE, Regs, Segment, VcpuOps,
@@ -45,6 +47,17 @@ vmm_sys_util::ioctl_io_nr!(KVM_GET_TSC_KHZ, kvm_bindings::KVMIO, 0xA3);
 const KVM_IDENTITY_MAP: u64 = RESERVED_BASE;
 const KVM_TSS: u64 = RESERVED_BASE + 0x1000;
 const _: () = assert!(KVM_TSS + 0x3000 <= RESERVED_BASE + crate::RESERVED_SIZE);
+
+/// The I/O APIC's MMIO window.
+const IOAPIC_SIZE: u64 = 0x100;
+
+// The MSI address and data of an interrupt from the I/O APIC.
+const MSI_ADDRESS_BASE: u32 = 0xFEE0_0000;
+const MSI_ADDRESS_DESTINATION_SHIFT: u32 = 12;
+const MSI_ADDRESS_LOGICAL: u32 = 1 << 2;
+const MSI_DATA_LOWEST_PRIORITY: u32 = 1 << 8;
+const MSI_DATA_ASSERT: u32 = 1 << 14;
+const MSI_DATA_LEVEL: u32 = 1 << 15;
 
 /// Like on Hel, the local APIC starts in x2APIC mode at the default base.
 const APIC_BASE_X2APIC: u64 = LAPIC_BASE | msr::APIC_BASE_ENABLE | msr::APIC_BASE_EXTD;
@@ -110,16 +123,132 @@ impl Drop for Mapping {
 pub const MAX_VCPUS: u32 = u32::MAX;
 
 pub struct Hypervisor {
-    vm: VmFd,
+    vm: Arc<VmFd>,
+    interrupts: Arc<Interrupts>,
     supported_cpuid: Vec<kvm_cpuid_entry2>,
     /// Declared after `vm`, such that the VM is destroyed first.
     mapping: Arc<Mapping>,
 }
 
+/// The MSI address and data of `interrupt`.
+fn msi(interrupt: &Interrupt) -> (u32, u32) {
+    let mut address =
+        MSI_ADDRESS_BASE | u32::from(interrupt.destination) << MSI_ADDRESS_DESTINATION_SHIFT;
+    if interrupt.logical {
+        address |= MSI_ADDRESS_LOGICAL;
+    }
+    let mut data = u32::from(interrupt.vector) | MSI_DATA_ASSERT;
+    if interrupt.lowest_priority {
+        data |= MSI_DATA_LOWEST_PRIORITY;
+    }
+    if interrupt.level {
+        data |= MSI_DATA_LEVEL;
+    }
+    (address, data)
+}
+
+/// The I/O APIC and the VM whose local APICs its interrupts go to.
+struct Interrupts {
+    vm: Arc<VmFd>,
+    state: Mutex<IoapicState>,
+}
+
+struct IoapicState {
+    ioapic: Ioapic,
+    /// The MSIs of the level-triggered pins, which KVM has routes for (GSI n is pin n):
+    /// they tell KVM which vectors' EOIs to report (as KVM_EXIT_IOAPIC_EOI).
+    routes: Vec<(u32, (u32, u32))>,
+}
+
+impl Interrupts {
+    /// Sends an interrupt that the I/O APIC returned.
+    // Delivery after dropping the lock is like a message in flight on hardware: Remote IRR
+    // stays set until the EOI, and guests do not change the vector before (Linux checks it).
+    fn raise(&self, interrupt: Option<Interrupt>) -> Result<()> {
+        let Some(interrupt) = interrupt else {
+            return Ok(());
+        };
+        let (address_lo, data) = msi(&interrupt);
+        let msi = kvm_msi {
+            address_lo,
+            data,
+            ..Default::default()
+        };
+        self.vm
+            .signal_msi(msi)
+            .with_context(|| format!("KVM_SIGNAL_MSI for vector {:#x} failed", interrupt.vector))?;
+        Ok(())
+    }
+
+    fn set_irq(&self, pin: usize, level: bool) -> Result<()> {
+        let interrupt = self.state.lock().unwrap().ioapic.set_irq(pin, level);
+        self.raise(interrupt)
+    }
+
+    fn eoi(&self, vector: u8) -> Result<()> {
+        let interrupt = self.state.lock().unwrap().ioapic.eoi(vector);
+        self.raise(interrupt)
+    }
+
+    /// Reads from the I/O APIC's registers, which are 32 bits wide; narrower reads see
+    /// the low bits.
+    fn read(&self, offset: u64) -> u64 {
+        let value = self.state.lock().unwrap().ioapic.read(offset & !3);
+        u64::from(value) >> (8 * (offset & 3))
+    }
+
+    /// Writes to the I/O APIC's registers. Narrower or unaligned writes are ignored
+    /// (their effect is undefined).
+    fn write(&self, offset: u64, size: usize, value: u64) -> Result<()> {
+        if offset & 3 != 0 || size < 4 {
+            return Ok(());
+        }
+        let mut state = self.state.lock().unwrap();
+        let interrupt = state.ioapic.write(offset, value as u32);
+        self.update_routes(&mut state)?;
+        drop(state);
+        self.raise(interrupt)
+    }
+
+    /// Updates KVM's routes after a redirection entry might have changed.
+    fn update_routes(&self, state: &mut IoapicState) -> Result<()> {
+        let routes: Vec<_> = (0..ioapic::NUM_PINS)
+            .filter_map(|pin| Some((pin as u32, state.ioapic.redirection(pin)?)))
+            .filter(|(_, interrupt)| interrupt.level)
+            .map(|(pin, interrupt)| (pin, msi(&interrupt)))
+            .collect();
+        if routes == state.routes {
+            return Ok(());
+        }
+        let entries: Vec<_> = routes
+            .iter()
+            .map(|&(gsi, (address, data))| {
+                let mut entry = kvm_irq_routing_entry {
+                    gsi,
+                    type_: KVM_IRQ_ROUTING_MSI,
+                    ..Default::default()
+                };
+                entry.u.msi.address_lo = address;
+                entry.u.msi.data = data;
+                entry
+            })
+            .collect();
+        let routing = KvmIrqRouting::from_entries(&entries)
+            .map_err(|error| anyhow::anyhow!("bad routing table: {error:?}"))?;
+        self.vm
+            .set_gsi_routing(&routing)
+            .context("KVM_SET_GSI_ROUTING failed")?;
+        state.routes = routes;
+        Ok(())
+    }
+}
+
 pub(crate) fn create(memory_size: u64) -> Result<(Hypervisor, GuestMemory)> {
     let kvm = Kvm::new().context("failed to open /dev/kvm")?;
     for cap in [
-        Cap::Irqchip,
+        Cap::SplitIrqchip,
+        Cap::SignalMsi,
+        Cap::IrqRouting,
         Cap::TscDeadlineTimer,
         Cap::X86UserSpaceMsr,
         Cap::X86MsrFilter,
@@ -133,9 +262,16 @@ pub(crate) fn create(memory_size: u64) -> Result<(Hypervisor, GuestMemory)> {
         .context("KVM_SET_TSS_ADDR failed")?;
     vm.set_identity_map_address(KVM_IDENTITY_MAP)
         .context("KVM_SET_IDENTITY_MAP_ADDR failed")?;
-    // The local APICs and the I/O APIC (and PICs) are in the kernel, as on Hel. This must
-    // happen before vCPUs are created; then the APs wait for INIT / SIPI.
-    vm.create_irq_chip().context("KVM_CREATE_IRQCHIP failed")?;
+    // The local APICs are in the kernel, as on Hel, with GSIs for the I/O APIC's pins
+    // (whose routes say which EOIs to report). This must happen before vCPUs are
+    // created; then the APs wait for INIT / SIPI.
+    let mut cap = kvm_enable_cap {
+        cap: kvm_bindings::KVM_CAP_SPLIT_IRQCHIP,
+        ..Default::default()
+    };
+    cap.args[0] = ioapic::NUM_PINS as u64;
+    vm.enable_cap(&cap)
+        .context("enabling the split irqchip failed")?;
     // MSR accesses go to us, except for the local APIC's: the filter denies everything
     // else, and accesses that KVM cannot handle exit, too.
     let mut cap = kvm_enable_cap {
@@ -183,9 +319,18 @@ pub(crate) fn create(memory_size: u64) -> Result<(Hypervisor, GuestMemory)> {
         .as_slice()
         .to_vec();
     install_kick_handler();
+    let vm = Arc::new(vm);
+    let interrupts = Arc::new(Interrupts {
+        vm: vm.clone(),
+        state: Mutex::new(IoapicState {
+            ioapic: Ioapic::new(),
+            routes: Vec::new(),
+        }),
+    });
     Ok((
         Hypervisor {
             vm,
+            interrupts,
             supported_cpuid,
             mapping,
         },
@@ -277,16 +422,17 @@ impl HypervisorOps for Hypervisor {
         Ok(Vcpu {
             fd,
             kicker,
+            interrupts: self.interrupts.clone(),
             incomplete: None,
             _mapping: self.mapping.clone(),
         })
     }
 
     fn set_irq_line(&self, pin: u32, level: bool) -> Result<()> {
-        // The default routing connects GSI n to pin n of the I/O APIC (and of the PICs).
-        self.vm
-            .set_irq_line(pin, level)
-            .with_context(|| format!("KVM_IRQ_LINE for pin {pin} failed"))
+        if pin as usize >= ioapic::NUM_PINS {
+            bail!("I/O APIC pin {pin} does not exist");
+        }
+        self.interrupts.set_irq(pin as usize, level)
     }
 
     fn tsc_hz(&self) -> Result<u64> {
@@ -386,6 +532,7 @@ impl Drop for Running<'_> {
 pub struct Vcpu {
     fd: VcpuFd,
     kicker: Arc<KickState>,
+    interrupts: Arc<Interrupts>,
     /// The instruction that waits for a [`Completion`].
     incomplete: Option<Incomplete>,
     /// Declared after `fd`, such that the vCPU (and thus maybe the VM) is destroyed first.
@@ -465,8 +612,28 @@ impl Vcpu {
             Err(error) if error.errno() == libc::EAGAIN => return Ok(None),
             Err(error) => return Err(error).context("KVM_RUN failed"),
         };
+        let is_ioapic = |address| (IOAPIC_BASE..IOAPIC_BASE + IOAPIC_SIZE).contains(&address);
         let (incomplete, exit) = match exit {
             VcpuExit::IrqWindowOpen => return Ok(None),
+            // We emulate the I/O APIC here; KVM completes the access on the next run.
+            VcpuExit::MmioRead(address, data) if is_ioapic(address) => {
+                let value = self.interrupts.read(address - IOAPIC_BASE).to_le_bytes();
+                let size = data.len().min(8);
+                data[..size].copy_from_slice(&value[..size]);
+                return Ok(None);
+            }
+            VcpuExit::MmioWrite(address, data) if is_ioapic(address) => {
+                let mut bytes = [0u8; 8];
+                let size = data.len().min(8);
+                bytes[..size].copy_from_slice(&data[..size]);
+                let value = u64::from_le_bytes(bytes);
+                self.interrupts.write(address - IOAPIC_BASE, size, value)?;
+                return Ok(None);
+            }
+            VcpuExit::IoapicEoi(vector) => {
+                self.interrupts.eoi(vector)?;
+                return Ok(None);
+            }
             VcpuExit::IoIn(port, data) => {
                 let size = data.len() as u8;
                 // SAFETY: The exit reason is KVM_EXIT_IO.

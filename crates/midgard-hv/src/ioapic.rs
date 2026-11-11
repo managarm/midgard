@@ -1,7 +1,7 @@
-//! An I/O APIC (24 pins) for backends whose hypervisor only emulates the local APIC
-//! (Hel). Its interrupts go to the local APIC of the only vCPU: the backend raises the
-//! [`Interrupt`]s that this model returns, and reports the EOIs of level-triggered
-//! interrupts back to it.
+//! An I/O APIC (24 pins) for backends whose hypervisor only emulates the local APICs
+//! (Hel, and KVM with a split irqchip): the backend sends the [`Interrupt`]s that this
+//! model returns to the local APICs, and reports the EOIs of level-triggered interrupts
+//! back to it.
 
 /// The number of pins.
 pub(crate) const NUM_PINS: usize = 24;
@@ -16,10 +16,13 @@ const VERSION: u32 = 0x11 | ((NUM_PINS as u32 - 1) << 16);
 // Redirection table entry bits.
 const RTE_VECTOR: u64 = 0xFF;
 const RTE_DELIVERY_MODE: u64 = 7 << 8;
+const RTE_LOWEST_PRIORITY: u64 = 1 << 8;
+const RTE_LOGICAL: u64 = 1 << 11;
 const RTE_DELIVERY_STATUS: u64 = 1 << 12;
 const RTE_REMOTE_IRR: u64 = 1 << 14;
 const RTE_LEVEL: u64 = 1 << 15;
 const RTE_MASKED: u64 = 1 << 16;
+const RTE_DESTINATION_SHIFT: u32 = 56;
 const RTE_READ_ONLY: u64 = RTE_DELIVERY_STATUS | RTE_REMOTE_IRR;
 
 /// An interrupt for the local APIC.
@@ -28,6 +31,11 @@ pub(crate) struct Interrupt {
     pub(crate) vector: u8,
     /// Level-triggered: the guest's EOI needs to reach [`Ioapic::eoi`].
     pub(crate) level: bool,
+    /// The local APIC ID (or, in logical mode, the logical destination).
+    pub(crate) destination: u8,
+    pub(crate) logical: bool,
+    /// Lowest priority instead of fixed delivery.
+    pub(crate) lowest_priority: bool,
 }
 
 pub(crate) struct Ioapic {
@@ -151,24 +159,35 @@ impl Ioapic {
         }
     }
 
-    /// Sends the pin's interrupt unless it is masked or (level-triggered) in service.
-    fn service(&mut self, pin: usize) -> Option<Interrupt> {
+    /// The interrupt that the pin sends (when its level says so), unless it is masked.
+    pub(crate) fn redirection(&self, pin: usize) -> Option<Interrupt> {
         let entry = self.redirection[pin];
         let vector = (entry & RTE_VECTOR) as u8;
-        let level = entry & RTE_LEVEL != 0;
         // Fixed and lowest priority interrupts; the others (SMI, NMI, INIT and ExtINT) and
         // vectors that the local APIC rejects are not supported.
         let fixed = (entry & RTE_DELIVERY_MODE) >> 8 <= 1;
         if entry & RTE_MASKED != 0 || !fixed || vector < 16 {
             return None;
         }
-        if level {
-            if entry & RTE_REMOTE_IRR != 0 {
+        Some(Interrupt {
+            vector,
+            level: entry & RTE_LEVEL != 0,
+            destination: (entry >> RTE_DESTINATION_SHIFT) as u8,
+            logical: entry & RTE_LOGICAL != 0,
+            lowest_priority: entry & RTE_DELIVERY_MODE == RTE_LOWEST_PRIORITY,
+        })
+    }
+
+    /// Sends the pin's interrupt unless it is masked or (level-triggered) in service.
+    fn service(&mut self, pin: usize) -> Option<Interrupt> {
+        let interrupt = self.redirection(pin)?;
+        if interrupt.level {
+            if self.redirection[pin] & RTE_REMOTE_IRR != 0 {
                 return None;
             }
             self.redirection[pin] |= RTE_REMOTE_IRR;
         }
-        Some(Interrupt { vector, level })
+        Some(interrupt)
     }
 }
 
@@ -179,6 +198,16 @@ mod tests {
     fn program(ioapic: &mut Ioapic, pin: usize, low: u32) -> Option<Interrupt> {
         ioapic.write(IOREGSEL, 0x10 + 2 * pin as u32);
         ioapic.write(IOWIN, low)
+    }
+
+    fn interrupt(vector: u8, level: bool) -> Interrupt {
+        Interrupt {
+            vector,
+            level,
+            destination: 0,
+            logical: false,
+            lowest_priority: false,
+        }
     }
 
     fn entry(ioapic: &mut Ioapic, pin: usize) -> u32 {
@@ -200,10 +229,7 @@ mod tests {
     fn edge() {
         let mut ioapic = Ioapic::new();
         assert_eq!(program(&mut ioapic, 4, 0x30), None);
-        let interrupt = Interrupt {
-            vector: 0x30,
-            level: false,
-        };
+        let interrupt = interrupt(0x30, false);
         assert_eq!(ioapic.set_irq(4, true), Some(interrupt));
         // Only rising edges interrupt.
         assert_eq!(ioapic.set_irq(4, true), None);
@@ -216,10 +242,7 @@ mod tests {
         let mut ioapic = Ioapic::new();
         let low = 0x31 | RTE_LEVEL as u32;
         program(&mut ioapic, 9, low);
-        let interrupt = Interrupt {
-            vector: 0x31,
-            level: true,
-        };
+        let interrupt = interrupt(0x31, true);
         assert_eq!(ioapic.set_irq(9, true), Some(interrupt));
         // In service until the EOI.
         assert_eq!(ioapic.set_irq(9, true), None);
@@ -240,11 +263,28 @@ mod tests {
         let low = 0x32 | RTE_LEVEL as u32;
         program(&mut ioapic, 13, low | RTE_MASKED as u32);
         assert_eq!(ioapic.set_irq(13, true), None);
+        assert_eq!(program(&mut ioapic, 13, low), Some(interrupt(0x32, true)));
+    }
+
+    #[test]
+    fn destination() {
+        let mut ioapic = Ioapic::new();
+        // Lowest priority, logical destination 0x0C (in the high half).
+        program(
+            &mut ioapic,
+            7,
+            0x33 | (RTE_LOWEST_PRIORITY | RTE_LOGICAL) as u32,
+        );
+        ioapic.write(IOREGSEL, 0x10 + 2 * 7 + 1);
+        ioapic.write(IOWIN, 0x0C00_0000);
         assert_eq!(
-            program(&mut ioapic, 13, low),
+            ioapic.set_irq(7, true),
             Some(Interrupt {
-                vector: 0x32,
-                level: true
+                vector: 0x33,
+                level: false,
+                destination: 0x0C,
+                logical: true,
+                lowest_priority: true,
             })
         );
     }
