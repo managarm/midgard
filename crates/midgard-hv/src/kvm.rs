@@ -4,7 +4,7 @@
 //! which Hel does not have, but Linux masks them) and with an MSR filter that sends all
 //! MSR accesses except the local APIC's to midgard. KVM's model is close to Hel's (see
 //! [`crate`]):
-//! - KVM completes I/O and MSR instructions on the next KVM_RUN, with the data in
+//! - KVM completes I/O, MMIO and MSR instructions on the next KVM_RUN, with the data in
 //!   `kvm_run`; we put the [`Completion`] there.
 //! - KVM decodes MMIO instructions; we pass the decoded access on.
 //! - KVM gets the CPUID table when the vCPU is created.
@@ -27,7 +27,7 @@ use kvm_ioctls::{
 use crate::x86::{LAPIC_BASE, cpuid, msr};
 use crate::{
     BasicRegs, Completion, CpuidEntry, DescriptorTable, Exit, GuestMemory, HypervisorOps,
-    KickerOps, MmioAccess, Msrs, RESERVED_BASE, Regs, Segment, VcpuOps,
+    KickerOps, Msrs, RESERVED_BASE, Regs, Segment, VcpuOps,
 };
 
 // kvm-ioctls only wraps KVM_SET_DEVICE_ATTR for vCPUs on aarch64.
@@ -278,7 +278,6 @@ impl HypervisorOps for Hypervisor {
             fd,
             kicker,
             incomplete: None,
-            mmio_read: None,
             _mapping: self.mapping.clone(),
         })
     }
@@ -389,8 +388,6 @@ pub struct Vcpu {
     kicker: Arc<KickState>,
     /// The instruction that waits for a [`Completion`].
     incomplete: Option<Incomplete>,
-    /// The size of an MMIO read that midgard completes.
-    mmio_read: Option<u8>,
     /// Declared after `fd`, such that the vCPU (and thus maybe the VM) is destroyed first.
     _mapping: Arc<Mapping>,
 }
@@ -400,6 +397,8 @@ pub struct Vcpu {
 enum Incomplete {
     In { size: u8 },
     Out,
+    MmioRead { size: u8 },
+    MmioWrite,
     Msr,
 }
 
@@ -429,9 +428,17 @@ impl Vcpu {
                     std::ptr::copy_nonoverlapping(bytes.as_ptr(), data, size as usize);
                 }
             }
-            (Incomplete::Out, Completion::Done(_)) => {}
+            (Incomplete::MmioRead { size }, Completion::Done(value)) => {
+                // SAFETY: The last exit was KVM_EXIT_MMIO.
+                let mmio = unsafe { &mut run.__bindgen_anon_1.mmio };
+                mmio.data[..size as usize].copy_from_slice(&value.to_le_bytes()[..size as usize]);
+            }
+            (Incomplete::Out | Incomplete::MmioWrite, Completion::Done(_)) => {}
             (Incomplete::In { .. } | Incomplete::Out, Completion::Fault) => {
                 bail!("faulting port I/O is not supported")
+            }
+            (Incomplete::MmioRead { .. } | Incomplete::MmioWrite, Completion::Fault) => {
+                bail!("faulting MMIO is not supported")
             }
             (Incomplete::Msr, completion) => {
                 // SAFETY: The last exit was KVM_EXIT_X86_RDMSR / KVM_EXIT_X86_WRMSR. KVM
@@ -490,35 +497,25 @@ impl Vcpu {
             }
             VcpuExit::MmioRead(address, data) => {
                 let size = data.len() as u8;
-                self.mmio_read = Some(size);
-                let access = MmioAccess {
-                    write: false,
+                let exit = Exit::Mmio {
+                    address,
                     size,
+                    write: false,
                     data: 0,
                 };
-                (
-                    None,
-                    Exit::Mmio {
-                        address,
-                        access: Some(access),
-                    },
-                )
+                (Some(Incomplete::MmioRead { size }), exit)
             }
             VcpuExit::MmioWrite(address, data) => {
                 let mut bytes = [0u8; 8];
-                bytes[..data.len().min(8)].copy_from_slice(&data[..data.len().min(8)]);
-                let access = MmioAccess {
+                let size = data.len().min(8);
+                bytes[..size].copy_from_slice(&data[..size]);
+                let exit = Exit::Mmio {
+                    address,
+                    size: size as u8,
                     write: true,
-                    size: data.len() as u8,
                     data: u64::from_le_bytes(bytes),
                 };
-                (
-                    None,
-                    Exit::Mmio {
-                        address,
-                        access: Some(access),
-                    },
-                )
+                (Some(Incomplete::MmioWrite), exit)
             }
             VcpuExit::X86Rdmsr(exit) => (Some(Incomplete::Msr), Exit::Rdmsr { index: exit.index }),
             VcpuExit::X86Wrmsr(exit) => (
@@ -764,23 +761,6 @@ impl VcpuOps for Vcpu {
         xcrs.xcrs[0].xcr = 0;
         xcrs.xcrs[0].value = m.xcr0;
         self.fd.set_xcrs(&xcrs).context("KVM_SET_XCRS failed")
-    }
-
-    fn kernel_mmio(&mut self, _address: u64, _write: Option<u32>) -> Result<Option<u32>> {
-        // KVM handles the accesses to its devices itself.
-        Ok(None)
-    }
-
-    fn complete_mmio_read(&mut self, value: u64) -> Result<()> {
-        let Some(size) = self.mmio_read.take() else {
-            bail!("no MMIO read to complete");
-        };
-        let bytes = value.to_le_bytes();
-        // SAFETY: The last exit was KVM_EXIT_MMIO; KVM completes the instruction with this
-        // data on the next KVM_RUN.
-        let mmio = unsafe { &mut self.kvm_run().__bindgen_anon_1.mmio };
-        mmio.data[..size as usize].copy_from_slice(&bytes[..size as usize]);
-        Ok(())
     }
 
     fn kicker(&self) -> Kicker {

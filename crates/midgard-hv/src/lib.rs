@@ -2,7 +2,7 @@
 //!
 //! The model is Hel's (thor's virtualization API): the hypervisor emulates the local
 //! APICs (including HLT, IPIs and INIT / SIPI), the I/O APIC and CPUID (from a table).
-//! Exits report *what* the guest did; port I/O, MSR and hypercall exits leave the
+//! Exits report *what* the guest did; port I/O, MMIO, MSR and hypercall exits leave the
 //! instruction unfinished until the next run completes it (see [`Completion`]). A kick
 //! makes the running (or next) run return. Other backends (KVM, for development on
 //! Linux) translate to this model.
@@ -203,16 +203,6 @@ impl Msrs {
     }
 }
 
-/// An MMIO access that the backend already decoded (KVM decodes MMIO instructions in
-/// the kernel; Hel does not).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MmioAccess {
-    pub write: bool,
-    pub size: u8,
-    /// The written value.
-    pub data: u64,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Exit {
     /// Port I/O (needs a [`Completion`]; for IN, its value is the result). `data` is the
@@ -224,12 +214,14 @@ pub enum Exit {
         string: bool,
         data: u32,
     },
-    /// An access to guest-physical memory that is not RAM. Without `access`, the VMM
-    /// decodes the instruction (and skips it); with it, the backend completes the
-    /// instruction (see [`Vcpu::complete_mmio_read`]).
+    /// An access to guest-physical memory that is not RAM and not a device of the
+    /// backend (needs a [`Completion`]; for a read, its value is the result). `size` is
+    /// 1, 2, 4 or 8 bytes; `data` is the written value (of `size` bytes).
     Mmio {
         address: u64,
-        access: Option<MmioAccess>,
+        size: u8,
+        write: bool,
+        data: u64,
     },
     /// RDMSR (needs a [`Completion`] with the value).
     Rdmsr { index: u32 },
@@ -246,8 +238,8 @@ pub enum Exit {
     Failed(String),
 }
 
-/// Finishes an instruction that exited (I/O, MSR and hypercall exits): the next run
-/// either completes it or makes it raise #GP(0).
+/// Finishes an instruction that exited (I/O, MMIO, MSR and hypercall exits): the next run
+/// either completes it or makes it raise #GP(0) (which port I/O and MMIO do not support).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Completion {
     /// The instruction completes with this result (if it has one).
@@ -280,12 +272,6 @@ backend! {
         fn set_regs(&mut self, regs: &Regs) -> Result<()>;
         fn msrs(&mut self) -> Result<Msrs>;
         fn set_msrs(&mut self, msrs: &Msrs) -> Result<()>;
-        /// Accesses a 32-bit register of an in-kernel device (the local APIC in xAPIC
-        /// mode or the I/O APIC) for an MMIO exit that the VMM decoded; `write` is the
-        /// value to write. Returns None if no in-kernel device is at `address`.
-        fn kernel_mmio(&mut self, address: u64, write: Option<u32>) -> Result<Option<u32>>;
-        /// Provides the result of a decoded MMIO read ([`Exit::Mmio`] with an access).
-        fn complete_mmio_read(&mut self, value: u64) -> Result<()>;
         /// The vCPU's kicker (which other threads use while it runs).
         fn kicker(&self) -> Kicker;
     }
