@@ -36,7 +36,8 @@ pub enum Request {
         memory: Option<u64>,
         disk_size: Option<u64>,
     },
-    /// Delete a VM instance, whose VM must not run, and its disk ([`Response::Done`]).
+    /// Delete a VM instance, whose VM must not run, and the disk in its directory
+    /// ([`Response::Done`]; a disk that its settings name elsewhere stays).
     Delete { name: String },
 }
 

@@ -28,7 +28,7 @@ mod platform;
 mod vcpu;
 mod virtio;
 
-pub use machine::{Machine, MachineHandle, Stop, start, validate_memory};
+pub use machine::{Machine, MachineHandle, Stop, start, validate_cpus, validate_memory};
 pub use virtio::vsock::{VsockListener, VsockStream};
 
 /// Disk images on the host (raw and qcow2). The VMM opens them for virtio-block; the

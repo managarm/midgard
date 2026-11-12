@@ -14,7 +14,7 @@ use midgard_protocol::runtime;
 use midgard_protocol::size::format_size;
 use midgard_vmm::image;
 
-use crate::settings::{self, Role, Settings};
+use crate::settings::{self, Role, Settings, Share};
 use crate::template::Template;
 use crate::{log, paths};
 
@@ -78,28 +78,36 @@ impl Instance {
 
     /// The instance's disk.
     pub fn disk(&self) -> PathBuf {
-        self.dir.join(DISK)
+        (self.settings.disk.clone()).unwrap_or_else(|| self.dir.join(DISK))
     }
 
     /// The instance's VM.
     pub fn config(&self) -> MachineConfig {
         MachineConfig {
-            kernel: paths::kernel(),
+            kernel: (self.settings.kernel.clone()).unwrap_or_else(paths::kernel),
             initrd: None,
             agent: Some(paths::agent()),
             cmdline: None,
             append: Vec::new(),
             memory: self.settings.memory.unwrap_or(DEFAULT_MEMORY),
-            cpus: None,
+            cpus: self.settings.cpus,
             console: ConsoleKind::Virtio,
             disks: vec![Disk {
                 path: self.disk(),
                 read_only: false,
             }],
-            network: true,
-            share: Some("/".into()),
+            network: self.settings.network.unwrap_or(true),
+            share: match &self.settings.share {
+                None => Some("/".into()),
+                Some(Share::Nothing) => None,
+                Some(Share::Directory(dir)) => Some(dir.clone()),
+            },
             guest: self.settings.guest.clone(),
-            waypipe: paths::guest_waypipe(),
+            waypipe: if self.settings.gui.unwrap_or(true) {
+                paths::guest_waypipe()
+            } else {
+                None
+            },
         }
     }
 }

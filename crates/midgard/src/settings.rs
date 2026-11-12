@@ -6,6 +6,21 @@
 //! ```toml
 //! # The guest's RAM (default: 1G).
 //! memory = "2G"
+//! # The number of vCPUs (default: the host's CPUs, up to 8).
+//! cpus = 4
+//! # User-mode networking (default: true).
+//! network = true
+//! # The host directory that the guest sees in /mnt/managarm, or false for none
+//! # (default: "/").
+//! share = "/home"
+//! # Wayland forwarding, if midgard runs in a Wayland session and has waypipe (default:
+//! # true).
+//! gui = false
+//! # The guest kernel (default: midgard's).
+//! kernel = "/opt/linux/bzImage"
+//! # The disk (only in instance files; default: the disk in the instance's directory).
+//! # Deleting the instance does not delete it.
+//! disk = "/data/dev.qcow2"
 //!
 //! # About the template.
 //! [template]
@@ -41,6 +56,8 @@
 //! display = "systemd"
 //! ```
 
+use std::path::{Path, PathBuf};
+
 use anyhow::{Context, Result, bail};
 use midgard_protocol::guest::{Display, GuestConfig, Launcher, Ready};
 use midgard_protocol::size::{format_size_exact, parse_size};
@@ -66,8 +83,27 @@ pub struct Settings {
     pub description: Option<String>,
     /// The guest's RAM (in bytes).
     pub memory: Option<u64>,
+    /// The number of vCPUs.
+    pub cpus: Option<u32>,
+    /// User-mode networking.
+    pub network: Option<bool>,
+    /// What the guest sees in [`midgard_protocol::SHARE_MOUNT`].
+    pub share: Option<Share>,
+    /// Wayland forwarding.
+    pub gui: Option<bool>,
+    /// The guest kernel.
+    pub kernel: Option<PathBuf>,
+    /// The disk (instead of the one in the instance's directory).
+    pub disk: Option<PathBuf>,
     /// How the agent sets up the guest.
     pub guest: GuestConfig,
+}
+
+/// What the guest sees in [`midgard_protocol::SHARE_MOUNT`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Share {
+    Nothing,
+    Directory(PathBuf),
 }
 
 /// The contents of a settings file.
@@ -75,6 +111,12 @@ pub struct Settings {
 #[serde(deny_unknown_fields)]
 struct SettingsFile {
     memory: Option<String>,
+    cpus: Option<u32>,
+    network: Option<bool>,
+    share: Option<ShareSetting>,
+    gui: Option<bool>,
+    kernel: Option<PathBuf>,
+    disk: Option<PathBuf>,
     #[serde(default)]
     template: TemplateSettings,
     #[serde(default)]
@@ -100,6 +142,14 @@ struct GuestSettings {
     launcher: Option<LauncherSetting>,
     wrapper: Option<Vec<String>>,
     display: Option<DisplaySetting>,
+}
+
+/// `share`: a directory, or a boolean (true for "/").
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum ShareSetting {
+    Enabled(bool),
+    Directory(PathBuf),
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -209,11 +259,39 @@ fn validate_user(user: &str) -> Result<()> {
     Ok(())
 }
 
+/// Checks that a path in the settings (`key`) is absolute.
+fn absolute(key: &str, path: &Path) -> Result<()> {
+    if !path.is_absolute() {
+        bail!("{key} must be an absolute path (not {path:?})");
+    }
+    Ok(())
+}
+
 /// Parses a settings file.
 pub fn parse(text: &str, role: Role) -> Result<Settings> {
     let file: SettingsFile = toml::from_str(text)?;
     if role == Role::Template && file.template.name.is_some() {
         bail!("[template] name is only for instance files (a template's directory names it)");
+    }
+    if role == Role::Template && file.disk.is_some() {
+        bail!("disk is only for instance files (a template's directory has its disk)");
+    }
+    if let Some(cpus) = file.cpus {
+        midgard_vmm::validate_cpus(cpus).context("invalid cpus")?;
+    }
+    let share = match file.share {
+        None => None,
+        Some(ShareSetting::Enabled(false)) => Some(Share::Nothing),
+        Some(ShareSetting::Enabled(true)) => Some(Share::Directory("/".into())),
+        Some(ShareSetting::Directory(dir)) => {
+            absolute("share", &dir)?;
+            Some(Share::Directory(dir))
+        }
+    };
+    for (key, path) in [("kernel", &file.kernel), ("disk", &file.disk)] {
+        if let Some(path) = path {
+            absolute(key, path)?;
+        }
     }
     let memory = file
         .memory
@@ -229,6 +307,12 @@ pub fn parse(text: &str, role: Role) -> Result<Settings> {
         template: file.template.name,
         description: file.template.description,
         memory,
+        cpus: file.cpus,
+        network: file.network,
+        share,
+        gui: file.gui,
+        kernel: file.kernel,
+        disk: file.disk,
         guest,
     })
 }
@@ -357,6 +441,40 @@ mod tests {
         ] {
             assert!(parse(invalid, Role::Instance).is_err(), "{invalid:?}");
         }
+    }
+
+    #[test]
+    fn machine() {
+        let settings = parse(
+            "cpus = 2\nnetwork = false\nshare = \"/home\"\ngui = false\n\
+             kernel = \"/boot/bzImage\"\ndisk = \"/data/dev.qcow2\"",
+            Role::Instance,
+        )
+        .unwrap();
+        assert_eq!(settings.cpus, Some(2));
+        assert_eq!(settings.network, Some(false));
+        assert_eq!(settings.share, Some(Share::Directory("/home".into())));
+        assert_eq!(settings.gui, Some(false));
+        assert_eq!(settings.kernel, Some("/boot/bzImage".into()));
+        assert_eq!(settings.disk, Some("/data/dev.qcow2".into()));
+        let share = |text: &str| parse(text, Role::Instance).unwrap().share;
+        assert_eq!(share("share = false"), Some(Share::Nothing));
+        assert_eq!(share("share = true"), Some(Share::Directory("/".into())));
+        assert_eq!(share(""), None);
+        for invalid in [
+            "cpus = 0",
+            "cpus = -1",
+            "cpus = 100000",
+            "network = \"yes\"",
+            "share = \"home\"",
+            "share = 1",
+            "kernel = \"bzImage\"",
+            "disk = \"dev.qcow2\"",
+        ] {
+            assert!(parse(invalid, Role::Instance).is_err(), "{invalid:?}");
+        }
+        assert!(parse("kernel = \"/boot/bzImage\"", Role::Template).is_ok());
+        assert!(parse("disk = \"/data/dev.qcow2\"", Role::Template).is_err());
     }
 
     #[test]

@@ -62,11 +62,17 @@ pub fn validate_memory(memory: u64) -> Result<()> {
     Ok(())
 }
 
-/// Checks that midgard can run the VM (with `cpus` vCPUs).
-fn validate(config: &MachineConfig, cpus: u32) -> Result<()> {
+/// Checks that a VM can have `cpus` vCPUs.
+pub fn validate_cpus(cpus: u32) -> Result<()> {
     if cpus == 0 || cpus > max_cpus() {
         bail!("the number of vCPUs must be between 1 and {}", max_cpus());
     }
+    Ok(())
+}
+
+/// Checks that midgard can run the VM (with `cpus` vCPUs).
+fn validate(config: &MachineConfig, cpus: u32) -> Result<()> {
+    validate_cpus(cpus)?;
     validate_memory(config.memory)?;
     if config.agent.is_some() && config.initrd.is_some() {
         bail!("the agent and an initrd are mutually exclusive");
