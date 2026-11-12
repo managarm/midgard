@@ -58,8 +58,9 @@ def publish(directory, run):
             "(pushed or started manually)"
         )
     manifest = {}
+    # (The directory also has what lists the targets: manifest.json and channel.json.)
     for path in sorted(directory.glob("*.json")):
-        if path.name != "manifest.json":
+        if path.stem in targets():
             manifest[path.stem] = read_manifest(directory, path.stem)
     if not manifest:
         raise Failure(f"there are no built targets in {directory}")

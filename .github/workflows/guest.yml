@@ -82,7 +82,11 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: guest-${{ matrix.target }}
-          path: dist/
+          # (Without channel.json, which lists this target only: the artifacts of a run
+          # end up in one directory, see guest/publish.py.)
+          path: |
+            dist/
+            !dist/channel.json
           # (The files are compressed already.)
           compression-level: 0
           if-no-files-found: error

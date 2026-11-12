@@ -24,7 +24,8 @@ built (.github/workflows/guest.yml), from the newest guest release (guest-<date>
 default, from another release or from a workflow run (which needs gh), or those that
 `build` built (--local). `build` builds targets into the output directory (--build-dir of
 `install`), with <target>.json, which lists their files with their SHA-256 and what they
-were built from. `targets` lists the targets (whose inputs changed) as JSON, for CI;
+were built from, and channel.json, which makes the directory a channel that `bifrost pull
+--from <dir>` installs from. `targets` lists the targets (whose inputs changed) as JSON, for CI;
 guest/publish.py publishes the files of a workflow run as a guest release.
 
 Images are built without root: guest/rootfs.py, which creates an image's file system,
@@ -69,6 +70,10 @@ INSTALLED_FROM = "installed-from"
 RELEASE_PREFIX = "guest-"
 # The workflow that builds the targets.
 WORKFLOW = ".github/workflows/guest.yml"
+# The file that lists built targets' files for `bifrost pull`, and its format (see
+# crates/midgard/src/pull.rs).
+CHANNEL_FILE = "channel.json"
+CHANNEL_FORMAT = 1
 # The targets that are no images: what midgard boots the guests with.
 BOOT_TARGETS = ["kernel", "agent", "waypipe"]
 # Where midgard's directory has their files, and the file that says what they are (see
@@ -194,6 +199,42 @@ def write_manifest(out, target, files, extra):
         **extra,
     }
     (out / f"{target}.json").write_text(json.dumps(manifest, indent=2) + "\n")
+
+
+def write_channel(directory, entries, base=""):
+    """Writes channel.json, which makes a directory with targets' files (or the URL `base`
+    that serves them) a channel that `bifrost pull` installs from: the boot targets' files
+    as the boot files linux and the images as templates. `entries` are the targets'
+    manifests."""
+
+    def file(name, sha256):
+        size = (directory / name).stat().st_size
+        return {"url": base + name, "sha256": sha256, "size": size}
+
+    boot = {"files": {}}
+    templates = {}
+    for target, entry in sorted(entries.items()):
+        for name, sha256 in entry["files"].items():
+            if target in BOOT_TARGETS:
+                boot["files"][name] = file(name, sha256)
+            else:
+                about = ["description", "settings", "boot"]
+                about = {key: entry[key] for key in about if key in entry}
+                templates[target] = {**file(name, sha256), **about}
+        if "protocol" in entry:
+            boot["protocol"] = entry["protocol"]
+    channel = {
+        "format": CHANNEL_FORMAT,
+        "boot": {BOOT_FILES.name: boot} if boot["files"] else {},
+        "templates": templates,
+    }
+    (directory / CHANNEL_FILE).write_text(json.dumps(channel, indent=2) + "\n")
+
+
+def built_targets(directory):
+    """The manifests of the targets that were built into a directory."""
+    names = sorted(path.stem for path in directory.glob("*.json"))
+    return {target: read_manifest(directory, target) for target in names if target in targets()}
 
 
 def config_settings(path):
@@ -385,6 +426,13 @@ def build_image(name, out, namespace):
         template.mkdir(exist_ok=True)
         run("zstd", "-q", "-f", "-T0", "-15", "--rm", qcow2, "-o", template / "disk.qcow2.zst")
         shutil.copyfile(recipe / "template.toml", template / "template.toml")
+        settings = load_toml(recipe / "template.toml")
+        # What channel.json says about the template.
+        about = {
+            "description": settings.get("template", {}).get("description"),
+            "settings": settings.get("format", 1),
+            "boot": settings.get("boot-files", BOOT_FILES.name),
+        }
         # (Not compressed again: the disk is compressed already.)
         partial = out / f"{name}.tar.partial"
         with tarfile.open(partial, "w", format=tarfile.PAX_FORMAT) as tar:
@@ -402,7 +450,7 @@ def build_image(name, out, namespace):
             work.rmdir()
         except OSError:
             pass
-    return [f"{name}.tar"], {}
+    return [f"{name}.tar"], {key: value for key, value in about.items() if value is not None}
 
 
 def cmd_build(args):
@@ -422,6 +470,7 @@ def cmd_build(args):
         else:
             files, extra = build_image(target, out, namespace)
         write_manifest(out, target, files, extra)
+        write_channel(out, built_targets(out))
         log(f"built {target}: {', '.join(files)} in {out}")
 
 
