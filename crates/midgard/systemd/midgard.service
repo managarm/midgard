@@ -1,14 +1,4 @@
-# midgard runs in the user's systemd instance and is started by midgard.socket. To install
-# midgard from this checkout:
-#
-#   cargo install --locked --path crates/midgard
-#   cargo install --locked --path crates/bifrost
-#   install -Dm644 -t ~/.config/systemd/user crates/midgard/systemd/midgard.{socket,service}
-#   systemctl --user daemon-reload
-#   systemctl --user enable --now midgard.socket
-#
-# After reinstalling midgard, `systemctl --user restart midgard` makes the running daemon
-# pick it up. Its log: `journalctl --user -u midgard`.
+# midgard runs in the user's systemd instance and is started by midgard.socket.
 
 [Unit]
 Description=midgard VM daemon
@@ -16,4 +6,4 @@ Requires=midgard.socket
 After=midgard.socket
 
 [Service]
-ExecStart=%h/.cargo/bin/midgard
+ExecStart=/usr/bin/midgard
