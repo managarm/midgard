@@ -124,22 +124,7 @@ fn sync_dir(path: &Path) {
 /// middle (see [`create`] and [`delete`]). Nothing may create or delete instances
 /// meanwhile.
 pub fn remove_leftovers() {
-    let instances = paths::instances_dir();
-    let Ok(entries) = std::fs::read_dir(&instances) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let leftover = [".partial", ".deleted"]
-            .iter()
-            .any(|suffix| name.ends_with(suffix));
-        if name.starts_with('.') && leftover {
-            log!("removing {name}, which creating or deleting an instance left behind");
-            if let Err(error) = std::fs::remove_dir_all(entry.path()) {
-                log!("failed to remove {:?}: {error}", entry.path());
-            }
-        }
-    }
+    paths::remove_leftovers(&paths::instances_dir(), &[".partial", ".deleted"]);
 }
 
 /// Whether the instance `name` exists (which it does even if it is broken).

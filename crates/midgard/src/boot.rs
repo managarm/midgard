@@ -8,7 +8,7 @@
 
 use std::collections::BTreeMap;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 use midgard_protocol::version::{Mismatch, Versions};
@@ -66,14 +66,7 @@ impl BootFiles {
                 dir.display()
             );
         }
-        let path = dir.join(MANIFEST);
-        let manifest = match std::fs::read(&path) {
-            Ok(text) => {
-                serde_json::from_slice(&text).with_context(|| format!("invalid {path:?}"))?
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Manifest::default(),
-            Err(error) => return Err(error).with_context(|| format!("failed to read {path:?}")),
-        };
+        let manifest = read_manifest(&dir)?;
         Ok(Self {
             kernel: dir.join(KERNEL),
             agent: dir.join(AGENT),
@@ -87,6 +80,16 @@ impl BootFiles {
     pub fn check(&self) -> Result<()> {
         self.manifest.protocol.map(negotiate).transpose()?;
         Ok(())
+    }
+}
+
+/// Reads the manifest of the boot files in `dir` (the default one if there is none).
+pub fn read_manifest(dir: &Path) -> Result<Manifest> {
+    let path = dir.join(MANIFEST);
+    match std::fs::read(&path) {
+        Ok(text) => serde_json::from_slice(&text).with_context(|| format!("invalid {path:?}")),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Manifest::default()),
+        Err(error) => Err(error).with_context(|| format!("failed to read {path:?}")),
     }
 }
 

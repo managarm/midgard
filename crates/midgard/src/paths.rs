@@ -69,3 +69,21 @@ pub fn names(dir: &Path) -> Vec<String> {
     names.sort();
     names
 }
+
+/// Removes the entries of `dir` that are no items but what making or removing one left
+/// behind when midgard stopped in the middle: those whose names start with a dot and end
+/// with one of `suffixes`. Nothing may make or remove items of `dir` meanwhile.
+pub fn remove_leftovers(dir: &Path, suffixes: &[&str]) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') && suffixes.iter().any(|suffix| name.ends_with(suffix)) {
+            crate::log!("removing {:?}, which midgard left behind", entry.path());
+            if let Err(error) = std::fs::remove_dir_all(entry.path()) {
+                crate::log!("failed to remove {:?}: {error}", entry.path());
+            }
+        }
+    }
+}
