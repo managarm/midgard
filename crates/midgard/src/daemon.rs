@@ -29,7 +29,7 @@ use midgard_protocol::{AGENT_PORT, WAYPIPE_PORT, control, runtime};
 use midgard_vmm::{Machine, MachineHandle, VsockStream};
 
 use crate::instance::{self, Instance};
-use crate::{CONSOLE_BUFFER, CONSOLE_CHUNK, boot, log};
+use crate::{CONSOLE_BUFFER, CONSOLE_CHUNK, boot, log, pull};
 
 /// How long the guest may take to boot (managarm under nested virtualization is slow).
 const BOOT_TIMEOUT: Duration = Duration::from_secs(600);
@@ -440,6 +440,8 @@ fn run_instance(name: &str, running: &Running) {
 /// Boots the VM of `name`, makes it ready for sessions and runs it until it stops;
 /// returns why it stopped.
 fn boot_instance(name: &str, running: &Running) -> Result<String> {
+    // A pull does not replace the boot files until the VM read them.
+    let files = pull::reading();
     let mut config = Instance::load(name)?.config()?;
     config.guest.waypipe_debug = waypipe_debug();
     let dir = runtime::runtime_dir(name);
@@ -459,6 +461,7 @@ fn boot_instance(name: &str, running: &Running) -> Result<String> {
         config.waypipe = None;
     }
     let machine = midgard_vmm::start(&config, console, None)?;
+    drop(files);
     let handle = machine.handle();
     if let Some(gui) = &gui {
         forward_waypipe(&handle, gui);

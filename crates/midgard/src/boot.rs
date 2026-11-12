@@ -7,7 +7,8 @@
 //! the agent speaks.
 
 use std::collections::BTreeMap;
-use std::io;
+use std::fs::File;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -24,10 +25,12 @@ pub const DEFAULT: &str = "linux";
 const KERNEL: &str = "vmlinuz";
 /// The agent in the boot files' directory.
 const AGENT: &str = "midgard-init";
+/// The files that boot files need to have.
+pub const REQUIRED: [&str; 2] = [KERNEL, AGENT];
 /// The guest's waypipe (a static Linux build) in the boot files' directory.
 const WAYPIPE: &str = "guest-waypipe";
 /// The manifest in the boot files' directory.
-const MANIFEST: &str = "manifest.json";
+pub const MANIFEST: &str = "manifest.json";
 
 /// What `manifest.json` says about boot files. (Files that were put there by hand may
 /// lack it.)
@@ -54,7 +57,7 @@ impl BootFiles {
     pub fn load(name: &str) -> Result<Self> {
         validate_name(name)?;
         let dir = paths::boot_dir(name);
-        let missing = [KERNEL, AGENT]
+        let missing = REQUIRED
             .iter()
             .filter(|file| !dir.join(file).is_file())
             .copied()
@@ -91,6 +94,19 @@ pub fn read_manifest(dir: &Path) -> Result<Manifest> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Manifest::default()),
         Err(error) => Err(error).with_context(|| format!("failed to read {path:?}")),
     }
+}
+
+/// Writes the manifest of the boot files in `dir` (which is new) and syncs it.
+pub fn write_manifest(dir: &Path, manifest: &Manifest) -> Result<()> {
+    let path = dir.join(MANIFEST);
+    let mut text = serde_json::to_vec_pretty(manifest)?;
+    text.push(b'\n');
+    File::create_new(&path)
+        .and_then(|mut file| {
+            file.write_all(&text)?;
+            file.sync_all()
+        })
+        .with_context(|| format!("failed to write {path:?}"))
 }
 
 /// The version of the guest protocol to speak with an agent that speaks `agent`.

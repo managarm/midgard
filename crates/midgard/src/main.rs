@@ -3,8 +3,9 @@
 //! `systemd/`) once bifrost connects to its socket. bifrost asks it to run VMs (see
 //! [`midgard_protocol::control`]): VMs in the foreground that bifrost describes, and the
 //! VMs of VM instances, which midgard keeps running for bifrost's sessions (see
-//! [`daemon`]). midgard also manages the VM instances (see [`instance`]) and the
-//! templates that they are created from (see [`template`]).
+//! [`daemon`]). midgard also manages the VM instances (see [`instance`]), the templates
+//! that they are created from (see [`template`]) and the boot files that they boot with
+//! (see [`boot`]), which it installs (see [`pull`]).
 //!
 //! The connections to bifrost are tasks on one executor ([`EXECUTOR`], on the main
 //! thread). Each VM runs on a thread of its own with its own executor (see
@@ -17,6 +18,7 @@ mod boot;
 mod daemon;
 mod instance;
 mod paths;
+mod pull;
 mod settings;
 mod template;
 
@@ -26,14 +28,14 @@ use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::{Arc, LazyLock};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use async_channel::TrySendError;
 use async_executor::Executor;
 use async_io::Async;
 use blocking::unblock;
 use clap::Parser;
 use futures_lite::{AsyncReadExt, future};
-use midgard_protocol::control::{Listing, Request, Response};
+use midgard_protocol::control::{Listing, Pull, Request, Response};
 use midgard_protocol::machine::MachineConfig;
 use midgard_protocol::nonblocking::{read_message, write_message};
 use midgard_protocol::runtime;
@@ -203,6 +205,33 @@ async fn answer(job: impl FnOnce() -> Result<()> + Send + 'static) -> Response {
     }
 }
 
+/// Pulls on [`blocking`]'s thread pool and tells bifrost what happens; once bifrost is
+/// gone, the pull stops.
+async fn pull(stream: &Async<UnixStream>, request: Pull) -> Response {
+    let (sender, events) = async_channel::bounded(16);
+    let job = unblock(move || {
+        pull::pull(&request, &mut |event| {
+            sender
+                .send_blocking(event)
+                .map_err(|_| anyhow!("bifrost closed the connection"))
+        })
+    });
+    let forward = async {
+        while let Ok(event) = events.recv().await {
+            if write_message(&mut &*stream, &Response::Pull(event))
+                .await
+                .is_err()
+            {
+                events.close();
+            }
+        }
+    };
+    match future::zip(forward, job).await {
+        ((), Ok(())) => Response::Done,
+        ((), Err(error)) => Response::Error(format!("{error:#}")),
+    }
+}
+
 /// The VM instances and the templates.
 fn list() -> Listing {
     let instances = paths::names(&paths::instances_dir())
@@ -268,6 +297,7 @@ async fn serve(stream: Async<UnixStream>) -> Result<()> {
             })
             .await
         }
+        Request::Pull(request) => pull(&stream, request).await,
         Request::Session { .. } => unreachable!(),
     };
     // bifrost may be gone already (which stopped the VM).
@@ -306,5 +336,6 @@ fn main() {
     };
     // (Before any request can create or delete instances.)
     instance::remove_leftovers();
+    pull::remove_leftovers();
     async_io::block_on(EXECUTOR.run(accept(listener)));
 }

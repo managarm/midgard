@@ -36,6 +36,17 @@ pub enum Request {
     },
     /// Delete a VM instance, whose VM must not run, and its disk ([`Response::Done`]).
     Delete { name: String },
+    /// Download boot files from a channel and install them. midgard says what it does
+    /// ([`Response::Pull`]) until it is done ([`Response::Done`]).
+    Pull(Pull),
+}
+
+/// What to install or update: the boot files that are installed or that the templates
+/// and VM instances need.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct Pull {
+    /// The channel (a URL or a directory); midgard's default if absent.
+    pub from: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -56,6 +67,8 @@ pub enum Response {
     NoInstance,
     Running(Vec<String>),
     List(Listing),
+    /// Progress of [`Request::Pull`].
+    Pull(PullEvent),
     /// The request succeeded.
     Done,
     /// The request failed.
@@ -92,4 +105,20 @@ pub struct TemplateInfo {
     pub needs_user: bool,
     /// Why the template is broken (e.g., it has no disk).
     pub error: Option<String>,
+}
+
+/// What midgard installs from a channel.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PullItem {
+    BootFiles(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PullEvent {
+    /// midgard downloaded `done` of the `total` bytes of a file.
+    Downloading { file: String, done: u64, total: u64 },
+    /// midgard installed the item, or updated it.
+    Installed(PullItem),
+    /// The item is installed already.
+    UpToDate(PullItem),
 }

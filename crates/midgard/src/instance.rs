@@ -79,7 +79,8 @@ impl Instance {
     }
 
     /// The instance's VM, which boots with the instance's boot files (which must be
-    /// there and fit this midgard).
+    /// there and fit this midgard). A pull must not replace them until the VM read them
+    /// (see [`crate::pull::reading`]).
     pub fn config(&self) -> Result<MachineConfig> {
         let name = self.settings.boot_files.as_deref().unwrap_or(boot::DEFAULT);
         let boot = BootFiles::load(name)?;

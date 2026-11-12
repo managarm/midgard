@@ -33,11 +33,16 @@ pub fn midgard_dir() -> PathBuf {
         .join("midgard")
 }
 
+/// Where the boot files that the user installed are (see [`crate::pull`]).
+pub fn boot_root() -> PathBuf {
+    midgard_dir().join("boot")
+}
+
 /// The directory of the boot files `name` (see [`crate::boot`]): the one in
 /// [`midgard_dir`] if it exists, else the one that packages install (such that errors
 /// name it).
 pub fn boot_dir(name: &str) -> PathBuf {
-    let path = midgard_dir().join("boot").join(name);
+    let path = boot_root().join(name);
     if path.is_dir() {
         return path;
     }
