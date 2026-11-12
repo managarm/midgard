@@ -462,8 +462,11 @@ pub fn run(name: &str, args: &RunArgs) -> Result<i32> {
     let exec = Exec {
         argv: args.command.clone(),
         env,
-        // The agent falls back to the home directory.
         cwd: args.cwd.clone(),
+        // The agent starts the command there if the guest sees it.
+        host_cwd: std::env::current_dir()
+            .ok()
+            .and_then(|dir| dir.to_str().map(str::to_string)),
         user: args.user.clone(),
         tty: if tty {
             Some(window_size().unwrap_or(WindowSize { rows: 24, cols: 80 }))

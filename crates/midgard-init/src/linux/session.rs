@@ -3,12 +3,14 @@
 use std::cell::Cell;
 use std::fs::File;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
 
 use async_channel::{Receiver, Sender};
 use async_io::{Async, Timer};
 use futures_lite::{AsyncReadExt, AsyncWriteExt, future};
+use midgard_protocol::SHARE_MOUNT;
 use midgard_protocol::nonblocking::{read_message, write_message};
 use midgard_protocol::session::{Exec, Request, Response, WindowSize};
 
@@ -119,6 +121,18 @@ fn nonblocking(file: File) -> Result<Rc<Async<File>>, Error> {
         .map_err(|error| Error::io("registering a file descriptor", error))
 }
 
+/// Where the guest sees the host directory `host` in [`SHARE_MOUNT`] (which shows the host
+/// directory `share`), if it does.
+fn shared_dir(share: &str, host: &str) -> Option<String> {
+    let rest = Path::new(host).strip_prefix(share).ok()?;
+    let dir = if rest.as_os_str().is_empty() {
+        PathBuf::from(SHARE_MOUNT)
+    } else {
+        Path::new(SHARE_MOUNT).join(rest)
+    };
+    dir.to_str().map(str::to_string)
+}
+
 async fn run(mut exec: Exec, stream: &Stream) -> Result<(), Error> {
     let config = super::config();
     let name = exec.user.as_deref().or(config.user.as_deref());
@@ -127,10 +141,9 @@ async fn run(mut exec: Exec, stream: &Stream) -> Result<(), Error> {
     let mut env = display::session_environment(&user);
     env.append(&mut exec.env);
     exec.env = env;
-    let cwd = exec
-        .cwd
-        .clone()
-        .filter(|cwd| std::path::Path::new(cwd).is_dir())
+    let cwd = (exec.cwd.clone())
+        .or_else(|| shared_dir(config.share.as_deref()?, exec.host_cwd.as_deref()?))
+        .filter(|cwd| Path::new(cwd).is_dir())
         .unwrap_or_else(|| user.home.clone());
     let prepared = launcher::prepare(&config.launcher, &exec, &user, &cwd)?;
 
@@ -340,4 +353,32 @@ async fn shutdown() {
         log!("{error}");
     }
     sys::power_off()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shared_dirs() {
+        assert_eq!(
+            shared_dir("/", "/home/alice").as_deref(),
+            Some("/mnt/managarm/home/alice")
+        );
+        assert_eq!(shared_dir("/", "/").as_deref(), Some("/mnt/managarm"));
+        assert_eq!(
+            shared_dir("/data", "/data/src").as_deref(),
+            Some("/mnt/managarm/src")
+        );
+        assert_eq!(
+            shared_dir("/data", "/data").as_deref(),
+            Some("/mnt/managarm")
+        );
+        assert_eq!(
+            shared_dir("/data/", "/data/src").as_deref(),
+            Some("/mnt/managarm/src")
+        );
+        assert_eq!(shared_dir("/data", "/database"), None);
+        assert_eq!(shared_dir("/data", "/home"), None);
+    }
 }

@@ -147,6 +147,8 @@ fn direct(exec: &Exec, user: &User, cwd: &str) -> Result<Prepared, Error> {
     };
     let mut command = Command::new(path, argv, flatten(env));
     command.cwd = cwd.into();
+    // (Like the other launchers, if the user may not enter the directory.)
+    command.fallback_cwd = Some(user.home.clone());
     command.credentials = credentials(user);
     Ok(Prepared {
         command,

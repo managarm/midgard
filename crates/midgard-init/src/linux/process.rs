@@ -39,8 +39,10 @@ pub struct Command {
     pub argv: Vec<String>,
     /// "NAME=value".
     pub env: Vec<String>,
-    /// The working directory (`/` if it does not exist or is not accessible).
+    /// The working directory.
     pub cwd: String,
+    /// The working directory if `cwd` does not exist or is not accessible (else `/`).
+    pub fallback_cwd: Option<String>,
     /// The user and groups that it runs as (else root).
     pub credentials: Option<Credentials>,
     /// A file descriptor that the process gets as file descriptor 3.
@@ -54,6 +56,7 @@ impl Command {
             argv,
             env,
             cwd: "/".into(),
+            fallback_cwd: None,
             credentials: None,
             fd3: None,
         }
@@ -77,6 +80,7 @@ pub fn spawn(command: &Command, stdio: &Stdio) -> Result<i32, Error> {
     let argv_c: Vec<CString> = command.argv.iter().map(|a| cstring(a)).collect();
     let env_c: Vec<CString> = command.env.iter().map(|e| cstring(e)).collect();
     let cwd_c = cstring(&command.cwd);
+    let fallback_cwd_c = command.fallback_cwd.as_deref().map(cstring);
     let mut argv_p: Vec<*const libc::c_char> = argv_c.iter().map(|a| a.as_ptr()).collect();
     argv_p.push(std::ptr::null());
     let mut env_p: Vec<*const libc::c_char> = env_c.iter().map(|e| e.as_ptr()).collect();
@@ -147,7 +151,11 @@ pub fn spawn(command: &Command, stdio: &Stdio) -> Result<i32, Error> {
                     && libc::setuid(c.uid) == 0
             });
             if dropped {
-                if libc::chdir(cwd_c.as_ptr()) != 0 {
+                if libc::chdir(cwd_c.as_ptr()) != 0
+                    && fallback_cwd_c
+                        .as_ref()
+                        .is_none_or(|fallback| libc::chdir(fallback.as_ptr()) != 0)
+                {
                     libc::chdir(c"/".as_ptr());
                 }
                 libc::execve(path_c.as_ptr(), argv_p.as_ptr(), env_p.as_ptr());

@@ -237,6 +237,7 @@ impl GuestSettings {
             launcher,
             display,
             waypipe_debug: false,
+            share: None,
         })
     }
 }

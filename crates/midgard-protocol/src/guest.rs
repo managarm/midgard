@@ -28,6 +28,9 @@ pub struct GuestConfig {
     pub display: Display,
     /// The guest's waypipe logs debug messages.
     pub waypipe_debug: bool,
+    /// The host directory that the guest sees in [`crate::SHARE_MOUNT`], if any
+    /// (midgard-vmm fills it in from [`crate::machine::MachineConfig::share`]).
+    pub share: Option<String>,
 }
 
 /// Who starts the guest's Wayland display: a waypipe server that runs as a user and

@@ -163,6 +163,7 @@ mod tests {
                 launcher: Launcher::Wrapper(vec!["runuser".into(), "{helper}".into()]),
                 display: Display::Systemd,
                 waypipe_debug: true,
+                share: Some("/".into()),
             },
             waypipe: Some("/usr/lib/midgard/guest-waypipe".into()),
         };
@@ -268,6 +269,7 @@ mod tests {
             argv: vec!["ls".into(), "-l".into()],
             env: vec![("TERM".into(), "xterm".into())],
             cwd: Some("/root".into()),
+            host_cwd: Some("/home/alice".into()),
             user: Some("alice".into()),
             tty: Some(WindowSize { rows: 24, cols: 80 }),
         }));

@@ -25,8 +25,13 @@ pub struct Exec {
     pub argv: Vec<String>,
     /// Environment variables in addition to the agent's defaults.
     pub env: Vec<(String, String)>,
-    /// The working directory (the user's home if absent).
+    /// The working directory (the user's home if absent, or if the user may not enter
+    /// it).
     pub cwd: Option<String>,
+    /// The client's working directory on the host. Without `cwd`, the command starts
+    /// where the guest sees it in [`crate::SHARE_MOUNT`] (if it does, see
+    /// [`crate::guest::GuestConfig::share`]).
+    pub host_cwd: Option<String>,
     /// The user that runs the command (the guest configuration's default if absent).
     pub user: Option<String>,
     /// Run the command on a pseudo terminal of this size (otherwise, on pipes).
