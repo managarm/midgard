@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Publishes the guest files that a run of .github/workflows/guest.yml built as a release
 (guest-<date>), for .github/workflows/guest-release.yml: the release has the run's files and
-those of the previous guest release for the targets that the run did not build,
-manifest.json, which lists the targets, and channel.json, which makes the release a channel
-that `bifrost pull --from` installs from (see build.py).
+those of the previous guest release for the targets that the run did not build (all of
+which must be built from the inputs of the checkout, such that a release does not pass off,
+e.g., an older agent as the current one), manifest.json, which lists the targets, and
+channel.json, which makes the release a channel that `bifrost pull --from` installs from
+(see build.py).
 
 The site directory gets a channel.json that lists the new release's files (by their URLs):
 the workflow deploys it to GitHub Pages, where it is the channel that midgard pulls from by
@@ -28,6 +30,7 @@ from build import (
     RELEASE_PREFIX,
     WORKFLOW,
     Failure,
+    inputs_hash,
     read_manifest,
     require,
     targets,
@@ -70,6 +73,17 @@ def write_site(site, directory, manifest, tag):
     log(f"the channel in {site} offers {tag}")
 
 
+def check_inputs(entries, source):
+    """Fails for targets that were not built from the inputs of the checkout."""
+    stale = [target for target, entry in entries.items() if entry["inputs"] != inputs_hash(target)]
+    if stale:
+        raise Failure(
+            f"{source} built {', '.join(stale)} from other inputs than this checkout's: publish "
+            f"a run of {WORKFLOW} that built them from these (one that was started manually "
+            "builds all targets)"
+        )
+
+
 def publish(directory, run, site):
     require("gh")
     fields = "conclusion,event,headBranch,headSha,url,workflowName"
@@ -91,6 +105,7 @@ def publish(directory, run, site):
             manifest[path.stem] = read_manifest(directory, path.stem)
     if not manifest:
         raise Failure(f"there are no built targets in {directory}")
+    check_inputs(manifest, info["url"])
     notes = [f"The guest files that {info['url']} built:", ""]
     notes += [f"- {target}: built at {entry['commit']}" for target, entry in manifest.items()]
 
@@ -99,8 +114,10 @@ def publish(directory, run, site):
         previous = releases[0]
         old = json.loads(gh("release", "download", previous, "-p", "manifest.json", "-O", "-"))
         # (Targets that the repository no longer has are dropped.)
-        for target in sorted(set(old) & set(targets()) - set(manifest)):
-            entry = old[target]
+        carried = sorted(set(old) & set(targets()) - set(manifest))
+        carried = {target: old[target] for target in carried}
+        check_inputs(carried, f"the release {previous}")
+        for target, entry in carried.items():
             for name in entry["files"]:
                 gh("release", "download", previous, "-p", name, "-D", directory, "--clobber")
             (directory / f"{target}.json").write_text(json.dumps(entry))
