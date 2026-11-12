@@ -1,10 +1,9 @@
-//! Where midgard's files are: its inputs (the guest kernel, the agent and the guest's
-//! waypipe) and the VM instances. The daemon's runtime files are in
-//! [`midgard_protocol::runtime`].
+//! Where midgard's files are: the boot files, the templates and the VM instances. The
+//! daemon's runtime files are in [`midgard_protocol::runtime`].
 
 use std::path::{Path, PathBuf};
 
-/// Where packages install the guest kernel and the agent.
+/// Where packages install boot files.
 const PACKAGE_DIR: &str = "/usr/lib/midgard";
 
 fn env_path(name: &str) -> Option<PathBuf> {
@@ -18,7 +17,8 @@ fn in_home(relative: &str) -> Option<PathBuf> {
 
 /// midgard's directory: MIDGARD_DATA_DIR, else /var/lib/midgard for root and
 /// $XDG_DATA_HOME/midgard (~/.local/share/midgard) for other users. It has the VM
-/// instances and the guest files that the user installed (see guest/build.py).
+/// instances and the boot files and templates that the user installed (see
+/// guest/build.py).
 pub fn midgard_dir() -> PathBuf {
     if let Some(dir) = env_path("MIDGARD_DATA_DIR") {
         return dir;
@@ -33,29 +33,15 @@ pub fn midgard_dir() -> PathBuf {
         .join("midgard")
 }
 
-/// Returns `name` from [`midgard_dir`] if it exists there, else the one that the
-/// packages install (such that errors name it).
-fn guest_file(name: &str) -> PathBuf {
-    let path = midgard_dir().join(name);
-    if path.exists() {
+/// The directory of the boot files `name` (see [`crate::boot`]): the one in
+/// [`midgard_dir`] if it exists, else the one that packages install (such that errors
+/// name it).
+pub fn boot_dir(name: &str) -> PathBuf {
+    let path = midgard_dir().join("boot").join(name);
+    if path.is_dir() {
         return path;
     }
-    PathBuf::from(PACKAGE_DIR).join(name)
-}
-
-/// The guest kernel.
-pub fn kernel() -> PathBuf {
-    guest_file("vmlinuz")
-}
-
-/// The guest agent (midgard-init).
-pub fn agent() -> PathBuf {
-    guest_file("midgard-init")
-}
-
-/// The guest's waypipe (a static Linux build), if there is one.
-pub fn guest_waypipe() -> Option<PathBuf> {
-    Some(guest_file("guest-waypipe")).filter(|path| path.exists())
+    PathBuf::from(PACKAGE_DIR).join("boot").join(name)
 }
 
 /// The VM instances' directories (see [`crate::instance`]).

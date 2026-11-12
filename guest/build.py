@@ -19,7 +19,7 @@ of the VM instances that midgard creates from it).
 
 `install` installs targets' files into midgard's directory (default: $MIDGARD_DATA_DIR,
 /var/lib/midgard for root or ~/.local/share/midgard), where midgard finds the kernel, the
-agent, the guest's waypipe and the templates: those that CI
+agent and the guest's waypipe (its boot files, in boot/linux) and the templates: those that CI
 built (.github/workflows/guest.yml), from the newest guest release (guest-<date>) by
 default, from another release or from a workflow run (which needs gh), or those that
 `build` built (--local). `build` builds targets into the output directory (--build-dir of
@@ -71,6 +71,10 @@ RELEASE_PREFIX = "guest-"
 WORKFLOW = ".github/workflows/guest.yml"
 # The targets that are no images: what midgard boots the guests with.
 BOOT_TARGETS = ["kernel", "agent", "waypipe"]
+# Where midgard's directory has their files, and the file that says what they are (see
+# crates/midgard/src/boot.rs).
+BOOT_FILES = Path("boot") / "linux"
+BOOT_MANIFEST = "manifest.json"
 # The agent and the guest's waypipe are static binaries, which run in any distribution.
 RUST_TARGET = "x86_64-unknown-linux-musl"
 CRATES = REPO / "crates"
@@ -457,14 +461,19 @@ def fetch_json(url, headers={}):
         raise Failure(f"cannot download {url}: {error}")
 
 
+def boot_manifest(data):
+    """What midgard's directory says about its boot files."""
+    path = data / BOOT_FILES / BOOT_MANIFEST
+    return json.loads(path.read_text()) if path.is_file() else {"files": {}}
+
+
 def installed(data, name, sha256):
     """Whether a target's file is installed in the data directory already (for a template:
     from that tar file)."""
     if name.endswith(".tar"):
         marker = data / "templates" / name.removesuffix(".tar") / INSTALLED_FROM
         return marker.is_file() and marker.read_text().strip() == sha256
-    path = data / name
-    return path.is_file() and file_sha256(path) == sha256
+    return (data / BOOT_FILES / name).is_file() and boot_manifest(data)["files"].get(name) == sha256
 
 
 def check_format(entry, source):
@@ -503,17 +512,32 @@ def install_template(path, sha256, data):
         new.rename(old)
 
 
-def install_files(directory, files, data):
-    """Installs files (by name, with their SHA-256) from a directory into the data
-    directory."""
+def install_boot_file(path, sha256, entry, data):
+    """Installs a boot file of a target into the data directory and records it (and what
+    its target says about it) in the manifest of the boot files."""
+    boot = data / BOOT_FILES
+    boot.mkdir(parents=True, exist_ok=True)
+    partial = boot / f".{path.name}.partial"
+    shutil.copyfile(path, partial)
+    partial.chmod(0o644 if entry["target"] == "kernel" else 0o755)
+    partial.rename(boot / path.name)
+    manifest = boot_manifest(data)
+    manifest["files"][path.name] = sha256
+    if "protocol" in entry:
+        manifest["protocol"] = entry["protocol"]
+    partial = boot / f".{BOOT_MANIFEST}.partial"
+    partial.write_text(json.dumps(manifest, indent=2) + "\n")
+    partial.rename(boot / BOOT_MANIFEST)
+
+
+def install_files(directory, entry, files, data):
+    """Installs files of a target (by name, with their SHA-256) from a directory into the
+    data directory."""
     for name, sha256 in files.items():
         if name.endswith(".tar"):
             install_template(directory / name, sha256, data)
         else:
-            partial = data / f"{name}.partial"
-            shutil.copyfile(directory / name, partial)
-            partial.chmod(0o755 if name != "vmlinuz" else 0o644)
-            partial.rename(data / name)
+            install_boot_file(directory / name, sha256, entry, data)
 
 
 def missing_files(entry, data):
@@ -552,7 +576,7 @@ def install_release(repo, tag, wanted, data):
                 directory = Path(directory)
                 for name, sha256 in missing.items():
                     download(f"{base}/{name}", directory / name, sha256)
-                install_files(directory, missing, data)
+                install_files(directory, entry, missing, data)
         results.append((entry, bool(missing)))
     return results
 
@@ -572,7 +596,7 @@ def install_local(directory, wanted, data):
     results = []
     for entry in entries:
         missing = missing_files(entry, data)
-        install_files(directory, missing, data)
+        install_files(directory, entry, missing, data)
         results.append((entry, bool(missing)))
     return results
 

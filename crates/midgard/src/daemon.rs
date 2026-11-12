@@ -18,18 +18,18 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use async_io::{Async, Timer};
 use event_listener::Event;
 use futures_lite::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, future};
 use midgard_protocol::nonblocking::{read_message, write_message};
 use midgard_protocol::session::{Request, Response};
-use midgard_protocol::version::{Hello, Mismatch, Versions};
+use midgard_protocol::version::Hello;
 use midgard_protocol::{AGENT_PORT, WAYPIPE_PORT, control, runtime};
 use midgard_vmm::{Machine, MachineHandle, VsockStream};
 
 use crate::instance::{self, Instance};
-use crate::{CONSOLE_BUFFER, CONSOLE_CHUNK, log};
+use crate::{CONSOLE_BUFFER, CONSOLE_CHUNK, boot, log};
 
 /// How long the guest may take to boot (managarm under nested virtualization is slow).
 const BOOT_TIMEOUT: Duration = Duration::from_secs(600);
@@ -53,7 +53,7 @@ async fn wait_for_agent(machine: &Machine) -> Result<u32> {
         if let Some(answered) = ping.await
             && let Some(hello) = answered?
         {
-            return negotiate(hello.protocol);
+            return boot::negotiate(hello.protocol);
         }
         if Instant::now() > deadline {
             bail!(
@@ -63,17 +63,6 @@ async fn wait_for_agent(machine: &Machine) -> Result<u32> {
         }
         Timer::after(Duration::from_millis(100)).await;
     }
-}
-
-/// The version of the guest protocol to speak with an agent that speaks `agent`.
-fn negotiate(agent: Versions) -> Result<u32> {
-    Versions::OURS.negotiate(agent).map_err(|mismatch| {
-        let advice = match mismatch {
-            Mismatch::PeerTooOld { .. } => "is too old for this midgard: update the guest files",
-            Mismatch::PeerTooNew { .. } => "is too new for this midgard: update midgard",
-        };
-        anyhow!("the guest agent (midgard-init) {advice} (it speaks {mismatch})")
-    })
 }
 
 /// Returns what the agent answered; None if it does not listen yet.
@@ -451,7 +440,7 @@ fn run_instance(name: &str, running: &Running) {
 /// Boots the VM of `name`, makes it ready for sessions and runs it until it stops;
 /// returns why it stopped.
 fn boot_instance(name: &str, running: &Running) -> Result<String> {
-    let mut config = Instance::load(name)?.config();
+    let mut config = Instance::load(name)?.config()?;
     config.guest.waypipe_debug = waypipe_debug();
     let dir = runtime::runtime_dir(name);
     std::fs::create_dir_all(&dir).with_context(|| format!("failed to create {dir:?}"))?;

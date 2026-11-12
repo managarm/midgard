@@ -10,6 +10,10 @@
 //! # The guest's RAM (default: 1G).
 //! memory = "2G"
 //!
+//! # The boot files that midgard boots the guest with (default: linux), see
+//! # [`crate::boot`].
+//! boot-files = "linux"
+//!
 //! # About the template.
 //! [template]
 //! # What the template is (for people).
@@ -74,17 +78,20 @@ pub struct Settings {
     pub description: Option<String>,
     /// The guest's RAM (in bytes).
     pub memory: Option<u64>,
+    /// The boot files that midgard boots the guest with.
+    pub boot_files: Option<String>,
     /// How the agent sets up the guest.
     pub guest: GuestConfig,
 }
 
 /// The contents of a settings file.
 #[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
 struct SettingsFile {
     #[expect(dead_code, reason = "checked before the rest of the file is read")]
     format: Option<u32>,
     memory: Option<String>,
+    boot_files: Option<String>,
     #[serde(default)]
     template: TemplateSettings,
     #[serde(default)]
@@ -249,8 +256,12 @@ pub fn parse(text: &str, role: Role) -> Result<Settings> {
             Ok(memory)
         })
         .context("invalid memory")?;
+    if let Some(boot_files) = &file.boot_files {
+        crate::instance::validate_name(boot_files).context("invalid boot-files")?;
+    }
     let guest = file.guest.to_config(role).context("invalid [guest]")?;
     Ok(Settings {
+        boot_files: file.boot_files,
         template: file.template.name,
         description: file.template.description,
         memory,
@@ -371,6 +382,9 @@ mod tests {
         assert_eq!(settings.memory, Some(2 << 30));
         assert_eq!(settings.template.as_deref(), Some("alpine"));
         assert_eq!(settings.description.as_deref(), Some("Alpine"));
+        assert_eq!(settings.boot_files, None);
+        let settings = parse("boot-files = \"managarm\"", Role::Template).unwrap();
+        assert_eq!(settings.boot_files.as_deref(), Some("managarm"));
         for invalid in [
             "memory = \"2X\"",
             "memory = \"0\"",
@@ -379,6 +393,7 @@ mod tests {
             "unknown = 1",
             "[other]",
             "[template]\nversion = 1",
+            "boot-files = \"../linux\"",
         ] {
             assert!(parse(invalid, Role::Instance).is_err(), "{invalid:?}");
         }
