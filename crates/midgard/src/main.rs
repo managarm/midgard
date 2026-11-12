@@ -258,8 +258,12 @@ async fn serve(stream: Async<UnixStream>) -> Result<()> {
     };
     let stream = match request {
         // The session takes the connection over (if it gets to the agent).
-        Request::Session { name, start } => {
-            return INSTANCES.session(stream, &name, start).await;
+        Request::Session {
+            name,
+            start,
+            display,
+        } => {
+            return INSTANCES.session(stream, &name, start, display).await;
         }
         _ => Arc::new(stream),
     };

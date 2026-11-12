@@ -455,6 +455,7 @@ fn connect(name: &str, start: bool) -> Result<UnixStream> {
     let request = control::Request::Session {
         name: name.to_string(),
         start,
+        display: runtime::wayland_display(),
     };
     midgard_protocol::write_message(&mut stream, &request)?;
     loop {

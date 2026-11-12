@@ -21,7 +21,16 @@ pub enum Request {
     /// no such instance, [`Response::Starting`] if it starts the VM and
     /// [`Response::Ready`] once the agent answers; from then on, the
     /// connection carries the session protocol (see [`crate::session`]).
-    Session { name: String, start: bool },
+    ///
+    /// `display` is bifrost's Wayland display (see [`crate::runtime::wayland_display`]).
+    /// The VM's Wayland clients go to the display of the request that starts the VM, for
+    /// as long as the VM runs; without one, Wayland forwarding is off. Requests for a VM
+    /// that already runs do not change where its Wayland clients go.
+    Session {
+        name: String,
+        start: bool,
+        display: Option<PathBuf>,
+    },
     /// The VM instances whose VMs run ([`Response::Running`]).
     Running,
     /// The VM instances and the templates ([`Response::List`]).

@@ -18,6 +18,16 @@ pub fn runtime_root() -> PathBuf {
         .unwrap_or_else(|| "/run/midgard".into())
 }
 
+/// The socket of the Wayland display that we run in: $WAYLAND_DISPLAY, in $XDG_RUNTIME_DIR
+/// unless it is absolute. bifrost sends it to midgard, which never uses its own.
+pub fn wayland_display() -> Option<PathBuf> {
+    let display = env_path("WAYLAND_DISPLAY").filter(|display| !display.as_os_str().is_empty())?;
+    if display.is_absolute() {
+        return Some(display);
+    }
+    env_path("XDG_RUNTIME_DIR").map(|dir| dir.join(display))
+}
+
 /// The socket that midgard listens on (systemd's midgard.socket creates it).
 pub fn daemon_socket() -> PathBuf {
     runtime_root().join("midgard.sock")
