@@ -5,9 +5,11 @@
 //! agent how to set up the guest (see [`guest`]). It also has the constants that both
 //! sides of the VM need to agree on, and how sizes are written (see [`size`]).
 //!
-//! Each message is a frame: a little-endian u32 length and the message in postcard.
-//! bifrost, midgard and the agent come from the same installation, so the encoding does
-//! not need to be self-describing.
+//! Each message is a frame: a little-endian u32 length and the message in MessagePack,
+//! with structs as maps of their fields' names and enums by their variants' names
+//! (`rmp_serde::to_vec_named`). The encoding describes itself because the agent is built
+//! and distributed apart from midgard: a peer skips the fields that it does not know and
+//! uses the defaults of those that it misses, such that messages can grow.
 
 #![warn(unreachable_pub)]
 
@@ -55,7 +57,7 @@ fn invalid(error: impl std::fmt::Display) -> io::Error {
 
 /// Encodes a message as a frame.
 fn encode<T: Serialize>(message: &T) -> io::Result<Vec<u8>> {
-    let payload = postcard::to_stdvec(message).map_err(invalid)?;
+    let payload = rmp_serde::to_vec_named(message).map_err(invalid)?;
     if payload.len() > MAX_FRAME {
         return Err(invalid("message is too large"));
     }
@@ -93,7 +95,7 @@ pub fn read_message<T: DeserializeOwned>(reader: &mut impl Read) -> io::Result<O
     }
     let mut payload = vec![0u8; payload_length(header)?];
     reader.read_exact(&mut payload)?;
-    postcard::from_bytes(&payload).map(Some).map_err(invalid)
+    rmp_serde::from_slice(&payload).map(Some).map_err(invalid)
 }
 
 /// The same for async streams (the `async` feature).
@@ -127,7 +129,7 @@ pub mod nonblocking {
         }
         let mut payload = vec![0u8; payload_length(header)?];
         reader.read_exact(&mut payload).await?;
-        postcard::from_bytes(&payload).map(Some).map_err(invalid)
+        rmp_serde::from_slice(&payload).map(Some).map_err(invalid)
     }
 }
 
@@ -300,6 +302,80 @@ mod tests {
         let mut buffer = Vec::new();
         write_message(&mut buffer, &launch).unwrap();
         assert_eq!(read_message(&mut &buffer[..]).unwrap(), Some(launch));
+    }
+
+    /// The encoding that other builds of the agent rely on.
+    #[test]
+    fn wire_format() {
+        let encode = |request: &Request| rmp_serde::to_vec_named(request).unwrap();
+        // A unit variant is its name.
+        assert_eq!(encode(&Request::Ping), b"\xa4Ping");
+        // Other variants are maps from their name to their value; bytes are binary.
+        assert_eq!(
+            encode(&Request::Stdin(vec![1, 200])),
+            b"\x81\xa5Stdin\xc4\x02\x01\xc8"
+        );
+        assert_eq!(encode(&Request::Signal(15)), b"\x81\xa6Signal\x0f");
+        // Structs are maps from their fields' names.
+        let exited = Response::Exited {
+            code: None,
+            signal: Some(9),
+        };
+        assert_eq!(
+            rmp_serde::to_vec_named(&exited).unwrap(),
+            b"\x81\xa6Exited\x82\xa4code\xc0\xa6signal\x09"
+        );
+        let mut frame = Vec::new();
+        write_message(&mut frame, &Request::Ping).unwrap();
+        assert_eq!(frame, b"\x05\0\0\0\xa4Ping");
+    }
+
+    /// A peer of another build sends fields that we do not know and lacks some of ours.
+    #[test]
+    fn tolerates_other_fields() {
+        #[derive(Serialize)]
+        struct NewerConfig {
+            init: Option<String>,
+            ready: Ready,
+            swap: Vec<u64>,
+            hostname: Option<String>,
+        }
+        let newer = NewerConfig {
+            init: Some("/sbin/init".into()),
+            ready: Ready::Notify,
+            swap: vec![1, 2],
+            hostname: Some("guest".into()),
+        };
+        let bytes = rmp_serde::to_vec_named(&newer).unwrap();
+        let config: GuestConfig = rmp_serde::from_slice(&bytes).unwrap();
+        let expected = GuestConfig {
+            init: Some("/sbin/init".into()),
+            ready: Ready::Notify,
+            ..GuestConfig::default()
+        };
+        assert_eq!(config, expected);
+
+        // An empty map.
+        let config: GuestConfig = rmp_serde::from_slice(b"\x80").unwrap();
+        assert_eq!(config, GuestConfig::default());
+
+        #[derive(Serialize)]
+        struct OlderExec {
+            argv: Vec<String>,
+        }
+        #[derive(Serialize)]
+        enum OlderRequest {
+            Exec(OlderExec),
+        }
+        let older = OlderRequest::Exec(OlderExec {
+            argv: vec!["ls".into()],
+        });
+        let bytes = rmp_serde::to_vec_named(&older).unwrap();
+        let expected = Request::Exec(Exec {
+            argv: vec!["ls".into()],
+            ..Exec::default()
+        });
+        assert_eq!(rmp_serde::from_slice::<Request>(&bytes).unwrap(), expected);
     }
 
     #[test]

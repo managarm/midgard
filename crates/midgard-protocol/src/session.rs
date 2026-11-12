@@ -19,7 +19,8 @@ pub struct WindowSize {
     pub cols: u16,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Exec {
     /// The command; empty means the user's login shell.
     pub argv: Vec<String>,
@@ -36,7 +37,7 @@ pub struct Exec {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Request {
     Exec(Exec),
-    Stdin(Vec<u8>),
+    Stdin(#[serde(with = "serde_bytes")] Vec<u8>),
     /// The client's stdin ended.
     StdinEof,
     Resize(WindowSize),
@@ -53,8 +54,8 @@ pub enum Response {
     Started {
         pid: u32,
     },
-    Stdout(Vec<u8>),
-    Stderr(Vec<u8>),
+    Stdout(#[serde(with = "serde_bytes")] Vec<u8>),
+    Stderr(#[serde(with = "serde_bytes")] Vec<u8>),
     /// The command exited with `code` or was killed by `signal`.
     Exited {
         code: Option<i32>,

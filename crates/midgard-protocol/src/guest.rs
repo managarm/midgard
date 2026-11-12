@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 pub const CONFIG_FILE: &str = "guest-config";
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct GuestConfig {
     /// The distribution's init (an absolute path in the guest), which the agent executes
     /// as PID 1 once it set up the guest; the agent keeps running as its child. Without
