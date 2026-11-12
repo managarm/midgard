@@ -22,6 +22,7 @@ use anyhow::{Context, Result, bail};
 use async_io::{Async, Timer};
 use event_listener::Event;
 use futures_lite::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, future};
+use midgard_protocol::machine::MachineConfig;
 use midgard_protocol::nonblocking::{read_message, write_message};
 use midgard_protocol::session::{Request, Response};
 use midgard_protocol::{AGENT_PORT, WAYPIPE_PORT, control, runtime};
@@ -144,8 +145,8 @@ async fn copy(
     }
 }
 
-/// The `waypipe client` for a VM instance's Wayland clients (see [`forward_waypipe`]).
-struct Gui {
+/// The `waypipe client` for a VM's Wayland clients (see [`Gui::start`]).
+pub struct Gui {
     waypipe: Child,
     socket: PathBuf,
 }
@@ -161,6 +162,30 @@ impl Drop for Gui {
 /// MIDGARD_WAYPIPE_DEBUG=1: both waypipes log debug messages.
 fn waypipe_debug() -> bool {
     std::env::var_os("MIDGARD_WAYPIPE_DEBUG").is_some_and(|value| !value.is_empty() && value != "0")
+}
+
+impl Gui {
+    /// Starts Wayland forwarding (on `socket`) for the VM that `config` describes if it
+    /// has the guest's waypipe. The guest gets a Wayland display only if we can forward
+    /// its clients: otherwise, its waypipe is removed from `config`. Once the VM runs,
+    /// [`Gui::forward`] connects its clients.
+    pub fn start(config: &mut MachineConfig, socket: PathBuf) -> Option<Gui> {
+        config.guest.waypipe_debug = waypipe_debug();
+        let gui = config
+            .waypipe
+            .is_some()
+            .then(|| start_waypipe(socket))
+            .flatten();
+        if gui.is_none() {
+            config.waypipe = None;
+        }
+        gui
+    }
+
+    /// Connects each connection from the guest's waypipe to `waypipe client`.
+    pub fn forward(&self, machine: &MachineHandle) {
+        forward_waypipe(machine, self);
+    }
 }
 
 /// Starts `waypipe client` on `socket` if we run in a Wayland session and have waypipe.
@@ -438,7 +463,6 @@ fn run_instance(name: &str, running: &Running) {
 /// returns why it stopped.
 fn boot_instance(name: &str, running: &Running) -> Result<String> {
     let mut config = Instance::load(name)?.config();
-    config.guest.waypipe_debug = waypipe_debug();
     let dir = runtime::runtime_dir(name);
     std::fs::create_dir_all(&dir).with_context(|| format!("failed to create {dir:?}"))?;
     let path = runtime::console_log(name);
@@ -446,19 +470,11 @@ fn boot_instance(name: &str, running: &Running) -> Result<String> {
     // Dropped after the VM, such that the log is complete once we report why it stopped.
     let (console_log, console) = ConsoleLog::start(name, log)?;
 
-    // The guest gets a Wayland display only if we can forward its clients.
-    let gui = config
-        .waypipe
-        .is_some()
-        .then(|| start_waypipe(runtime::waypipe_socket(name)))
-        .flatten();
-    if gui.is_none() {
-        config.waypipe = None;
-    }
+    let gui = Gui::start(&mut config, runtime::waypipe_socket(name));
     let machine = midgard_vmm::start(&config, console, None)?;
     let handle = machine.handle();
     if let Some(gui) = &gui {
-        forward_waypipe(&handle, gui);
+        gui.forward(&handle);
     }
     if let Err(error) = machine.run(wait_for_agent(&machine)) {
         handle.stop();

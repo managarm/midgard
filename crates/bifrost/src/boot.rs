@@ -64,7 +64,7 @@ fn config(boot: &BootArgs) -> Result<MachineConfig> {
         },
         // The agent stays PID 1.
         guest: GuestConfig::default(),
-        waypipe: None,
+        waypipe: boot.waypipe.as_deref().map(absolute).transpose()?,
     })
 }
 
@@ -198,6 +198,8 @@ mod tests {
         assert!(config.disks.is_empty());
         assert!(config.network);
         assert_eq!(config.share, Some("/".into()));
+        assert_eq!(config.guest, GuestConfig::default());
+        assert_eq!(config.waypipe, None);
     }
 
     #[test]

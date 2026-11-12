@@ -167,6 +167,11 @@ pub struct BootArgs {
     #[arg(long, value_name = "FILE")]
     pub agent: Option<PathBuf>,
 
+    /// Forward the guest's Wayland clients with the guest's waypipe from FILE (a static
+    /// Linux binary)
+    #[arg(long, value_name = "FILE", requires = "agent")]
+    pub waypipe: Option<PathBuf>,
+
     /// Replace the base kernel parameters
     #[arg(long, value_name = "ARGS", allow_hyphen_values = true)]
     pub cmdline: Option<String>,
@@ -376,7 +381,24 @@ mod tests {
             panic!("not boot: {:?}", cli.action);
         };
         assert_eq!(boot.agent, Some(PathBuf::from("midgard-init")));
+        assert_eq!(boot.waypipe, None);
         assert!(parse(&["boot", "--kernel", "k", "--agent", "a", "--initrd", "i"]).is_err());
+        let cli = parse(&[
+            "boot",
+            "--kernel",
+            "bzImage",
+            "--agent",
+            "midgard-init",
+            "--waypipe",
+            "guest-waypipe",
+        ])
+        .unwrap();
+        let Some(Action::Boot(boot)) = cli.action else {
+            panic!("not boot: {:?}", cli.action);
+        };
+        assert_eq!(boot.waypipe, Some(PathBuf::from("guest-waypipe")));
+        // It needs the agent.
+        assert!(parse(&["boot", "--kernel", "k", "--waypipe", "w"]).is_err());
     }
 
     #[test]

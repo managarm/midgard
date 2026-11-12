@@ -23,6 +23,8 @@ use std::io;
 use std::os::fd::{FromRawFd, RawFd};
 use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 
 use anyhow::{Context, Result, bail};
@@ -38,7 +40,7 @@ use midgard_protocol::nonblocking::{read_message, write_message};
 use midgard_protocol::runtime;
 use midgard_vmm::MachineHandle;
 
-use crate::daemon::Instances;
+use crate::daemon::{Gui, Instances};
 
 /// Prints a message (like `eprintln!`) with midgard's prefix; it goes to the console log.
 macro_rules! log {
@@ -119,17 +121,30 @@ enum Event {
     Stopped(Result<String>),
 }
 
+/// The socket of the `waypipe client` for a VM in the foreground (each has its own).
+fn boot_waypipe_socket() -> PathBuf {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let id = NEXT.fetch_add(1, Ordering::Relaxed);
+    runtime::runtime_root().join(format!("boot-{id}.waypipe"))
+}
+
 /// Runs a VM on this (its own) thread until it stops.
 fn run_vm(
-    config: &MachineConfig,
+    mut config: MachineConfig,
     console: piper::Writer,
     input: async_channel::Receiver<Vec<u8>>,
     events: async_channel::Sender<Event>,
 ) {
-    let result = midgard_vmm::start(config, console, Some(input)).and_then(|machine| {
-        let _ = events.send_blocking(Event::Started(machine.handle()));
+    let gui = Gui::start(&mut config, boot_waypipe_socket());
+    let result = midgard_vmm::start(&config, console, Some(input)).and_then(|machine| {
+        let handle = machine.handle();
+        if let Some(gui) = &gui {
+            gui.forward(&handle);
+        }
+        let _ = events.send_blocking(Event::Started(handle));
         Ok(machine.run_until_stopped()?.to_string())
     });
+    drop(gui);
     let _ = events.send_blocking(Event::Stopped(result));
 }
 
@@ -171,7 +186,7 @@ async fn boot(stream: &Arc<Async<UnixStream>>, config: MachineConfig) -> Result<
     let (sender, events) = async_channel::unbounded();
     std::thread::Builder::new()
         .name("vm".into())
-        .spawn(move || run_vm(&config, console, input_receiver, sender))
+        .spawn(move || run_vm(config, console, input_receiver, sender))
         .context("failed to start the VM's thread")?;
     let watch_vm = async {
         let mut forwarder = None;
