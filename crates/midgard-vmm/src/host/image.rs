@@ -10,7 +10,8 @@
 //! clusters to file offsets; refcounts track which clusters of the file are in use.
 //! We support what `qemu-img create` / `convert` produce: version 2 or 3, 16-bit
 //! refcounts, no backing files, snapshots, encryption or compressed clusters.
-//! New clusters are appended to the file.
+//! New clusters are appended to the file. Images can grow (see [`grow`]), but not
+//! shrink.
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions, TryLockError};
@@ -83,6 +84,35 @@ fn lock(file: &File, read_only: bool) -> io::Result<()> {
         Err(TryLockError::Error(error)) if error.kind() == io::ErrorKind::Unsupported => Ok(()),
         Err(TryLockError::Error(error)) => Err(error),
     }
+}
+
+/// The size of the guest's disk in an image (which a VM may be using).
+pub fn size(path: &Path) -> io::Result<u64> {
+    let file = File::open(path)?;
+    if is_qcow2(&file) {
+        Ok(Qcow2::open(file)?.size)
+    } else {
+        Ok(Raw::new(file)?.size)
+    }
+}
+
+/// Grows the guest's disk in an image to `size` bytes (the new space reads as zeros).
+/// Fails if a VM is using the image.
+pub fn grow(path: &Path, size: u64) -> io::Result<()> {
+    let file = OpenOptions::new().read(true).write(true).open(path)?;
+    lock(&file, false)?;
+    if is_qcow2(&file) {
+        Qcow2::open(file)?.grow(size)
+    } else {
+        Raw::new(file)?.grow(size)
+    }
+}
+
+fn cannot_shrink(from: u64, to: u64) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("the disk cannot shrink (from {from} to {to} bytes)"),
+    )
 }
 
 /// Checks that `length` bytes at `offset` are inside a disk of `size` bytes.
@@ -214,6 +244,15 @@ impl Raw {
             file: Arc::new(file),
             size,
         })
+    }
+
+    fn grow(&mut self, size: u64) -> io::Result<()> {
+        if size < self.size {
+            return Err(cannot_shrink(self.size, size));
+        }
+        self.file.set_len(size)?;
+        self.size = size;
+        self.file.sync_all()
     }
 }
 
@@ -419,6 +458,13 @@ impl Qcow2 {
         })
     }
 
+    /// Grows the guest's disk (see [`Tables::grow`]).
+    fn grow(&mut self, size: u64) -> io::Result<()> {
+        self.tables.lock().unwrap().grow(self.size, size)?;
+        self.size = size;
+        Ok(())
+    }
+
     fn read_blocking(
         &self,
         memory: &GuestMemory,
@@ -621,6 +667,52 @@ impl Tables {
             self.l1_offset + l1_index as u64 * 8,
         )?;
         Ok(offset)
+    }
+
+    /// Grows the guest's disk from `old_size` to `size` bytes. The L1 table cannot move,
+    /// so it must already have room for the new L1 entries in its clusters (which
+    /// `qemu-img` allocates whole). How far that goes depends on the cluster size: with
+    /// 64 KiB clusters (the default), it covers 4 TiB; with 4 KiB clusters, an image may
+    /// not be able to grow at all.
+    fn grow(&mut self, old_size: u64, size: u64) -> io::Result<()> {
+        if size < old_size {
+            return Err(cannot_shrink(old_size, size));
+        }
+        let cluster_size = self.cluster_size();
+        let l2_coverage = cluster_size * self.l2_entries();
+        let old_entries = self.l1.len() as u64;
+        let room = (old_entries * 8).next_multiple_of(cluster_size) / 8;
+        let entries = size.div_ceil(l2_coverage).max(old_entries);
+        if entries > room || entries > u32::MAX as u64 {
+            return Err(unsupported(format!(
+                "growing the disk beyond {} bytes",
+                room * l2_coverage
+            )));
+        }
+        // The rest of the L1 table's last cluster belongs to the table, but it is not
+        // necessarily zeroed: clear the new entries before the header refers to them.
+        let new_entries = (entries - old_entries) as usize;
+        self.file.write_all_at(
+            &vec![0u8; new_entries * 8],
+            self.l1_offset + old_entries * 8,
+        )?;
+        // We change the image like any write does (e.g., bitmaps would not match the
+        // larger disk).
+        self.clear_autoclear()?;
+        self.file.sync_data()?;
+        self.l1.resize(entries as usize, 0);
+        // The L1 table grows first: a larger table than the size needs is valid, a smaller
+        // one is not (in case only one of the writes reaches the disk).
+        self.file.write_all_at(
+            &(entries as u32).to_be_bytes(),
+            std::mem::offset_of!(Header, l1_size) as u64,
+        )?;
+        self.file.sync_data()?;
+        self.file.write_all_at(
+            &size.to_be_bytes(),
+            std::mem::offset_of!(Header, size) as u64,
+        )?;
+        self.file.sync_data()
     }
 }
 
@@ -941,5 +1033,68 @@ mod tests {
             let report = String::from_utf8_lossy(&output.stdout);
             assert!(output.status.success(), "qemu-img check: {report}");
         }
+    }
+
+    #[test]
+    fn qcow2_grow() {
+        let _exclusive = exclusive();
+        let dir = std::env::temp_dir().join(format!("midgard-qcow2-grow-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("disk.qcow2");
+        let cluster = 1u64 << 16;
+        create(&path, 3 << 30);
+        let image = open(&path, false).unwrap();
+        write_disk(&*image, b"start", 0).unwrap();
+        drop(image);
+        // Garbage after the L1 table's entries (in its cluster) must not become entries.
+        let file = OpenOptions::new().write(true).open(&path).unwrap();
+        file.write_all_at(&[0xAB; 64], 3 * cluster + 1024).unwrap();
+        // An autoclear feature (e.g., bitmaps) that does not hold for the larger disk.
+        let autoclear = std::mem::offset_of!(Header, autoclear_features) as u64;
+        file.write_all_at(&1u64.to_be_bytes(), autoclear).unwrap();
+        drop(file);
+
+        assert!(grow(&path, 1 << 30).is_err());
+        grow(&path, 64 << 30).unwrap();
+        assert_eq!(size(&path).unwrap(), 64 << 30);
+        let mut features = [0xFF; 8];
+        File::open(&path)
+            .unwrap()
+            .read_exact_at(&mut features, autoclear)
+            .unwrap();
+        assert_eq!(features, [0; 8]);
+        let image = open(&path, false).unwrap();
+        let mut buffer = [0u8; 5];
+        read_disk(&*image, &mut buffer, 0).unwrap();
+        assert_eq!(&buffer, b"start");
+        read_disk(&*image, &mut buffer, 32 << 30).unwrap();
+        assert_eq!(buffer, [0; 5]);
+        write_disk(&*image, b"end", (64 << 30) - 3).unwrap();
+        drop(image);
+        let image = open(&path, true).unwrap();
+        let mut end = [0u8; 3];
+        read_disk(&*image, &mut end, (64 << 30) - 3).unwrap();
+        assert_eq!(&end, b"end");
+        drop(image);
+        qemu_img_check(&path);
+
+        // One L1 cluster (8192 entries of 512 MiB each) covers 4 TiB.
+        assert!(grow(&path, (4 << 40) + 1).is_err());
+        grow(&path, 4 << 40).unwrap();
+        qemu_img_check(&path);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn raw_grow() {
+        let _exclusive = exclusive();
+        let dir = std::env::temp_dir().join(format!("midgard-raw-grow-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("disk.ext4");
+        std::fs::write(&path, b"data").unwrap();
+        grow(&path, 1 << 20).unwrap();
+        assert_eq!(size(&path).unwrap(), 1 << 20);
+        assert!(grow(&path, 4).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

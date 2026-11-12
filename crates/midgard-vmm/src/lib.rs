@@ -30,3 +30,9 @@ mod virtio;
 
 pub use machine::{Machine, MachineHandle, Stop, start, validate_memory};
 pub use virtio::vsock::{VsockListener, VsockStream};
+
+/// Disk images on the host (raw and qcow2). The VMM opens them for virtio-block; the
+/// daemon's instance management sizes and grows them. Everything else is private.
+pub mod image {
+    pub use crate::host::image::{grow, size};
+}
