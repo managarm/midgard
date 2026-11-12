@@ -1,7 +1,7 @@
 //! Talking to midgard (on its socket, see [`midgard_protocol::control`]): runs commands
-//! (or a login shell) in a VM instance, stops VMs, shows their console logs and manages
-//! the VM instances. midgard starts an instance's VM for the first session with it; the
-//! VM stays up for later commands.
+//! (or a login shell) in a VM instance, stops VMs, shows their console logs, manages the
+//! VM instances and has midgard install templates and boot files. midgard starts an
+//! instance's VM for the first session with it; the VM stays up for later commands.
 
 use std::fs::File;
 use std::io::{self, Read, Seek, Write};
@@ -12,12 +12,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use midgard_protocol::control::Listing;
+use midgard_protocol::control::{Listing, PullEvent, PullItem, Pulled};
 use midgard_protocol::session::{Exec, Request, Response, WindowSize};
 use midgard_protocol::size::format_size;
 use midgard_protocol::{control, runtime};
 
-use crate::cli::{CreateArgs, RunArgs};
+use crate::cli::{CreateArgs, PullArgs, RunArgs};
 use crate::{EXIT_FAILURE, log, terminal};
 
 // The libc crate does not define these for managarm; mlibc uses the Linux ABI values.
@@ -260,6 +260,107 @@ pub fn create(args: &CreateArgs) -> Result<i32> {
     )?;
     log!("created {}", args.name);
     Ok(0)
+}
+
+/// What a [`PullItem`] is for people, and whether that is a plural.
+fn describe(item: &PullItem) -> (String, bool) {
+    match item {
+        PullItem::BootFiles(name) => (format!("the boot files {name}"), true),
+        PullItem::Template(name) => (format!("the template {name}"), false),
+    }
+}
+
+/// How far a download is, for people.
+fn format_progress(file: &str, done: u64, total: u64) -> String {
+    let percent = (done * 100).checked_div(total).unwrap_or(100);
+    format!("downloading {file}: {percent}% of {}", format_size(total))
+}
+
+/// What the templates are after a pull that named none, for people.
+fn format_pulled(pulled: &Pulled) -> Option<String> {
+    if !pulled.installed.is_empty() {
+        return None;
+    }
+    Some(if pulled.available.is_empty() {
+        "no templates are installed, and the channel has none".into()
+    } else {
+        format!(
+            "no templates are installed; the channel has {} (bifrost pull <template> \
+             installs one)",
+            pulled.available.join(", ")
+        )
+    })
+}
+
+/// Has midgard install or update templates and boot files (`bifrost pull`).
+pub fn pull(args: &PullArgs) -> Result<i32> {
+    // midgard reads a directory itself, wherever it runs.
+    let from = match &args.from {
+        Some(from) if from.contains("://") => Some(from.clone()),
+        Some(from) => {
+            let path = std::path::absolute(from).with_context(|| format!("invalid path {from}"))?;
+            Some(path.to_string_lossy().into_owned())
+        }
+        None => None,
+    };
+    let mut stream = connect_daemon()?;
+    let request = control::Request::Pull(control::Pull {
+        templates: args.templates.clone(),
+        all: args.all,
+        from,
+    });
+    midgard_protocol::write_message(&mut stream, &request)?;
+    // On a terminal, the progress of a download is one line that we keep rewriting.
+    let tty = is_tty(2);
+    let mut downloading: Option<String> = None;
+    let finish_line = |downloading: &mut Option<String>| {
+        if downloading.take().is_some() && tty {
+            eprintln!();
+        }
+    };
+    loop {
+        let response =
+            midgard_protocol::read_message(&mut stream).context("lost the connection to midgard");
+        if !matches!(
+            response,
+            Ok(Some(control::Response::Pull(PullEvent::Downloading { .. })))
+        ) {
+            finish_line(&mut downloading);
+        }
+        match response? {
+            Some(control::Response::Pull(PullEvent::Downloading { file, done, total })) => {
+                if downloading.as_deref() != Some(&file) {
+                    finish_line(&mut downloading);
+                    if !tty {
+                        log!("downloading {file} ({})", format_size(total));
+                    }
+                    downloading = Some(file.clone());
+                }
+                if tty {
+                    eprint!("\rbifrost: {}\x1b[K", format_progress(&file, done, total));
+                    io::stderr().flush()?;
+                }
+            }
+            Some(control::Response::Pull(PullEvent::Installed(item))) => {
+                log!("installed {}", describe(&item).0);
+            }
+            Some(control::Response::Pull(PullEvent::UpToDate(item))) => {
+                let (what, plural) = describe(&item);
+                log!("{what} {} up to date", if plural { "are" } else { "is" });
+            }
+            Some(control::Response::Pulled(pulled)) => {
+                if args.templates.is_empty()
+                    && let Some(hint) = format_pulled(&pulled)
+                {
+                    log!("{hint}");
+                }
+                return Ok(0);
+            }
+            Some(control::Response::Error(message)) => bail!("{message}"),
+            Some(other) => bail!("unexpected answer from midgard: {other:?}"),
+            None => bail!("midgard closed the connection"),
+        }
+    }
 }
 
 /// Deletes the VM instance `name` and its disk after asking (unless `yes`).
@@ -690,6 +791,36 @@ mod tests {
             format_listing(&empty),
             "No VM instances (bifrost create makes one).\n\n\
              No templates in /templates (guest/build.py install installs them).\n"
+        );
+    }
+
+    #[test]
+    fn pulls() {
+        assert_eq!(
+            format_progress("alpine.tar", 1 << 20, 4 << 20),
+            "downloading alpine.tar: 25% of 4 MiB"
+        );
+        assert_eq!(
+            format_progress("empty", 0, 0),
+            "downloading empty: 100% of 0 bytes"
+        );
+        let pulled = Pulled {
+            installed: vec![],
+            available: vec!["alpine".into(), "debian".into()],
+        };
+        assert_eq!(
+            format_pulled(&pulled).unwrap(),
+            "no templates are installed; the channel has alpine, debian (bifrost pull \
+             <template> installs one)"
+        );
+        let pulled = Pulled {
+            installed: vec!["alpine".into()],
+            available: vec!["debian".into()],
+        };
+        assert_eq!(format_pulled(&pulled), None);
+        assert_eq!(
+            describe(&PullItem::BootFiles("linux".into())),
+            ("the boot files linux".into(), true)
         );
     }
 }
