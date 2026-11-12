@@ -62,8 +62,10 @@ fn config(boot: &BootArgs) -> Result<MachineConfig> {
             (Some(share), false) => Some(absolute(share)?),
             (None, false) => Some("/".into()),
         },
-        // The agent stays PID 1.
-        guest: GuestConfig::default(),
+        guest: GuestConfig {
+            init: boot.init.clone(),
+            ..GuestConfig::default()
+        },
         waypipe: boot.waypipe.as_deref().map(absolute).transpose()?,
     })
 }

@@ -167,6 +167,11 @@ pub struct BootArgs {
     #[arg(long, value_name = "FILE")]
     pub agent: Option<PathBuf>,
 
+    /// The distribution's init, which the agent starts as PID 1 [default: none, the
+    /// agent stays PID 1]
+    #[arg(long, value_name = "PROGRAM", requires = "agent")]
+    pub init: Option<String>,
+
     /// Forward the guest's Wayland clients with the guest's waypipe from FILE (a static
     /// Linux binary)
     #[arg(long, value_name = "FILE", requires = "agent")]
@@ -381,6 +386,7 @@ mod tests {
             panic!("not boot: {:?}", cli.action);
         };
         assert_eq!(boot.agent, Some(PathBuf::from("midgard-init")));
+        assert_eq!(boot.init, None);
         assert_eq!(boot.waypipe, None);
         assert!(parse(&["boot", "--kernel", "k", "--agent", "a", "--initrd", "i"]).is_err());
         let cli = parse(&[
@@ -389,6 +395,8 @@ mod tests {
             "bzImage",
             "--agent",
             "midgard-init",
+            "--init",
+            "/sbin/init",
             "--waypipe",
             "guest-waypipe",
         ])
@@ -396,8 +404,10 @@ mod tests {
         let Some(Action::Boot(boot)) = cli.action else {
             panic!("not boot: {:?}", cli.action);
         };
+        assert_eq!(boot.init.as_deref(), Some("/sbin/init"));
         assert_eq!(boot.waypipe, Some(PathBuf::from("guest-waypipe")));
-        // It needs the agent.
+        // Both need the agent.
+        assert!(parse(&["boot", "--kernel", "k", "--init", "/sbin/init"]).is_err());
         assert!(parse(&["boot", "--kernel", "k", "--waypipe", "w"]).is_err());
     }
 
