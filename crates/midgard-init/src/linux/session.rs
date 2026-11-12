@@ -11,6 +11,7 @@ use async_io::{Async, Timer};
 use futures_lite::{AsyncReadExt, AsyncWriteExt, future};
 use midgard_protocol::nonblocking::{read_message, write_message};
 use midgard_protocol::session::{Exec, Request, Response, WindowSize};
+use midgard_protocol::version::Hello;
 
 use super::launcher::{self, Signals};
 use super::process::{self, Stdio};
@@ -34,7 +35,7 @@ pub async fn handle(stream: Async<File>) {
         }
     };
     match read_message::<Request>(&mut &*stream).await {
-        Ok(Some(Request::Ping)) => reply(Response::Pong).await,
+        Ok(Some(Request::Hello(_))) => reply(Response::Hello(Hello::OURS)).await,
         Ok(Some(Request::Shutdown)) => {
             // Acknowledge first; the client then waits for the VM to stop.
             reply(Response::Exited {
@@ -52,7 +53,14 @@ pub async fn handle(stream: Async<File>) {
         }
         Ok(Some(_)) => reply(Response::Error("a session starts with Exec".into())).await,
         Ok(None) => {}
-        Err(error) => log!("bad request: {error}"),
+        Err(error) => {
+            // E.g., a request of a newer version of the guest protocol.
+            log!("bad request: {error}");
+            reply(Response::Error(format!(
+                "the agent cannot read the request: {error}"
+            )))
+            .await
+        }
     }
 }
 
@@ -208,6 +216,7 @@ async fn run(mut exec: Exec, stream: &Stream) -> Result<(), Error> {
         pid,
         prepared.signals,
         finished.clone(),
+        responses.clone(),
     ));
 
     let status = exited
@@ -229,10 +238,11 @@ async fn run(mut exec: Exec, stream: &Stream) -> Result<(), Error> {
     .await;
     let (code, signal) = process::exit_status(status);
     let _ = responses.send(Response::Exited { code, signal }).await;
+    // The session is over; stop reading requests (which also drops the task's sender, such
+    // that the writer finishes).
+    drop(input);
     drop(responses);
     writer.await;
-    // The session is over; stop reading requests.
-    drop(input);
     Ok(())
 }
 
@@ -243,6 +253,7 @@ async fn forward_input(
     pid: i32,
     signals: Signals,
     finished: Rc<Cell<bool>>,
+    responses: Sender<Response>,
 ) {
     // The process group that receives signals: the terminal's foreground group if there
     // is a terminal, otherwise the session (the command is its leader).
@@ -283,7 +294,16 @@ async fn forward_input(
             }
             Ok(Some(Request::Signal(signal))) => signals.deliver(group(&input), signal),
             Ok(Some(_)) => {}
-            Ok(None) | Err(_) => {
+            result @ (Ok(None) | Err(_)) => {
+                // A request that we cannot read (e.g., one of a newer version of the guest
+                // protocol) ends the session, too, but not silently.
+                if let Err(error) = result
+                    && error.kind() == std::io::ErrorKind::InvalidData
+                {
+                    log!("bad request: {error}");
+                    let message = format!("the agent cannot read a request: {error}");
+                    let _ = responses.send(Response::Error(message)).await;
+                }
                 // The client went away: hang up, like a closed terminal.
                 if !finished.get() {
                     signals.deliver(group(&input), libc::SIGHUP);

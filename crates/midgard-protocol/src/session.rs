@@ -3,7 +3,7 @@
 //! A session starts with [`control::Request::Session`]. Once midgard answered
 //! [`control::Response::Ready`], it forwards the connection to the agent over vsock
 //! without looking at it. One connection carries one session: the client's first message
-//! to the agent is [`Request::Exec`] (or [`Request::Ping`] / [`Request::Shutdown`]); then
+//! to the agent is [`Request::Exec`] (or [`Request::Hello`] / [`Request::Shutdown`]); then
 //! stdin, resizes and signals flow to the agent and output flows back until
 //! [`Response::Exited`].
 //!
@@ -12,6 +12,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::version::Hello;
+
 /// The size of a terminal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WindowSize {
@@ -19,7 +21,8 @@ pub struct WindowSize {
     pub cols: u16,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Exec {
     /// The command; empty means the user's login shell.
     pub argv: Vec<String>,
@@ -36,7 +39,7 @@ pub struct Exec {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Request {
     Exec(Exec),
-    Stdin(Vec<u8>),
+    Stdin(#[serde(with = "serde_bytes")] Vec<u8>),
     /// The client's stdin ended.
     StdinEof,
     Resize(WindowSize),
@@ -44,8 +47,10 @@ pub enum Request {
     Signal(i32),
     /// Shut down the guest (the VM stops).
     Shutdown,
-    /// Answered with [`Response::Pong`]; checks that the agent is up.
-    Ping,
+    /// Answered with [`Response::Hello`]: midgard checks that the agent is up and which
+    /// versions of the guest protocol it speaks. Every version of the agent needs to
+    /// understand this request, so its encoding must not change.
+    Hello(Hello),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -53,13 +58,15 @@ pub enum Response {
     Started {
         pid: u32,
     },
-    Stdout(Vec<u8>),
-    Stderr(Vec<u8>),
+    Stdout(#[serde(with = "serde_bytes")] Vec<u8>),
+    Stderr(#[serde(with = "serde_bytes")] Vec<u8>),
     /// The command exited with `code` or was killed by `signal`.
     Exited {
         code: Option<i32>,
         signal: Option<i32>,
     },
     Error(String),
-    Pong,
+    /// The versions of the guest protocol that the agent speaks. Every version of midgard
+    /// needs to understand this response, so its encoding must not change.
+    Hello(Hello),
 }

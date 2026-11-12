@@ -20,5 +20,6 @@ midgard-vmm.workspace = true
 piper.workspace = true
 ruzstd.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 toml.workspace = true
 toml_edit.workspace = true

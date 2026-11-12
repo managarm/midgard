@@ -1,13 +1,63 @@
 //! How the agent sets up the guest and runs sessions. midgard decides it (it is part of
 //! a VM instance's settings) and passes it to the agent in the initramfs, as the file
-//! [`CONFIG_FILE`] (one frame, see [`crate::write_message`]).
+//! [`CONFIG_FILE`]: two frames (see [`crate::write_message`]), midgard's [`Hello`] and the
+//! [`GuestConfig`]. The agent checks the former before it reads the latter, which another
+//! version of the guest protocol may encode differently.
+
+use std::io::{self, Read};
 
 use serde::{Deserialize, Serialize};
+
+use crate::version::{Hello, Mismatch, Versions};
 
 /// The name of the guest configuration in the initramfs.
 pub const CONFIG_FILE: &str = "guest-config";
 
+/// The contents of [`CONFIG_FILE`].
+pub fn encode_config(config: &GuestConfig) -> io::Result<Vec<u8>> {
+    let mut file = Vec::new();
+    crate::write_message(&mut file, &Hello::OURS)?;
+    crate::write_message(&mut file, config)?;
+    Ok(file)
+}
+
+/// Why the agent cannot use [`CONFIG_FILE`].
+#[derive(Debug)]
+pub enum ConfigError {
+    /// midgard speaks no version of the guest protocol that the agent speaks.
+    Mismatch(Mismatch),
+    Io(io::Error),
+}
+
+impl std::fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            Self::Mismatch(mismatch) => write!(f, "midgard speaks {mismatch}"),
+            Self::Io(error) => error.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for ConfigError {}
+
+/// Reads [`CONFIG_FILE`]: the guest configuration and the version of the guest protocol
+/// to speak with midgard.
+pub fn read_config(reader: &mut impl Read) -> Result<(u32, GuestConfig), ConfigError> {
+    let eof = || ConfigError::Io(io::ErrorKind::UnexpectedEof.into());
+    let hello: Hello = crate::read_message(reader)
+        .map_err(ConfigError::Io)?
+        .ok_or_else(eof)?;
+    let version = Versions::OURS
+        .negotiate(hello.protocol)
+        .map_err(ConfigError::Mismatch)?;
+    let config = crate::read_message(reader)
+        .map_err(ConfigError::Io)?
+        .ok_or_else(eof)?;
+    Ok((version, config))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct GuestConfig {
     /// The distribution's init (an absolute path in the guest), which the agent executes
     /// as PID 1 once it set up the guest; the agent keeps running as its child. Without

@@ -5,9 +5,12 @@
 //! agent how to set up the guest (see [`guest`]). It also has the constants that both
 //! sides of the VM need to agree on, and how sizes are written (see [`size`]).
 //!
-//! Each message is a frame: a little-endian u32 length and the message in postcard.
-//! bifrost, midgard and the agent come from the same installation, so the encoding does
-//! not need to be self-describing.
+//! Each message is a frame: a little-endian u32 length and the message in MessagePack,
+//! with structs as maps of their fields' names and enums by their variants' names
+//! (`rmp_serde::to_vec_named`). The encoding describes itself because the agent is built
+//! and distributed apart from midgard: a peer skips the fields that it does not know and
+//! uses the defaults of those that it misses, such that messages can grow; what else
+//! changes between midgard and the agent has a version (see [`version`]).
 
 #![warn(unreachable_pub)]
 
@@ -21,6 +24,7 @@ pub mod machine;
 pub mod runtime;
 pub mod session;
 pub mod size;
+pub mod version;
 
 /// The vsock CID of the host (midgard itself).
 pub const HOST_CID: u32 = 2;
@@ -55,7 +59,7 @@ fn invalid(error: impl std::fmt::Display) -> io::Error {
 
 /// Encodes a message as a frame.
 fn encode<T: Serialize>(message: &T) -> io::Result<Vec<u8>> {
-    let payload = postcard::to_stdvec(message).map_err(invalid)?;
+    let payload = rmp_serde::to_vec_named(message).map_err(invalid)?;
     if payload.len() > MAX_FRAME {
         return Err(invalid("message is too large"));
     }
@@ -93,7 +97,7 @@ pub fn read_message<T: DeserializeOwned>(reader: &mut impl Read) -> io::Result<O
     }
     let mut payload = vec![0u8; payload_length(header)?];
     reader.read_exact(&mut payload)?;
-    postcard::from_bytes(&payload).map(Some).map_err(invalid)
+    rmp_serde::from_slice(&payload).map(Some).map_err(invalid)
 }
 
 /// The same for async streams (the `async` feature).
@@ -127,7 +131,7 @@ pub mod nonblocking {
         }
         let mut payload = vec![0u8; payload_length(header)?];
         reader.read_exact(&mut payload).await?;
-        postcard::from_bytes(&payload).map(Some).map_err(invalid)
+        rmp_serde::from_slice(&payload).map(Some).map_err(invalid)
     }
 }
 
@@ -137,6 +141,7 @@ mod tests {
     use crate::guest::{Display, GuestConfig, Launch, Launcher, Ready};
     use crate::machine::{ConsoleKind, Disk, MachineConfig};
     use crate::session::{Exec, Request, Response, WindowSize};
+    use crate::version::{Hello, Versions};
 
     #[test]
     fn machine_config_round_trip() {
@@ -180,7 +185,7 @@ mod tests {
             control::Response::Console(b"Linux version".to_vec()),
             control::Response::Stopped("the guest powered off".into()),
             control::Response::Starting,
-            control::Response::Ready,
+            control::Response::Ready { protocol: 1 },
             control::Response::NoInstance,
             control::Response::Running(vec!["alpine".into()]),
             control::Response::List(control::Listing {
@@ -275,7 +280,7 @@ mod tests {
         round_trip_request(Request::Resize(WindowSize { rows: 1, cols: 2 }));
         round_trip_request(Request::Signal(15));
         round_trip_request(Request::Shutdown);
-        round_trip_request(Request::Ping);
+        round_trip_request(Request::Hello(Hello::OURS));
     }
 
     #[test]
@@ -287,7 +292,7 @@ mod tests {
             signal: Some(9),
         });
         round_trip_response(Response::Error("no such file".into()));
-        round_trip_response(Response::Pong);
+        round_trip_response(Response::Hello(Hello::OURS));
     }
 
     #[test]
@@ -300,6 +305,129 @@ mod tests {
         let mut buffer = Vec::new();
         write_message(&mut buffer, &launch).unwrap();
         assert_eq!(read_message(&mut &buffer[..]).unwrap(), Some(launch));
+    }
+
+    /// The encoding that other builds of the agent rely on.
+    #[test]
+    fn wire_format() {
+        let encode = |request: &Request| rmp_serde::to_vec_named(request).unwrap();
+        // A unit variant is its name.
+        assert_eq!(encode(&Request::StdinEof), b"\xa8StdinEof");
+        // Other variants are maps from their name to their value; bytes are binary.
+        assert_eq!(
+            encode(&Request::Stdin(vec![1, 200])),
+            b"\x81\xa5Stdin\xc4\x02\x01\xc8"
+        );
+        assert_eq!(encode(&Request::Signal(15)), b"\x81\xa6Signal\x0f");
+        // Structs are maps from their fields' names.
+        let exited = Response::Exited {
+            code: None,
+            signal: Some(9),
+        };
+        assert_eq!(
+            rmp_serde::to_vec_named(&exited).unwrap(),
+            b"\x81\xa6Exited\x82\xa4code\xc0\xa6signal\x09"
+        );
+        let mut frame = Vec::new();
+        write_message(&mut frame, &Request::StdinEof).unwrap();
+        assert_eq!(frame, b"\x09\0\0\0\xa8StdinEof");
+        // What midgard and the agent say first.
+        let hello = Hello {
+            protocol: Versions {
+                oldest: 1,
+                current: 2,
+            },
+        };
+        assert_eq!(
+            encode(&Request::Hello(hello)),
+            b"\x81\xa5Hello\x81\xa8protocol\x82\xa6oldest\x01\xa7current\x02"
+        );
+        assert_eq!(
+            rmp_serde::to_vec_named(&Response::Hello(hello)).unwrap(),
+            b"\x81\xa5Hello\x81\xa8protocol\x82\xa6oldest\x01\xa7current\x02"
+        );
+    }
+
+    /// A peer of another build sends fields that we do not know and lacks some of ours.
+    #[test]
+    fn tolerates_other_fields() {
+        #[derive(Serialize)]
+        struct NewerConfig {
+            init: Option<String>,
+            ready: Ready,
+            swap: Vec<u64>,
+            hostname: Option<String>,
+        }
+        let newer = NewerConfig {
+            init: Some("/sbin/init".into()),
+            ready: Ready::Notify,
+            swap: vec![1, 2],
+            hostname: Some("guest".into()),
+        };
+        let bytes = rmp_serde::to_vec_named(&newer).unwrap();
+        let config: GuestConfig = rmp_serde::from_slice(&bytes).unwrap();
+        let expected = GuestConfig {
+            init: Some("/sbin/init".into()),
+            ready: Ready::Notify,
+            ..GuestConfig::default()
+        };
+        assert_eq!(config, expected);
+
+        // An empty map.
+        let config: GuestConfig = rmp_serde::from_slice(b"\x80").unwrap();
+        assert_eq!(config, GuestConfig::default());
+
+        #[derive(Serialize)]
+        struct OlderExec {
+            argv: Vec<String>,
+        }
+        #[derive(Serialize)]
+        enum OlderRequest {
+            Exec(OlderExec),
+        }
+        let older = OlderRequest::Exec(OlderExec {
+            argv: vec!["ls".into()],
+        });
+        let bytes = rmp_serde::to_vec_named(&older).unwrap();
+        let expected = Request::Exec(Exec {
+            argv: vec!["ls".into()],
+            ..Exec::default()
+        });
+        assert_eq!(rmp_serde::from_slice::<Request>(&bytes).unwrap(), expected);
+    }
+
+    #[test]
+    fn config_file() {
+        use crate::guest::{ConfigError, encode_config, read_config};
+        use crate::version::{Mismatch, PROTOCOL};
+
+        let config = GuestConfig {
+            init: Some("/sbin/init".into()),
+            ..GuestConfig::default()
+        };
+        let file = encode_config(&config).unwrap();
+        let (version, read) = read_config(&mut file.as_slice()).unwrap();
+        assert_eq!((version, read), (PROTOCOL, config));
+
+        // A midgard that is too new for us; we do not look at its configuration.
+        let newer = Hello {
+            protocol: Versions {
+                oldest: PROTOCOL + 1,
+                current: PROTOCOL + 2,
+            },
+        };
+        let mut file = Vec::new();
+        write_message(&mut file, &newer).unwrap();
+        file.extend_from_slice(b"\x01\0\0\0\xc1");
+        let error = read_config(&mut file.as_slice()).unwrap_err();
+        assert!(matches!(
+            error,
+            ConfigError::Mismatch(Mismatch::PeerTooNew { .. })
+        ));
+        assert!(matches!(
+            read_config(&mut &[][..]).unwrap_err(),
+            ConfigError::Io(_)
+        ));
     }
 
     #[test]

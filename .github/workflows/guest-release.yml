@@ -1,8 +1,10 @@
 name: Guest release
 
 # Publishes the guest files that a run of guest.yml built as a release (guest-<date>), with
-# those of the previous guest release for the targets that the run did not build, and
-# deletes old guest releases (see guest/publish.py).
+# those of the previous guest release for the targets that the run did not build, makes it
+# what `bifrost pull` installs (it deploys the channel.json that lists it to GitHub Pages, whose
+# source must be set to GitHub Actions in the repository's settings) and then deletes old guest
+# releases (see guest/publish.py).
 
 on:
   workflow_dispatch:
@@ -10,10 +12,6 @@ on:
       run:
         description: The ID of the run of the Guest workflow
         required: true
-
-permissions:
-  contents: write
-  actions: read
 
 # (Releases of the same day would get the same tag.)
 concurrency:
@@ -23,6 +21,9 @@ jobs:
   release:
     name: Publish
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      actions: read
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -36,4 +37,33 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RUN: ${{ inputs.run }}
-        run: python3 guest/publish.py dist --run "$RUN"
+        run: python3 guest/publish.py release dist --run "$RUN" --site site
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+  deploy:
+    name: Deploy the channel
+    needs: release
+    runs-on: ubuntu-24.04
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}channel.json
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@v4
+  # (Only after the deployment: until then, the channel lists the previous release.)
+  prune:
+    name: Delete old releases
+    needs: deploy
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prune
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 guest/publish.py prune

@@ -4,8 +4,15 @@
 //! some settings belong to one of them only (see [`Role`]):
 //!
 //! ```toml
+//! # The format of the file (default: 1), see [`FORMAT`].
+//! format = 1
+//!
 //! # The guest's RAM (default: 1G).
 //! memory = "2G"
+//!
+//! # The boot files that midgard boots the guest with (default: linux), see
+//! # [`crate::boot`].
+//! boot-files = "linux"
 //!
 //! # About the template.
 //! [template]
@@ -47,6 +54,11 @@ use midgard_protocol::size::{format_size_exact, parse_size};
 use serde::Deserialize;
 use toml_edit::{DocumentMut, Item, Table, TableLike, Value};
 
+/// The newest format of settings files that this midgard reads. Templates are distributed
+/// apart from midgard, so a file that has what an older format lacks (e.g., a new
+/// setting) says so (`format`), such that an older midgard can tell that it is too old.
+pub const FORMAT: u32 = 1;
+
 /// The longest name of a user in the guest.
 const MAX_USER: usize = 32;
 
@@ -66,15 +78,20 @@ pub struct Settings {
     pub description: Option<String>,
     /// The guest's RAM (in bytes).
     pub memory: Option<u64>,
+    /// The boot files that midgard boots the guest with.
+    pub boot_files: Option<String>,
     /// How the agent sets up the guest.
     pub guest: GuestConfig,
 }
 
 /// The contents of a settings file.
 #[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
 struct SettingsFile {
+    #[expect(dead_code, reason = "checked before the rest of the file is read")]
+    format: Option<u32>,
     memory: Option<String>,
+    boot_files: Option<String>,
     #[serde(default)]
     template: TemplateSettings,
     #[serde(default)]
@@ -209,8 +226,23 @@ fn validate_user(user: &str) -> Result<()> {
     Ok(())
 }
 
+/// The format of a settings file, which is all that we read of a file of a newer format.
+#[derive(Deserialize)]
+struct Header {
+    format: Option<u32>,
+}
+
 /// Parses a settings file.
 pub fn parse(text: &str, role: Role) -> Result<Settings> {
+    let header: Header = toml::from_str(text)?;
+    match header.format {
+        Some(0) => bail!("format must be at least 1"),
+        Some(format) if format > FORMAT => bail!(
+            "it has the format {format}, which needs a newer midgard (this one reads up to \
+             format {FORMAT})"
+        ),
+        _ => {}
+    }
     let file: SettingsFile = toml::from_str(text)?;
     if role == Role::Template && file.template.name.is_some() {
         bail!("[template] name is only for instance files (a template's directory names it)");
@@ -224,8 +256,12 @@ pub fn parse(text: &str, role: Role) -> Result<Settings> {
             Ok(memory)
         })
         .context("invalid memory")?;
+    if let Some(boot_files) = &file.boot_files {
+        crate::instance::validate_name(boot_files).context("invalid boot-files")?;
+    }
     let guest = file.guest.to_config(role).context("invalid [guest]")?;
     Ok(Settings {
+        boot_files: file.boot_files,
         template: file.template.name,
         description: file.template.description,
         memory,
@@ -346,6 +382,9 @@ mod tests {
         assert_eq!(settings.memory, Some(2 << 30));
         assert_eq!(settings.template.as_deref(), Some("alpine"));
         assert_eq!(settings.description.as_deref(), Some("Alpine"));
+        assert_eq!(settings.boot_files, None);
+        let settings = parse("boot-files = \"managarm\"", Role::Template).unwrap();
+        assert_eq!(settings.boot_files.as_deref(), Some("managarm"));
         for invalid in [
             "memory = \"2X\"",
             "memory = \"0\"",
@@ -354,9 +393,26 @@ mod tests {
             "unknown = 1",
             "[other]",
             "[template]\nversion = 1",
+            "boot-files = \"../linux\"",
         ] {
             assert!(parse(invalid, Role::Instance).is_err(), "{invalid:?}");
         }
+    }
+
+    #[test]
+    fn formats() {
+        assert!(parse("format = 1\nmemory = \"2G\"", Role::Template).is_ok());
+        assert!(parse("format = 0", Role::Template).is_err());
+        // A newer format, with settings that we do not know.
+        let newer = format!(
+            "format = {}\nswap = \"1G\"\n[devices]\ngpu = true",
+            FORMAT + 1
+        );
+        let error = parse(&newer, Role::Template).unwrap_err().to_string();
+        assert!(error.contains("needs a newer midgard"), "{error}");
+        // The instance file keeps the format of its template.
+        let file = instance_file("format = 1\n[guest]\n", "alpine", Some(1 << 30), None).unwrap();
+        assert!(file.contains("format = 1"), "{file}");
     }
 
     #[test]

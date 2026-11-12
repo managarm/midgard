@@ -15,7 +15,7 @@ pub enum Request {
     /// bifrost closes the connection.
     Boot(Box<MachineConfig>),
     /// Input for the console of the VM that [`Request::Boot`] started.
-    Input(Vec<u8>),
+    Input(#[serde(with = "serde_bytes")] Vec<u8>),
     /// Connect to the agent in the VM of a VM instance, which midgard starts first if it
     /// does not run (and `start`). midgard answers [`Response::NoInstance`] if there is
     /// no such instance, [`Response::Starting`] if it starts the VM and
@@ -41,13 +41,17 @@ pub enum Request {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Response {
     /// Output of the VM's console.
-    Console(Vec<u8>),
+    Console(#[serde(with = "serde_bytes")] Vec<u8>),
     /// The VM stopped (why, for the user).
     Stopped(String),
     /// The VM of the VM instance boots.
     Starting,
-    /// The connection now goes to the agent.
-    Ready,
+    /// The connection now goes to the agent, which speaks this version of the guest
+    /// protocol with midgard (see [`crate::version`]): bifrost must not send what that
+    /// version lacks.
+    Ready {
+        protocol: u32,
+    },
     /// There is no such VM instance.
     NoInstance,
     Running(Vec<String>),

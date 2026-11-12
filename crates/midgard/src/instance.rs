@@ -1,7 +1,7 @@
 //! VM instances: a directory in midgard's instances directory (see
 //! [`paths::instances_dir`]) with the instance's settings (`instance.toml`, see
-//! [`crate::settings`]) and its disk (`disk.qcow2`), which midgard boots with its guest
-//! kernel and the agent.
+//! [`crate::settings`]) and its disk (`disk.qcow2`), which midgard boots with the
+//! instance's boot files (see [`crate::boot`]).
 
 use std::fs::File;
 use std::io::{self, Write};
@@ -12,6 +12,7 @@ use midgard_protocol::control::InstanceInfo;
 use midgard_protocol::machine::{ConsoleKind, Disk, MachineConfig};
 use midgard_protocol::runtime;
 
+use crate::boot::{self, BootFiles};
 use crate::settings::{self, Role, Settings};
 use crate::template::Template;
 use crate::{log, paths};
@@ -77,12 +78,16 @@ impl Instance {
         self.dir.join(DISK)
     }
 
-    /// The instance's VM.
-    pub fn config(&self) -> MachineConfig {
-        MachineConfig {
-            kernel: paths::kernel(),
+    /// The instance's VM, which boots with the instance's boot files (which must be
+    /// there and fit this midgard).
+    pub fn config(&self) -> Result<MachineConfig> {
+        let name = self.settings.boot_files.as_deref().unwrap_or(boot::DEFAULT);
+        let boot = BootFiles::load(name)?;
+        boot.check()?;
+        Ok(MachineConfig {
+            kernel: boot.kernel,
             initrd: None,
-            agent: Some(paths::agent()),
+            agent: Some(boot.agent),
             cmdline: None,
             append: Vec::new(),
             memory: self.settings.memory.unwrap_or(DEFAULT_MEMORY),
@@ -95,8 +100,8 @@ impl Instance {
             network: true,
             share: Some("/".into()),
             guest: self.settings.guest.clone(),
-            waypipe: paths::guest_waypipe(),
-        }
+            waypipe: boot.waypipe,
+        })
     }
 }
 

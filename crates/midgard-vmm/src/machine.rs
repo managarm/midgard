@@ -199,8 +199,7 @@ fn load_images(config: &MachineConfig) -> Result<(Vec<u8>, Option<Vec<u8>>)> {
     let kernel = read(&config.kernel, "the kernel")?;
     let initrd = match (&config.agent, &config.initrd) {
         (Some(agent), _) => {
-            let mut guest_config = Vec::new();
-            midgard_protocol::write_message(&mut guest_config, &config.guest)?;
+            let guest_config = midgard_protocol::guest::encode_config(&config.guest)?;
             let waypipe = match &config.waypipe {
                 Some(path) => Some(read(path, "the guest's waypipe")?),
                 None => None,

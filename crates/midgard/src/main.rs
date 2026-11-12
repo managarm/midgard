@@ -13,6 +13,7 @@
 //! [`boot`]). Work on files that takes a while (e.g., creating a VM instance) runs on
 //! [`blocking`]'s thread pool.
 
+mod boot;
 mod daemon;
 mod instance;
 mod paths;
