@@ -25,9 +25,14 @@ piper = "0.2.5"
 ruzstd = "0.9"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+sha2 = "0.10"
+# (Without xattr: we unpack only the files themselves.)
+tar = { version = "0.4", default-features = false }
 thiserror = "2"
 toml = "1"
 toml_edit = "0.25"
+# (Without gzip: what midgard downloads is compressed already.)
+ureq = { version = "3", default-features = false, features = ["rustls"] }
 zerocopy = { version = "0.8", features = ["derive"] }
 
 midgard-hv = { path = "crates/midgard-hv" }

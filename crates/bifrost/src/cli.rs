@@ -39,6 +39,9 @@ pub enum Action {
     /// List VM instances and templates
     List,
 
+    /// Install or update templates and the boot files that the VMs boot with
+    Pull(PullArgs),
+
     /// Stop a VM instance
     Shutdown(ShutdownArgs),
 
@@ -116,6 +119,22 @@ pub struct CreateArgs {
     /// Answer questions with their defaults
     #[arg(short = 'y', long)]
     pub yes: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct PullArgs {
+    /// The templates to install or update [default: only update the boot files]
+    #[arg(value_name = "TEMPLATE")]
+    pub templates: Vec<String>,
+
+    /// Update all installed templates, too
+    #[arg(short = 'a', long)]
+    pub all: bool,
+
+    /// The channel to pull from: a URL or a directory, e.g. the output directory of
+    /// guest/build.py [default: $MIDGARD_CHANNEL of midgard, or midgard's GitHub Pages]
+    #[arg(long, value_name = "CHANNEL")]
+    pub from: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -280,6 +299,19 @@ mod tests {
         // The VM is not an argument (that would be the command).
         assert_eq!(parse(&["dev", "ls"]).unwrap().run.command, ["dev", "ls"]);
         assert!(parse(&["-d", "dev", "ls"]).is_err());
+    }
+
+    #[test]
+    fn pull() {
+        let cli = parse(&["pull", "alpine", "debian", "--from", "dist"]).unwrap();
+        let Some(Action::Pull(pull)) = cli.action else {
+            panic!("not pull: {:?}", cli.action);
+        };
+        assert_eq!(pull.templates, ["alpine", "debian"]);
+        assert_eq!(pull.from.as_deref(), Some("dist"));
+        assert!(!pull.all);
+        let cli = parse(&["pull", "--all"]).unwrap();
+        assert!(matches!(cli.action, Some(Action::Pull(pull)) if pull.all));
     }
 
     #[test]

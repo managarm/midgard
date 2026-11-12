@@ -18,7 +18,7 @@ fn in_home(relative: &str) -> Option<PathBuf> {
 /// midgard's directory: MIDGARD_DATA_DIR, else /var/lib/midgard for root and
 /// $XDG_DATA_HOME/midgard (~/.local/share/midgard) for other users. It has the VM
 /// instances and the boot files and templates that the user installed (see
-/// guest/build.py).
+/// [`crate::pull`]).
 pub fn midgard_dir() -> PathBuf {
     if let Some(dir) = env_path("MIDGARD_DATA_DIR") {
         return dir;
@@ -33,11 +33,16 @@ pub fn midgard_dir() -> PathBuf {
         .join("midgard")
 }
 
+/// Where the boot files that the user installed are (see [`crate::pull`]).
+pub fn boot_root() -> PathBuf {
+    midgard_dir().join("boot")
+}
+
 /// The directory of the boot files `name` (see [`crate::boot`]): the one in
 /// [`midgard_dir`] if it exists, else the one that packages install (such that errors
 /// name it).
 pub fn boot_dir(name: &str) -> PathBuf {
-    let path = midgard_dir().join("boot").join(name);
+    let path = boot_root().join(name);
     if path.is_dir() {
         return path;
     }
@@ -68,4 +73,22 @@ pub fn names(dir: &Path) -> Vec<String> {
         .collect();
     names.sort();
     names
+}
+
+/// Removes the entries of `dir` that are no items but what making or removing one left
+/// behind when midgard stopped in the middle: those whose names start with a dot and end
+/// with one of `suffixes`. Nothing may make or remove items of `dir` meanwhile.
+pub fn remove_leftovers(dir: &Path, suffixes: &[&str]) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') && suffixes.iter().any(|suffix| name.ends_with(suffix)) {
+            crate::log!("removing {:?}, which midgard left behind", entry.path());
+            if let Err(error) = std::fs::remove_dir_all(entry.path()) {
+                crate::log!("failed to remove {:?}: {error}", entry.path());
+            }
+        }
+    }
 }

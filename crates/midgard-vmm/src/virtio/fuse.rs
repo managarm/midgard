@@ -177,12 +177,18 @@ fuse_struct!(
 
 fuse_struct!(
     /// struct fuse_batch_forget_in, followed by `count` [`ForgetOne`]s.
-    BatchForgetIn { count: u32, dummy: u32 }
+    BatchForgetIn {
+        count: u32,
+        dummy: u32
+    }
 );
 
 fuse_struct!(
     /// struct fuse_forget_one.
-    ForgetOne { nodeid: u64, nlookup: u64 }
+    ForgetOne {
+        nodeid: u64,
+        nlookup: u64
+    }
 );
 
 fuse_struct!(
@@ -257,7 +263,10 @@ fuse_struct!(
 
 fuse_struct!(
     /// struct fuse_mkdir_in, followed by the name.
-    MkdirIn { mode: u32, umask: u32 }
+    MkdirIn {
+        mode: u32,
+        umask: u32
+    }
 );
 
 fuse_struct!(
@@ -281,12 +290,18 @@ fuse_struct!(
 
 fuse_struct!(
     /// struct fuse_open_in.
-    OpenIn { flags: u32, open_flags: u32 }
+    OpenIn {
+        flags: u32,
+        open_flags: u32
+    }
 );
 
 fuse_struct!(
     /// struct fuse_access_in.
-    AccessIn { mask: u32, padding: u32 }
+    AccessIn {
+        mask: u32,
+        padding: u32
+    }
 );
 
 fuse_struct!(
@@ -336,7 +351,10 @@ fuse_struct!(
 
 fuse_struct!(
     /// struct fuse_write_out.
-    WriteOut { size: u32, padding: u32 }
+    WriteOut {
+        size: u32,
+        padding: u32
+    }
 );
 
 fuse_struct!(

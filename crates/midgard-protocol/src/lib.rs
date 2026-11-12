@@ -204,6 +204,18 @@ mod tests {
                 }],
                 templates_dir: "/var/lib/midgard/templates".into(),
             }),
+            control::Response::Pull(control::PullEvent::Downloading {
+                file: "alpine.tar".into(),
+                done: 1 << 20,
+                total: 1 << 30,
+            }),
+            control::Response::Pull(control::PullEvent::Installed(control::PullItem::BootFiles(
+                "linux".into(),
+            ))),
+            control::Response::Pulled(control::Pulled {
+                installed: vec!["alpine".into()],
+                available: vec!["debian".into()],
+            }),
             control::Response::Done,
             control::Response::Error("no such file".into()),
         ];
@@ -232,6 +244,11 @@ mod tests {
                 memory: Some(2 << 30),
             },
             control::Request::Delete { name: "dev".into() },
+            control::Request::Pull(control::Pull {
+                templates: vec!["alpine".into()],
+                all: false,
+                from: Some("/srv/guests".into()),
+            }),
         ];
         for request in &requests {
             write_message(&mut stream, request).unwrap();
