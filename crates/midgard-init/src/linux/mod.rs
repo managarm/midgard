@@ -206,7 +206,7 @@ fn load_config() -> Result<GuestConfig> {
             let advice = match mismatch {
                 Mismatch::PeerTooOld { .. } => "midgard is too old for this agent: update midgard",
                 Mismatch::PeerTooNew { .. } => {
-                    "this agent is too old for midgard: update the guest files"
+                    "this agent is too old for midgard: bifrost pull updates the boot files"
                 }
             };
             bail!("{advice} (midgard speaks {mismatch})")

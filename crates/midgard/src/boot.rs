@@ -1,10 +1,10 @@
 //! Boot files, which midgard boots guests with: a directory in midgard's boot directory
-//! (see [`paths::boot_dir`]; guest/build.py installs them) with the guest kernel
-//! (`vmlinuz`), the agent (`midgard-init`), the guest's waypipe (`guest-waypipe`, if
-//! there is one) and `manifest.json`, which says what the files are. They are built and
-//! distributed apart from midgard (and from the templates, whose instances say which
-//! boot files they boot with), so the manifest says which versions of the guest protocol
-//! the agent speaks.
+//! (see [`paths::boot_dir`]; `bifrost pull` installs them, see [`crate::pull`]) with the
+//! guest kernel (`vmlinuz`), the agent (`midgard-init`), the guest's waypipe
+//! (`guest-waypipe`, if there is one) and `manifest.json`, which says what the files are.
+//! They are built and distributed apart from midgard (and from the templates, whose
+//! instances say which boot files they boot with), so the manifest says which versions of
+//! the guest protocol the agent speaks.
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -64,7 +64,7 @@ impl BootFiles {
             .collect::<Vec<_>>();
         if !missing.is_empty() {
             bail!(
-                "the boot files {name} lack {} (in {}; guest/build.py install installs them)",
+                "the boot files {name} lack {} (in {}; bifrost pull installs them)",
                 missing.join(" and "),
                 dir.display()
             );
@@ -113,7 +113,9 @@ pub fn write_manifest(dir: &Path, manifest: &Manifest) -> Result<()> {
 pub fn negotiate(agent: Versions) -> Result<u32> {
     Versions::OURS.negotiate(agent).map_err(|mismatch| {
         let advice = match mismatch {
-            Mismatch::PeerTooOld { .. } => "is too old for this midgard: update the boot files",
+            Mismatch::PeerTooOld { .. } => {
+                "is too old for this midgard: bifrost pull updates the boot files"
+            }
             Mismatch::PeerTooNew { .. } => "is too new for this midgard: update midgard",
         };
         anyhow!("the guest agent (midgard-init) {advice} (it speaks {mismatch})")
@@ -161,7 +163,7 @@ mod tests {
                 current: 1,
             };
             let error = negotiate(older).unwrap_err().to_string();
-            assert!(error.contains("update the boot files"), "{error}");
+            assert!(error.contains("bifrost pull"), "{error}");
         }
     }
 }

@@ -124,7 +124,7 @@ fn format_listing(listing: &Listing) -> String {
     out.push('\n');
     if listing.templates.is_empty() {
         out += &format!(
-            "No templates in {} (guest/build.py install installs them).\n",
+            "No templates in {} (bifrost pull <template> installs one).\n",
             listing.templates_dir.display()
         );
     } else {
@@ -220,14 +220,12 @@ fn create_instance(
     }
     let Some(info) = listing.templates.iter().find(|info| info.name == template) else {
         let names: Vec<_> = listing.templates.iter().map(|info| &*info.name).collect();
-        if names.is_empty() {
-            bail!(
-                "no template {template} (there are no templates in {}; guest/build.py \
-                 install installs them)",
-                listing.templates_dir.display()
-            );
-        }
-        bail!("no template {template} (there are {})", names.join(", "));
+        let installed = if names.is_empty() {
+            "no templates are installed".into()
+        } else {
+            format!("there are {}", names.join(", "))
+        };
+        bail!("no template {template} ({installed}; bifrost pull {template} installs it)");
     };
     if let Some(error) = &info.error {
         bail!("{error}");
@@ -790,7 +788,7 @@ mod tests {
         assert_eq!(
             format_listing(&empty),
             "No VM instances (bifrost create makes one).\n\n\
-             No templates in /templates (guest/build.py install installs them).\n"
+             No templates in /templates (bifrost pull <template> installs one).\n"
         );
     }
 

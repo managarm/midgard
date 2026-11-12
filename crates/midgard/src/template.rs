@@ -1,8 +1,8 @@
 //! Templates, which VM instances are created from: a directory in midgard's templates
-//! directory (see [`paths::templates_dir`]; guest/build.py installs them) with the
-//! default settings of its instances (`template.toml`, see [`crate::settings`]) and the
-//! disk that their disks start as a copy of (`disk.qcow2`, or `disk.qcow2.zst`, which is
-//! compressed with zstd).
+//! directory (see [`paths::templates_dir`]; `bifrost pull` installs them, see
+//! [`crate::pull`]) with the default settings of its instances (`template.toml`, see
+//! [`crate::settings`]) and the disk that their disks start as a copy of (`disk.qcow2`, or
+//! `disk.qcow2.zst`, which is compressed with zstd).
 
 use std::ffi::OsStr;
 use std::fs::File;
@@ -48,7 +48,7 @@ impl Template {
         let text = match std::fs::read_to_string(&path) {
             Ok(text) => text,
             Err(error) if error.kind() == io::ErrorKind::NotFound => bail!(
-                "no template {name} (in {}; guest/build.py install installs templates)",
+                "no template {name} (in {}; bifrost pull {name} installs it)",
                 dir.display()
             ),
             Err(error) => return Err(error).with_context(|| format!("failed to read {path:?}")),
