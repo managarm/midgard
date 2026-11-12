@@ -20,7 +20,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use async_io::{Async, Timer};
-use midgard_protocol::guest::{CONFIG_FILE, Display, GuestConfig};
+use midgard_protocol::guest::{CONFIG_FILE, ConfigError, Display, GuestConfig, read_config};
+use midgard_protocol::version::{Mismatch, PROTOCOL};
 use midgard_protocol::{AGENT_PORT, SHARE_MOUNT, SHARE_TAG, param};
 use sys::{Error, mount};
 
@@ -107,11 +108,12 @@ fn boot() -> Result<()> {
     mount("proc", "/proc", "proc", 0, None)?;
     sys::open_console();
 
+    // First of all, whether midgard and we fit together: the rest depends on it.
+    let config = load_config()?;
     let cmdline = std::fs::read_to_string("/proc/cmdline").context("reading /proc/cmdline")?;
     let root = parameter(&cmdline, param::ROOT)
         .with_context(|| format!("no {}= parameter", param::ROOT))?;
     let fstype = parameter(&cmdline, param::ROOT_FSTYPE).unwrap_or_else(|| "ext4".into());
-    let config = load_config();
     let waypipe = display::load();
 
     // The disk shows up once its driver probed it.
@@ -171,18 +173,44 @@ fn boot() -> Result<()> {
     agent(watcher, agent_display)
 }
 
-/// Reads the guest configuration from the initramfs (before we leave it).
-fn load_config() -> GuestConfig {
+/// Reads the guest configuration from the initramfs (before we leave it). Fails if
+/// midgard speaks no version of the guest protocol that we speak, or if we cannot read
+/// its configuration (we do not guess what it wants).
+fn load_config() -> Result<GuestConfig> {
     let path = format!("/{CONFIG_FILE}");
-    let result = File::open(&path)
-        .and_then(|mut file| midgard_protocol::read_message(&mut file))
-        .map(Option::unwrap_or_default);
+    let mut file = match File::open(&path) {
+        Ok(file) => file,
+        // An initramfs that midgard did not build.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            log!("no {path}; using the default configuration");
+            return Ok(GuestConfig::default());
+        }
+        Err(error) => bail!("reading {path}: {error}"),
+    };
+    let result = read_config(&mut file);
     // The initramfs stays in memory.
     let _ = std::fs::remove_file(&path);
-    result.unwrap_or_else(|error| {
-        log!("reading {path}: {error}; using the default configuration");
-        GuestConfig::default()
-    })
+    match result {
+        Ok((version, config)) => {
+            if version != PROTOCOL {
+                log!("midgard is older: speaking version {version} of the guest protocol");
+            }
+            Ok(config)
+        }
+        Err(ConfigError::Mismatch(mismatch)) => {
+            let advice = match mismatch {
+                Mismatch::PeerTooOld { .. } => "midgard is too old for this agent: update midgard",
+                Mismatch::PeerTooNew { .. } => {
+                    "this agent is too old for midgard: update the guest files"
+                }
+            };
+            bail!("{advice} (midgard speaks {mismatch})")
+        }
+        Err(ConfigError::Io(error)) => bail!(
+            "cannot read midgard's configuration in {path} ({error}): midgard and this agent \
+             do not fit together"
+        ),
+    }
 }
 
 /// Copies ourselves to [`HELPER`], such that the guest can run us.

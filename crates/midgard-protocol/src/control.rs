@@ -46,8 +46,12 @@ pub enum Response {
     Stopped(String),
     /// The VM of the VM instance boots.
     Starting,
-    /// The connection now goes to the agent.
-    Ready,
+    /// The connection now goes to the agent, which speaks this version of the guest
+    /// protocol with midgard (see [`crate::version`]): bifrost must not send what that
+    /// version lacks.
+    Ready {
+        protocol: u32,
+    },
     /// There is no such VM instance.
     NoInstance,
     Running(Vec<String>),

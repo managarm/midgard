@@ -18,12 +18,13 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use async_io::{Async, Timer};
 use event_listener::Event;
 use futures_lite::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, future};
 use midgard_protocol::nonblocking::{read_message, write_message};
 use midgard_protocol::session::{Request, Response};
+use midgard_protocol::version::{Hello, Mismatch, Versions};
 use midgard_protocol::{AGENT_PORT, WAYPIPE_PORT, control, runtime};
 use midgard_vmm::{Machine, MachineHandle, VsockStream};
 
@@ -36,8 +37,9 @@ const BOOT_TIMEOUT: Duration = Duration::from_secs(600);
 /// answers the connection request because its vsock driver is not up).
 const PING_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Waits until the agent answers.
-async fn wait_for_agent(machine: &Machine) -> Result<()> {
+/// Waits until the agent answers; returns the version of the guest protocol to speak
+/// with it.
+async fn wait_for_agent(machine: &Machine) -> Result<u32> {
     let handle = machine.handle();
     let deadline = Instant::now() + BOOT_TIMEOUT;
     loop {
@@ -49,9 +51,9 @@ async fn wait_for_agent(machine: &Machine) -> Result<()> {
             None
         });
         if let Some(answered) = ping.await
-            && answered?
+            && let Some(hello) = answered?
         {
-            return Ok(());
+            return negotiate(hello.protocol);
         }
         if Instant::now() > deadline {
             bail!(
@@ -63,16 +65,27 @@ async fn wait_for_agent(machine: &Machine) -> Result<()> {
     }
 }
 
-/// Returns whether the agent answered; false if it does not listen yet.
-async fn ping_agent(machine: &MachineHandle) -> Result<bool> {
+/// The version of the guest protocol to speak with an agent that speaks `agent`.
+fn negotiate(agent: Versions) -> Result<u32> {
+    Versions::OURS.negotiate(agent).map_err(|mismatch| {
+        let advice = match mismatch {
+            Mismatch::PeerTooOld { .. } => "is too old for this midgard: update the guest files",
+            Mismatch::PeerTooNew { .. } => "is too new for this midgard: update midgard",
+        };
+        anyhow!("the guest agent (midgard-init) {advice} (it speaks {mismatch})")
+    })
+}
+
+/// Returns what the agent answered; None if it does not listen yet.
+async fn ping_agent(machine: &MachineHandle) -> Result<Option<Hello>> {
     let mut stream = match machine.vsock_connect(AGENT_PORT).await {
         Ok(stream) => stream,
-        Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => return Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => return Ok(None),
         Err(error) => return Err(error).context("failed to connect to the agent"),
     };
-    write_message(&mut stream, &Request::Ping).await?;
+    write_message(&mut stream, &Request::Hello(Hello::OURS)).await?;
     match read_message::<Response>(&mut stream).await? {
-        Some(Response::Pong) => Ok(true),
+        Some(Response::Hello(hello)) => Ok(Some(hello)),
         other => bail!("unexpected answer from the agent: {other:?}"),
     }
 }
@@ -244,8 +257,9 @@ async fn connect_waypipe(socket: &Path) -> io::Result<Async<UnixStream>> {
 enum State {
     /// The VM boots; the agent does not answer yet.
     Booting,
-    /// The agent answers; sessions run as tasks on the VM's executor.
-    Ready(MachineHandle),
+    /// The agent answers (and speaks this version of the guest protocol); sessions run as
+    /// tasks on the VM's executor.
+    Ready(MachineHandle, u32),
     /// The VM did not boot, or it stopped.
     Gone(String),
 }
@@ -378,12 +392,12 @@ impl Instances {
         }
         let ready = match &*running.state.lock().unwrap() {
             State::Booting => unreachable!(),
-            State::Ready(machine) => Ok(machine.clone()),
+            State::Ready(machine, protocol) => Ok((machine.clone(), *protocol)),
             State::Gone(reason) => Err(reason.clone()),
         };
         match ready {
-            Ok(machine) => {
-                respond(&stream, control::Response::Ready).await?;
+            Ok((machine, protocol)) => {
+                respond(&stream, control::Response::Ready { protocol }).await?;
                 // The session's task runs on the VM's executor.
                 machine.spawn(forward(stream, machine.clone()));
             }
@@ -460,13 +474,16 @@ fn boot_instance(name: &str, running: &Running) -> Result<String> {
     if let Some(gui) = &gui {
         forward_waypipe(&handle, gui);
     }
-    if let Err(error) = machine.run(wait_for_agent(&machine)) {
-        handle.stop();
-        let _ = machine.run_until_stopped();
-        return Err(error);
-    }
+    let protocol = match machine.run(wait_for_agent(&machine)) {
+        Ok(protocol) => protocol,
+        Err(error) => {
+            handle.stop();
+            let _ = machine.run_until_stopped();
+            return Err(error);
+        }
+    };
     log!("{name} is ready");
-    running.set(State::Ready(handle));
+    running.set(State::Ready(handle, protocol));
 
     let result = machine.run_until_stopped();
     drop(gui);

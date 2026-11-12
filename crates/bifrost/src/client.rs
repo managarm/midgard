@@ -367,7 +367,8 @@ fn connect(name: &str, start: bool) -> Result<UnixStream> {
                     log!("starting {name}...");
                 }
             }
-            Some(control::Response::Ready) => return Ok(stream),
+            // (Nothing that we send depends on the version of the guest protocol yet.)
+            Some(control::Response::Ready { protocol: _ }) => return Ok(stream),
             Some(control::Response::NoInstance) => return Err(NoInstance(name.into()).into()),
             Some(control::Response::Error(message)) => bail!("{message}"),
             Some(other) => bail!("unexpected answer from midgard: {other:?}"),
@@ -583,7 +584,7 @@ fn session(stream: UnixStream, writer: Arc<Mutex<UnixStream>>, tty: bool) -> Res
                     return Ok(code.unwrap_or_else(|| 128 + signal.unwrap_or(0)));
                 }
                 Some(Response::Error(message)) => bail!("{message}"),
-                Some(Response::Pong) => {}
+                Some(Response::Hello(_)) => {}
                 None => bail!("the VM closed the connection"),
             }
         }

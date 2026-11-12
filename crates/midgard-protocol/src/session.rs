@@ -3,7 +3,7 @@
 //! A session starts with [`control::Request::Session`]. Once midgard answered
 //! [`control::Response::Ready`], it forwards the connection to the agent over vsock
 //! without looking at it. One connection carries one session: the client's first message
-//! to the agent is [`Request::Exec`] (or [`Request::Ping`] / [`Request::Shutdown`]); then
+//! to the agent is [`Request::Exec`] (or [`Request::Hello`] / [`Request::Shutdown`]); then
 //! stdin, resizes and signals flow to the agent and output flows back until
 //! [`Response::Exited`].
 //!
@@ -11,6 +11,8 @@
 //! [`control::Response::Ready`]: crate::control::Response::Ready
 
 use serde::{Deserialize, Serialize};
+
+use crate::version::Hello;
 
 /// The size of a terminal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,8 +47,10 @@ pub enum Request {
     Signal(i32),
     /// Shut down the guest (the VM stops).
     Shutdown,
-    /// Answered with [`Response::Pong`]; checks that the agent is up.
-    Ping,
+    /// Answered with [`Response::Hello`]: midgard checks that the agent is up and which
+    /// versions of the guest protocol it speaks. Every version of the agent needs to
+    /// understand this request, so its encoding must not change.
+    Hello(Hello),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -62,5 +66,7 @@ pub enum Response {
         signal: Option<i32>,
     },
     Error(String),
-    Pong,
+    /// The versions of the guest protocol that the agent speaks. Every version of midgard
+    /// needs to understand this response, so its encoding must not change.
+    Hello(Hello),
 }
