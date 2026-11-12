@@ -6,6 +6,7 @@ mod launcher;
 mod process;
 mod ready;
 mod reaper;
+mod resize;
 mod rt;
 mod session;
 mod sys;
@@ -123,6 +124,9 @@ fn boot() -> Result<()> {
         std::thread::sleep(Duration::from_millis(10));
     }
     mount(&root, "/newroot", &fstype, 0, None)?;
+    if fstype == "ext4" {
+        resize::grow_root(&root, "/newroot");
+    }
 
     // Move /dev and /proc into the new root and make it the root (like switch_root;
     // the initramfs stays in memory, but only we are left in it).
