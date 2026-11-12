@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use async_io::{Async, Timer};
 use midgard_protocol::guest::{CONFIG_FILE, ConfigError, Display, GuestConfig, read_config};
-use midgard_protocol::version::{Mismatch, PROTOCOL};
+use midgard_protocol::version::{Mismatch, OLDEST_PROTOCOL, PROTOCOL};
 use midgard_protocol::{AGENT_PORT, SHARE_MOUNT, SHARE_TAG, param};
 use sys::{Error, mount};
 
@@ -84,6 +84,11 @@ pub fn main() {
         Some("ready") => ready::notify().map_err(|error| error.to_string()),
         Some("waypipe") => display::server(std::env::args().nth(2)),
         Some("pause") => display::pause(),
+        Some("protocol") => {
+            // For guest/build.py: the versions of the guest protocol that we speak.
+            println!("{OLDEST_PROTOCOL} {PROTOCOL}");
+            Ok(())
+        }
         Some(mode) => Err(format!("unknown mode {mode:?} (the agent runs as PID 1)")),
     };
     if let Err(error) = result {

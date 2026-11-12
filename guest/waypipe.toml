@@ -1,0 +1,7 @@
+# The waypipe release that build.py builds the guest's waypipe from (a static build
+# without its optional features, i.e., without compression, DMABUFs and video). It talks
+# to the `waypipe client` of midgard's host, so it should be the host's release.
+version = "0.11.3"
+git = "https://gitlab.freedesktop.org/mstoeckl/waypipe.git"
+tag = "v0.11.3"
+commit = "3ea049b2d33cbf1000714c28b9668f8c244f70bd"

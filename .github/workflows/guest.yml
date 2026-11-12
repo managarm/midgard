@@ -1,8 +1,8 @@
 name: Guest
 
-# Builds the guest kernel and the distributions' images (guest/build.py) as artifacts when
-# their inputs change (all of them when the workflow runs manually). guest-release.yml
-# publishes the artifacts of a run as a release.
+# Builds the guest kernel, the agent, the guest's waypipe and the distributions' images
+# (guest/build.py) as artifacts when their inputs change (all of them when the workflow runs
+# manually). guest-release.yml publishes the artifacts of a run as a release.
 
 on:
   push:
@@ -11,10 +11,14 @@ on:
       - "**"
     paths:
       - "guest/**"
+      - "crates/midgard-init/**"
+      - "crates/midgard-protocol/**"
       - ".github/workflows/guest.yml"
   pull_request:
     paths:
       - "guest/**"
+      - "crates/midgard-init/**"
+      - "crates/midgard-protocol/**"
       - ".github/workflows/guest.yml"
   workflow_dispatch:
 
@@ -66,6 +70,11 @@ jobs:
           user=$(id -un)
           grep -q "^$user:" /etc/subuid || sudo usermod --add-subuids 100000-165535 "$user"
           grep -q "^$user:" /etc/subgid || sudo usermod --add-subgids 100000-165535 "$user"
+      # The agent and the guest's waypipe are static binaries.
+      - uses: dtolnay/rust-toolchain@stable
+        if: matrix.target == 'agent' || matrix.target == 'waypipe'
+        with:
+          targets: x86_64-unknown-linux-musl
       - name: Build
         env:
           TARGET: ${{ matrix.target }}

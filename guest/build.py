@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """Builds midgard's guest files on a Linux host: the guest kernel (vmlinuz), which midgard
-boots with midgard-init as the initramfs, and the distributions' disk images.
+boots with the agent (midgard-init) and the guest's waypipe in the initramfs, and the
+distributions' disk images.
 
     build.py install [<target>...] [--release <tag> | --run <id> | --local] [-d <dir>]
     build.py build <target>... [-o <dir>]
     build.py targets [--changed-since <commit>]
 
-The targets are `kernel` (guest/kernel.toml and guest/linux.config) and the images in
-guest/images/<name>: image.toml says how to bootstrap the root file system, the files in
+The targets are `kernel` (guest/kernel.toml and guest/linux.config), `agent`
+(crates/midgard-init as a static binary, with the versions of the guest protocol that it
+speaks in agent.json), `waypipe` (guest/waypipe.toml, a static binary, too) and the images
+in guest/images/<name>: image.toml says how to bootstrap the root file system, the files in
 overlay/ are copied into it, and `provision`, a shell script, runs in a chroot of it (as
 root, with the network), e.g., to install packages. An image is midgard's template <name>:
 <name>.tar with the template's directory, <name>/disk.qcow2.zst (its sparse 64 GiB ext4
@@ -15,8 +18,8 @@ file system as a qcow2 image, compressed with zstd) and <name>/template.toml (th
 of the VM instances that midgard creates from it).
 
 `install` installs targets' files into midgard's directory (default: $MIDGARD_DATA_DIR,
-/var/lib/midgard for root or ~/.local/share/midgard), where midgard finds the kernel and the
-templates: those that CI
+/var/lib/midgard for root or ~/.local/share/midgard), where midgard finds the kernel, the
+agent, the guest's waypipe and the templates: those that CI
 built (.github/workflows/guest.yml), from the newest guest release (guest-<date>) by
 default, from another release or from a workflow run (which needs gh), or those that
 `build` built (--local). `build` builds targets into the output directory (--build-dir of
@@ -32,7 +35,9 @@ any owner and the package managers can run the packages' scripts.
 Downloads and intermediate files are in $XDG_CACHE_HOME/midgard-build
 (~/.cache/midgard-build); the output directory defaults to its dist directory. Needs
 Python 3.12, and `build` needs what building Linux needs (make, gcc, flex, bison, bc, the
-libelf headers) and, for images, util-linux (unshare, mount), e2fsprogs and zstd.
+libelf headers) for the kernel, cargo with the target x86_64-unknown-linux-musl for the
+agent and waypipe (and git for the latter) and, for images, util-linux (unshare, mount),
+e2fsprogs and zstd.
 """
 
 import argparse
@@ -64,6 +69,11 @@ INSTALLED_FROM = "installed-from"
 RELEASE_PREFIX = "guest-"
 # The workflow that builds the targets.
 WORKFLOW = ".github/workflows/guest.yml"
+# The targets that are no images: what midgard boots the guests with.
+BOOT_TARGETS = ["kernel", "agent", "waypipe"]
+# The agent and the guest's waypipe are static binaries, which run in any distribution.
+RUST_TARGET = "x86_64-unknown-linux-musl"
+CRATES = REPO / "crates"
 
 
 class Failure(Exception):
@@ -128,8 +138,8 @@ def load_toml(path):
 
 
 def targets():
-    """The kernel and the images."""
-    return ["kernel"] + sorted(path.parent.name for path in IMAGES.glob("*/image.toml"))
+    """The kernel, the agent, the guest's waypipe and the images."""
+    return BOOT_TARGETS + sorted(path.parent.name for path in IMAGES.glob("*/image.toml"))
 
 
 def inputs(target):
@@ -137,6 +147,14 @@ def inputs(target):
     files = [GUEST / "build.py"]
     if target == "kernel":
         files += [GUEST / "kernel.toml", GUEST / "linux.config"]
+    elif target == "agent":
+        # (With the crate of the guest protocol, which it is built with.)
+        files += [CRATES / "midgard-init" / "Cargo.toml", CRATES / "midgard-init" / "Cargo.lock"]
+        files += [CRATES / "midgard-protocol" / "Cargo.toml"]
+        for crate in ["midgard-init", "midgard-protocol"]:
+            files += sorted(path for path in (CRATES / crate / "src").rglob("*") if path.is_file())
+    elif target == "waypipe":
+        files += [GUEST / "waypipe.toml"]
     else:
         files += [GUEST / "mkqcow2.py", GUEST / "rootfs.py"]
         files += sorted(
@@ -163,12 +181,13 @@ def git_commit():
     return result.stdout.strip() if result.returncode == 0 else None
 
 
-def write_manifest(out, target, files):
+def write_manifest(out, target, files, extra):
     manifest = {
         "target": target,
         "inputs": inputs_hash(target),
         "commit": git_commit(),
         "files": {name: file_sha256(out / name) for name in files},
+        **extra,
     }
     (out / f"{target}.json").write_text(json.dumps(manifest, indent=2) + "\n")
 
@@ -225,7 +244,66 @@ def build_kernel(out):
         log(f"warning: the kernel configuration lacks {', '.join(dropped)}")
     run(*make, f"-j{os.cpu_count()}", "bzImage", env=env)
     shutil.copyfile(build / "arch/x86/boot/bzImage", out / "vmlinuz")
-    return ["vmlinuz"]
+    return ["vmlinuz"], {}
+
+
+def cargo_build(manifest, name, *args, env={}):
+    """Builds a binary of a crate for RUST_TARGET (with its lockfile); returns its path."""
+    require("cargo")
+    target_dir = CACHE / f"{name}-target"
+    run(
+        "cargo", "build", "--release", "--locked", "--target", RUST_TARGET,
+        "--manifest-path", manifest, "--target-dir", target_dir, *args,
+        env=dict(os.environ, **env),
+    )  # fmt: skip
+    return target_dir / RUST_TARGET / "release" / name
+
+
+def build_agent(out):
+    """Builds midgard-init and asks it which versions of the guest protocol it speaks
+    (see crates/midgard-protocol/src/version.rs)."""
+    log("building midgard-init")
+    binary = cargo_build(CRATES / "midgard-init" / "Cargo.toml", "midgard-init")
+    shutil.copyfile(binary, out / "midgard-init")
+    (out / "midgard-init").chmod(0o755)
+    answer = subprocess.run(
+        [str(out / "midgard-init"), "protocol"], check=True, capture_output=True, text=True
+    ).stdout.split()
+    if len(answer) != 2 or not all(version.isdecimal() for version in answer):
+        raise Failure(f"midgard-init protocol printed {' '.join(answer)!r} instead of two versions")
+    return ["midgard-init"], {"protocol": {"oldest": int(answer[0]), "current": int(answer[1])}}
+
+
+def build_waypipe(out):
+    """Builds guest-waypipe from the pinned release, without its optional features (which
+    need C libraries)."""
+    require("git")
+    pin = load_toml(GUEST / "waypipe.toml")
+    source = CACHE / f"waypipe-{pin['commit']}"
+    if not (source / "Cargo.toml").exists():
+        log(f"cloning waypipe {pin['version']}")
+        partial = CACHE / "waypipe.partial"
+        shutil.rmtree(partial, ignore_errors=True)
+        CACHE.mkdir(parents=True, exist_ok=True)
+        run("git", "clone", "--quiet", "--depth", "1", "--branch", pin["tag"], pin["git"], partial)
+        head = subprocess.run(
+            ["git", "-C", str(partial), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        if head != pin["commit"]:
+            shutil.rmtree(partial)
+            raise Failure(f"{pin['git']} has {pin['tag']} at {head} instead of {pin['commit']}")
+        partial.rename(source)
+    log(f"building waypipe {pin['version']}")
+    binary = cargo_build(
+        source / "Cargo.toml", "waypipe", "--no-default-features", "--bin", "waypipe",
+        env={"CARGO_PROFILE_RELEASE_STRIP": "debuginfo"},
+    )  # fmt: skip
+    shutil.copyfile(binary, out / "guest-waypipe")
+    (out / "guest-waypipe").chmod(0o755)
+    return ["guest-waypipe"], {"version": pin["version"]}
 
 
 def fetch_downloads(table):
@@ -320,7 +398,7 @@ def build_image(name, out, namespace):
             work.rmdir()
         except OSError:
             pass
-    return [f"{name}.tar"]
+    return [f"{name}.tar"], {}
 
 
 def cmd_build(args):
@@ -328,17 +406,18 @@ def cmd_build(args):
     for target in args.targets:
         if target not in targets():
             raise Failure(f"there is no target {target} (the targets: {', '.join(targets())})")
-    if any(target != "kernel" for target in args.targets):
+    if any(target not in BOOT_TARGETS for target in args.targets):
         require("zstd")
         namespace = namespace_command()
     os.umask(0o022)
     out.mkdir(parents=True, exist_ok=True)
+    builders = {"kernel": build_kernel, "agent": build_agent, "waypipe": build_waypipe}
     for target in args.targets:
-        if target == "kernel":
-            files = build_kernel(out)
+        if target in builders:
+            files, extra = builders[target](out)
         else:
-            files = build_image(target, out, namespace)
-        write_manifest(out, target, files)
+            files, extra = build_image(target, out, namespace)
+        write_manifest(out, target, files, extra)
         log(f"built {target}: {', '.join(files)} in {out}")
 
 
@@ -391,7 +470,7 @@ def installed(data, name, sha256):
 def check_format(entry, source):
     """Fails for images in the format from before templates were tar files."""
     target = entry["target"]
-    if target != "kernel" and list(entry["files"]) != [f"{target}.tar"]:
+    if target not in BOOT_TARGETS and list(entry["files"]) != [f"{target}.tar"]:
         raise Failure(
             f"{source} has {target} in an older format (without {target}.tar), which midgard "
             "does not use anymore"
@@ -433,6 +512,7 @@ def install_files(directory, files, data):
         else:
             partial = data / f"{name}.partial"
             shutil.copyfile(directory / name, partial)
+            partial.chmod(0o755 if name != "vmlinuz" else 0o644)
             partial.rename(data / name)
 
 
