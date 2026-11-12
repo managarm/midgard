@@ -293,6 +293,11 @@ fn setup_root() {
             log!("{error}");
         }
     }
+    // Wayland clients (and waypipe, which mirrors their buffers) map large, sparse shared
+    // memory pools; the heuristic would refuse those that exceed the guest's small RAM.
+    if let Err(error) = std::fs::write("/proc/sys/vm/overcommit_memory", "1") {
+        log!("enabling memory overcommit: {error}");
+    }
     // Some distributions expect /dev/ptmx to be the devpts one.
     if !std::path::Path::new("/dev/ptmx").exists() {
         let _ = std::os::unix::fs::symlink("pts/ptmx", "/dev/ptmx");
