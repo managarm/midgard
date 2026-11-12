@@ -113,6 +113,10 @@ pub struct CreateArgs {
     #[arg(long, value_name = "SIZE", value_parser = parse_size)]
     pub memory: Option<u64>,
 
+    /// The size of the VM instance's disk, e.g. 128G [default: the template's]
+    #[arg(long, value_name = "SIZE", value_parser = parse_size)]
+    pub disk_size: Option<u64>,
+
     /// Answer questions with their defaults
     #[arg(short = 'y', long)]
     pub yes: bool,
@@ -422,6 +426,7 @@ mod tests {
         assert_eq!(create.name, "dev");
         assert_eq!(create.template.as_deref(), Some("debian"));
         assert_eq!(create.memory, Some(512 << 20));
+        assert_eq!(create.disk_size, None);
         assert_eq!(create.user, None);
         let cli = parse(&["create", "-y", "-u", "alice", "alpine"]).unwrap();
         let Some(Action::Create(create)) = cli.action else {
@@ -429,6 +434,11 @@ mod tests {
         };
         assert_eq!(create.user.as_deref(), Some("alice"));
         assert!(create.yes);
+        let cli = parse(&["create", "dev", "--disk-size", "128G"]).unwrap();
+        let Some(Action::Create(create)) = cli.action else {
+            panic!("not create: {:?}", cli.action);
+        };
+        assert_eq!(create.disk_size, Some(128 << 30));
         assert!(parse(&["create"]).is_err());
     }
 

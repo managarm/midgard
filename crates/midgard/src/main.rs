@@ -253,10 +253,11 @@ async fn serve(stream: Async<UnixStream>) -> Result<()> {
             template,
             user,
             memory,
+            disk_size,
         } => {
             answer(move || {
                 let _reservation = INSTANCES.reserve(&name)?;
-                instance::create(&name, &template, user.as_deref(), memory)
+                instance::create(&name, &template, user.as_deref(), memory, disk_size)
             })
             .await
         }

@@ -27,12 +27,14 @@ pub enum Request {
     /// The VM instances and the templates ([`Response::List`]).
     List,
     /// Create a VM instance from a template ([`Response::Done`]), with the user that
-    /// sessions run as (which the template's user-setup creates) and its own memory size.
+    /// sessions run as (which the template's user-setup creates), its own memory size and
+    /// its disk's size (in bytes; at least the template's disk's).
     Create {
         name: String,
         template: String,
         user: Option<String>,
         memory: Option<u64>,
+        disk_size: Option<u64>,
     },
     /// Delete a VM instance, whose VM must not run, and its disk ([`Response::Done`]).
     Delete { name: String },

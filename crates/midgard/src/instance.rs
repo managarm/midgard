@@ -11,6 +11,8 @@ use anyhow::{Context, Result, bail};
 use midgard_protocol::control::InstanceInfo;
 use midgard_protocol::machine::{ConsoleKind, Disk, MachineConfig};
 use midgard_protocol::runtime;
+use midgard_protocol::size::format_size;
+use midgard_vmm::image;
 
 use crate::settings::{self, Role, Settings};
 use crate::template::Template;
@@ -25,6 +27,8 @@ const DEFAULT_MEMORY: u64 = 1 << 30;
 const INSTANCE_FILE: &str = "instance.toml";
 /// The disk in an instance's directory.
 const DISK: &str = "disk.qcow2";
+/// The size of the guest's disk sectors.
+const SECTOR_SIZE: u64 = 512;
 
 /// Checks the name of an instance: it names a directory, so it consists of letters,
 /// digits, `-` and `_` and does not start with `-`.
@@ -142,10 +146,18 @@ pub fn exists(name: &str) -> bool {
     paths::instances_dir().join(name).is_dir()
 }
 
-/// Creates the instance `name` from `template`: its directory is made next to where it
-/// belongs and moved there once it is complete. Nothing else may create or delete the
-/// instance meanwhile (see [`crate::daemon::Instances::reserve`]).
-pub fn create(name: &str, template: &str, user: Option<&str>, memory: Option<u64>) -> Result<()> {
+/// Creates the instance `name` from `template`, with a disk of `disk_size` bytes if it is
+/// given (which cannot be smaller than the template's; midgard-init grows the file
+/// system to fit): its directory is made next to where it belongs and moved there once
+/// it is complete. Nothing else may create or delete the instance meanwhile (see
+/// [`crate::daemon::Instances::reserve`]).
+pub fn create(
+    name: &str,
+    template: &str,
+    user: Option<&str>,
+    memory: Option<u64>,
+    disk_size: Option<u64>,
+) -> Result<()> {
     validate_name(name)?;
     let source = Template::load(template)?;
     let instances = paths::instances_dir();
@@ -164,7 +176,11 @@ pub fn create(name: &str, template: &str, user: Option<&str>, memory: Option<u64
     std::fs::create_dir_all(&partial).with_context(|| format!("failed to create {partial:?}"))?;
     let result = (|| {
         log!("creating {name} from the template {template}");
-        source.copy_disk(&partial.join(DISK))?;
+        let disk = partial.join(DISK);
+        source.copy_disk(&disk)?;
+        if let Some(size) = disk_size {
+            grow_disk(&disk, template, size)?;
+        }
         let file = partial.join(INSTANCE_FILE);
         write_synced(&file, &text).with_context(|| format!("failed to write {file:?}"))?;
         sync_dir(&partial);
@@ -176,6 +192,22 @@ pub fn create(name: &str, template: &str, user: Option<&str>, memory: Option<u64
         let _ = std::fs::remove_dir_all(&partial);
     }
     result
+}
+
+/// Grows the disk that was copied from `template` to `size` bytes.
+fn grow_disk(disk: &Path, template: &str, size: u64) -> Result<()> {
+    // The guest sees whole sectors.
+    if !size.is_multiple_of(SECTOR_SIZE) {
+        bail!("the disk's size must be a multiple of {SECTOR_SIZE} bytes");
+    }
+    let current = image::size(disk).with_context(|| format!("failed to read {disk:?}"))?;
+    if size < current {
+        bail!(
+            "the disk of the template {template} has {}; the disk cannot be smaller",
+            format_size(current)
+        );
+    }
+    image::grow(disk, size).with_context(|| format!("failed to grow {disk:?}"))
 }
 
 /// Deletes the instance `name`: its directory is moved out of the way first, such that a
@@ -230,6 +262,20 @@ pub fn info(name: &str, running: bool) -> InstanceInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grow_disks() {
+        let dir = std::env::temp_dir().join(format!("midgard-grow-disk-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // A raw image (images are detected by their magic, not by their name).
+        let disk = dir.join(DISK);
+        File::create(&disk).unwrap().set_len(1 << 20).unwrap();
+        assert!(grow_disk(&disk, "alpine", 4096).is_err());
+        assert!(grow_disk(&disk, "alpine", (2 << 20) + 1).is_err());
+        grow_disk(&disk, "alpine", 2 << 20).unwrap();
+        assert_eq!(image::size(&disk).unwrap(), 2 << 20);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn names() {

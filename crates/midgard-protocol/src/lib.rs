@@ -225,6 +225,7 @@ mod tests {
                 template: "debian".into(),
                 user: Some("alice".into()),
                 memory: Some(2 << 30),
+                disk_size: Some(128 << 30),
             },
             control::Request::Delete { name: "dev".into() },
         ];

@@ -208,6 +208,7 @@ fn create_instance(
     template: &str,
     user: Option<String>,
     memory: Option<u64>,
+    disk_size: Option<u64>,
     yes: bool,
 ) -> Result<()> {
     let listing = listing()?;
@@ -242,6 +243,7 @@ fn create_instance(
         template: template.to_string(),
         user,
         memory,
+        disk_size,
     })? {
         control::Response::Done => Ok(()),
         other => bail!("unexpected answer from midgard: {other:?}"),
@@ -256,6 +258,7 @@ pub fn create(args: &CreateArgs) -> Result<i32> {
         template,
         args.user.clone(),
         args.memory,
+        args.disk_size,
         args.yes,
     )?;
     log!("created {}", args.name);
@@ -434,7 +437,7 @@ fn offer_instance(name: &str, yes: bool) -> Result<()> {
             return Err(NoInstance(name.into()).into());
         }
     }
-    create_instance(name, name, None, None, yes)
+    create_instance(name, name, None, None, None, yes)
 }
 
 /// Runs a command in the VM of `name` (which is created first if it is missing, see
