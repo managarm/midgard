@@ -18,7 +18,7 @@ fn in_home(relative: &str) -> Option<PathBuf> {
 /// midgard's directory: MIDGARD_DATA_DIR, else /var/lib/midgard for root and
 /// $XDG_DATA_HOME/midgard (~/.local/share/midgard) for other users. It has the VM
 /// instances and the boot files and templates that the user installed (see
-/// guest/build.py).
+/// [`crate::pull`]).
 pub fn midgard_dir() -> PathBuf {
     if let Some(dir) = env_path("MIDGARD_DATA_DIR") {
         return dir;

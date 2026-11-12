@@ -15,7 +15,7 @@ use midgard_protocol::runtime;
 use crate::boot::{self, BootFiles};
 use crate::settings::{self, Role, Settings};
 use crate::template::Template;
-use crate::{log, paths};
+use crate::{log, paths, pull};
 
 /// The longest name of an instance.
 const MAX_NAME: usize = 64;
@@ -80,7 +80,7 @@ impl Instance {
 
     /// The instance's VM, which boots with the instance's boot files (which must be
     /// there and fit this midgard). A pull must not replace them until the VM read them
-    /// (see [`crate::pull::reading`]).
+    /// (see [`pull::reading`]).
     pub fn config(&self) -> Result<MachineConfig> {
         let name = self.settings.boot_files.as_deref().unwrap_or(boot::DEFAULT);
         let boot = BootFiles::load(name)?;
@@ -138,7 +138,14 @@ pub fn exists(name: &str) -> bool {
 /// instance meanwhile (see [`crate::daemon::Instances::reserve`]).
 pub fn create(name: &str, template: &str, user: Option<&str>, memory: Option<u64>) -> Result<()> {
     validate_name(name)?;
-    let source = Template::load(template)?;
+    // A pull does not replace the template while we read its settings and open its disk
+    // (which we can copy once it is open, whatever happens to the template).
+    let (source, disk) = {
+        let _files = pull::reading();
+        let source = Template::load(template)?;
+        let disk = source.open_disk()?;
+        (source, disk)
+    };
     let instances = paths::instances_dir();
     let dir = instances.join(name);
     if dir.exists() {
@@ -155,7 +162,7 @@ pub fn create(name: &str, template: &str, user: Option<&str>, memory: Option<u64
     std::fs::create_dir_all(&partial).with_context(|| format!("failed to create {partial:?}"))?;
     let result = (|| {
         log!("creating {name} from the template {template}");
-        source.copy_disk(&partial.join(DISK))?;
+        disk.copy_to(&partial.join(DISK))?;
         let file = partial.join(INSTANCE_FILE);
         write_synced(&file, &text).with_context(|| format!("failed to write {file:?}"))?;
         sync_dir(&partial);

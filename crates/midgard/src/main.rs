@@ -5,7 +5,7 @@
 //! VMs of VM instances, which midgard keeps running for bifrost's sessions (see
 //! [`daemon`]). midgard also manages the VM instances (see [`instance`]), the templates
 //! that they are created from (see [`template`]) and the boot files that they boot with
-//! (see [`boot`]), which it installs (see [`pull`]).
+//! (see [`boot`]), and installs the latter two (see [`pull`]).
 //!
 //! The connections to bifrost are tasks on one executor ([`EXECUTOR`], on the main
 //! thread). Each VM runs on a thread of its own with its own executor (see
@@ -20,7 +20,9 @@ mod instance;
 mod paths;
 mod pull;
 mod settings;
+mod tar;
 mod template;
+mod zstd;
 
 use std::io;
 use std::os::fd::{FromRawFd, RawFd};
@@ -227,7 +229,7 @@ async fn pull(stream: &Async<UnixStream>, request: Pull) -> Response {
         }
     };
     match future::zip(forward, job).await {
-        ((), Ok(())) => Response::Done,
+        ((), Ok(pulled)) => Response::Pulled(pulled),
         ((), Err(error)) => Response::Error(format!("{error:#}")),
     }
 }

@@ -1,7 +1,8 @@
-//! Pulling: midgard installs boot files (see [`crate::boot`]) from a channel, a URL or a
-//! directory with `channel.json`, which lists them (see [`Channel`]; guest/build.py writes
-//! it), and their files. CI builds them and publishes them as midgard's default channel
-//! ([`DEFAULT_CHANNEL`], see guest/publish.py).
+//! Pulling: midgard installs boot files (see [`crate::boot`]) and templates (see
+//! [`crate::template`]) from a channel, a URL or a directory with `channel.json`, which
+//! lists them (see [`Channel`]; guest/build.py writes it), and their files. CI builds
+//! them and publishes them as midgard's default channel ([`DEFAULT_CHANNEL`], see
+//! guest/publish.py).
 //!
 //! Each item is installed next to where it belongs (in a directory whose name starts with
 //! a dot, which is no item) and moved there once it is complete; what uses the installed
@@ -15,15 +16,15 @@ use std::sync::{Mutex, PoisonError, RwLock, RwLockReadGuard, TryLockError};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use midgard_protocol::control::{Pull, PullEvent, PullItem};
+use midgard_protocol::control::{Pull, PullEvent, PullItem, Pulled};
 use midgard_protocol::version::{Mismatch, Versions};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::boot;
 use crate::instance::{Instance, validate_name};
-use crate::template::Template;
-use crate::{log, paths};
+use crate::template::{self, Template};
+use crate::{log, paths, settings, tar};
 
 /// The channel that midgard pulls from unless bifrost (or MIDGARD_CHANNEL) names one: the
 /// repository's GitHub Pages, which list the files of the newest guest release (see
@@ -44,12 +45,13 @@ const READ_TIMEOUT: Duration = Duration::from_secs(60);
 /// How often bifrost hears about a download.
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(200);
 
-/// Held by whoever reads installed boot files (shared) or replaces them (exclusively).
+/// Held by whoever reads installed boot files or templates (shared) or replaces them
+/// (exclusively).
 static FILES: RwLock<()> = RwLock::new(());
 /// Held by the pull that runs.
 static PULLING: Mutex<()> = Mutex::new(());
 
-/// Keeps the installed boot files as they are while it lives.
+/// Keeps the installed boot files and templates as they are while it lives.
 pub fn reading() -> RwLockReadGuard<'static, ()> {
     FILES.read().unwrap_or_else(PoisonError::into_inner)
 }
@@ -61,6 +63,9 @@ struct Channel {
     /// Boot files, by name.
     #[serde(default)]
     boot: BTreeMap<String, ChannelBoot>,
+    /// Templates, by name.
+    #[serde(default)]
+    templates: BTreeMap<String, ChannelTemplate>,
 }
 
 /// The format of a channel, which is all that we read of a channel of a newer format.
@@ -86,6 +91,22 @@ struct ChannelBoot {
     files: BTreeMap<String, ChannelFile>,
 }
 
+#[derive(Debug, Deserialize)]
+struct ChannelTemplate {
+    /// The template's tar file: its directory, by the template's name.
+    #[serde(flatten)]
+    file: ChannelFile,
+    /// The format of its settings file (see [`settings::FORMAT`]).
+    #[serde(default = "first_format")]
+    settings: u32,
+    /// The boot files that its instances boot with.
+    boot: Option<String>,
+}
+
+fn first_format() -> u32 {
+    1
+}
+
 impl Channel {
     fn parse(text: &[u8]) -> Result<Self> {
         let format = serde_json::from_slice::<ChannelFormat>(text)?.format;
@@ -103,6 +124,13 @@ impl Channel {
                 validate_name(name).is_ok() && boot.files.keys().all(|file| file_name(file));
             if !valid {
                 log!("ignoring the channel's boot files {name:?}, whose names are invalid");
+            }
+            valid
+        });
+        channel.templates.retain(|name, _| {
+            let valid = validate_name(name).is_ok();
+            if !valid {
+                log!("ignoring the channel's template {name:?}, whose name is invalid");
             }
             valid
         });
@@ -354,7 +382,9 @@ fn recover(dir: &Path) {
 /// Cleans up after a pull that midgard stopped in the middle of. No pull may run
 /// meanwhile.
 pub fn remove_leftovers() {
-    recover(&paths::boot_root());
+    for dir in [paths::boot_root(), paths::templates_dir()] {
+        recover(&dir);
+    }
 }
 
 /// Installs the boot files `name` of the channel in `root` (see [`paths::boot_root`]):
@@ -429,6 +459,70 @@ fn pull_boot(
     report(PullEvent::Installed(item))
 }
 
+/// Installs the template `name` of the channel in `root` (see [`paths::templates_dir`])
+/// unless it is installed already.
+fn pull_template(
+    source: &Source,
+    root: &Path,
+    name: &str,
+    entry: &ChannelTemplate,
+    report: &mut Report,
+) -> Result<()> {
+    if entry.settings > settings::FORMAT {
+        bail!(
+            "the channel's template {name} needs a newer midgard (its settings have the format \
+             {}; this midgard reads up to format {})",
+            entry.settings,
+            settings::FORMAT
+        );
+    }
+    let sha256 = entry.file.sha256.to_ascii_lowercase();
+    let item = PullItem::Template(name.to_string());
+    if template::installed_from(&root.join(name)).as_deref() == Some(&sha256) {
+        return report(PullEvent::UpToDate(item));
+    }
+    let stage = stage(root, name)?;
+    let result = (|| {
+        let file = format!("{name}.tar");
+        let archive = stage.join(&file);
+        source.download(&entry.file, &file, &archive, report)?;
+        let unpacked = stage.join("unpacked");
+        let skipped = File::open(&archive)
+            .map_err(anyhow::Error::from)
+            .and_then(|archive| tar::extract(archive, &unpacked))
+            .with_context(|| format!("cannot unpack {file}"))?;
+        let new = template::locate(&unpacked)
+            .and_then(|new| Template::load_from(name, &new).map(|_| new))
+            .with_context(|| {
+                // What we skipped may be what the template lacks.
+                let skipped: Vec<_> = skipped
+                    .iter()
+                    .filter(|member| {
+                        member
+                            .path
+                            .file_name()
+                            .is_some_and(template::is_template_file)
+                    })
+                    .map(|member| member.to_string())
+                    .collect();
+                if skipped.is_empty() {
+                    format!("{file} has no valid template")
+                } else {
+                    format!(
+                        "{file} has no valid template (midgard skipped {})",
+                        skipped.join(", ")
+                    )
+                }
+            })?;
+        template::record_installed_from(&new, &sha256)?;
+        install(&new, root, name)
+    })();
+    let _ = std::fs::remove_dir_all(&stage);
+    result?;
+    log!("installed the template {name}");
+    report(PullEvent::Installed(item))
+}
+
 /// The boot files that are installed and those that the installed templates and the VM
 /// instances boot with.
 fn boot_files_in_use() -> BTreeSet<String> {
@@ -447,25 +541,78 @@ fn boot_files_in_use() -> BTreeSet<String> {
     names
 }
 
-/// Updates the boot files that are installed or in use from a channel (see [`Pull`]).
-pub fn pull(request: &Pull, report: &mut Report) -> Result<()> {
+/// Installs or updates boot files and templates from a channel (see [`Pull`]).
+pub fn pull(request: &Pull, report: &mut Report) -> Result<Pulled> {
     let _pulling = match PULLING.try_lock() {
         Ok(pulling) => pulling,
         Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
         Err(TryLockError::WouldBlock) => bail!("midgard is pulling already"),
     };
+    for name in &request.templates {
+        validate_name(name)?;
+    }
     let source = Source::open(request.from.as_deref())?;
-    // Of the boot files, we update those that the channel has.
+    let channel = &source.channel;
+
+    let mut templates: BTreeSet<&str> = request.templates.iter().map(String::as_str).collect();
+    for name in &templates {
+        if !channel.templates.contains_key(*name) {
+            let names: Vec<_> = channel.templates.keys().map(String::as_str).collect();
+            bail!(
+                "the channel has no template {name} (it has {})",
+                if names.is_empty() {
+                    "none".into()
+                } else {
+                    names.join(", ")
+                }
+            );
+        }
+    }
+    let installed = paths::names(&paths::templates_dir());
+    if request.all {
+        templates.extend(
+            installed
+                .iter()
+                .map(String::as_str)
+                .filter(|name| channel.templates.contains_key(*name)),
+        );
+    }
+
+    // The boot files that the new templates need must be in the channel; of the others,
+    // we update those that it has.
     let mut boot_files = boot_files_in_use();
+    for name in &templates {
+        let needed = channel.templates[*name].boot.as_deref();
+        let needed = needed.unwrap_or(boot::DEFAULT);
+        if !channel.boot.contains_key(needed) {
+            bail!("the channel lacks the boot files {needed}, which the template {name} needs");
+        }
+        boot_files.insert(needed.to_string());
+    }
     if boot_files.is_empty() {
         boot_files.insert(boot::DEFAULT.to_string());
     }
     for name in &boot_files {
-        if let Some(entry) = source.channel.boot.get(name) {
+        if let Some(entry) = channel.boot.get(name) {
             pull_boot(&source, &paths::boot_root(), name, entry, report)?;
         }
     }
-    Ok(())
+    for name in templates {
+        let entry = &channel.templates[name];
+        pull_template(&source, &paths::templates_dir(), name, entry, report)?;
+    }
+
+    let installed = paths::names(&paths::templates_dir());
+    let available = channel
+        .templates
+        .keys()
+        .filter(|name| !installed.contains(name))
+        .cloned()
+        .collect();
+    Ok(Pulled {
+        installed,
+        available,
+    })
 }
 
 #[cfg(test)]
@@ -473,6 +620,7 @@ mod tests {
     use midgard_protocol::version::PROTOCOL;
 
     use super::*;
+    use crate::tar::tests::{archive, finish, member, scratch};
 
     fn sha256(data: &[u8]) -> String {
         let digest = Sha256::digest(data);
@@ -489,18 +637,21 @@ mod tests {
         )
     }
 
-    fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("midgard-test-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
-    /// A channel in `dir` with the boot files linux (whose agent is `agent`).
+    /// A channel in `dir` with the boot files linux (whose agent is `agent`) and the
+    /// template alpine.
     fn channel(dir: &Path, agent: &[u8], protocol: u32) -> Source {
         let channel = dir.join("channel");
         let _ = std::fs::remove_dir_all(&channel);
         std::fs::create_dir_all(&channel).unwrap();
+        let template = archive(&[
+            ("alpine", b'5', b""),
+            (
+                "alpine/template.toml",
+                b'0',
+                b"[template]\ndescription = \"Alpine\"\n",
+            ),
+            ("alpine/disk.qcow2", b'0', &[1; 2000]),
+        ]);
         let text = format!(
             r#"{{
                 "format": 1,
@@ -508,10 +659,12 @@ mod tests {
                 "boot": {{"linux": {{
                     "protocol": {{"oldest": {protocol}, "current": {protocol}}},
                     "files": {{"vmlinuz": {{{}}}, "midgard-init": {{{}}}}}
-                }}}}
+                }}}},
+                "templates": {{"alpine": {{{}, "description": "Alpine", "boot": "linux"}}}}
             }}"#,
             publish(&channel, "vmlinuz", b"kernel"),
             publish(&channel, "midgard-init", agent),
+            publish(&channel, "alpine.tar", &template),
         );
         std::fs::write(channel.join(CHANNEL_FILE), text).unwrap();
         Source::open(Some(channel.to_str().unwrap())).unwrap()
@@ -520,17 +673,20 @@ mod tests {
     #[test]
     fn pulls() {
         let dir = scratch("pull");
-        let boot_root = dir.join("boot");
+        let (boot_root, templates) = (dir.join("boot"), dir.join("templates"));
         let mut events = Vec::new();
         let mut report = |event| {
             events.push(event);
             Ok(())
         };
         let linux = PullItem::BootFiles("linux".into());
+        let alpine = PullItem::Template("alpine".into());
 
         let source = channel(&dir, b"agent 1", PROTOCOL);
         let boot_entry = &source.channel.boot["linux"];
+        let template_entry = &source.channel.templates["alpine"];
         pull_boot(&source, &boot_root, "linux", boot_entry, &mut report).unwrap();
+        pull_template(&source, &templates, "alpine", template_entry, &mut report).unwrap();
         let installed = boot_root.join("linux");
         assert_eq!(std::fs::read(installed.join("vmlinuz")).unwrap(), b"kernel");
         assert_eq!(
@@ -540,11 +696,22 @@ mod tests {
         let manifest = boot::read_manifest(&installed).unwrap();
         assert_eq!(manifest.protocol, boot_entry.protocol);
         assert_eq!(manifest.files["vmlinuz"], sha256(b"kernel"));
+        assert!(Template::load_from("alpine", &templates.join("alpine")).is_ok());
+        assert_eq!(
+            template::installed_from(&templates.join("alpine")).unwrap(),
+            template_entry.file.sha256
+        );
         assert!(events.contains(&PullEvent::Installed(linux.clone())));
+        assert!(events.contains(&PullEvent::Installed(alpine.clone())));
         assert!(events.contains(&PullEvent::Downloading {
             file: "midgard-init".into(),
             done: 7,
             total: 7,
+        }));
+        assert!(events.contains(&PullEvent::Downloading {
+            file: "alpine.tar".into(),
+            done: template_entry.file.size,
+            total: template_entry.file.size,
         }));
 
         // Nothing changed.
@@ -554,7 +721,14 @@ mod tests {
             Ok(())
         };
         pull_boot(&source, &boot_root, "linux", boot_entry, &mut report).unwrap();
-        assert_eq!(events, [PullEvent::UpToDate(linux.clone())]);
+        pull_template(&source, &templates, "alpine", template_entry, &mut report).unwrap();
+        assert_eq!(
+            events,
+            [
+                PullEvent::UpToDate(linux.clone()),
+                PullEvent::UpToDate(alpine)
+            ]
+        );
 
         // A new agent: only it is downloaded.
         events.clear();
@@ -638,6 +812,59 @@ mod tests {
     }
 
     #[test]
+    fn template_failures() {
+        let dir = scratch("pull-template");
+        let templates = dir.join("templates");
+        let mut report = |_| Ok(());
+        let source = channel(&dir, b"agent", PROTOCOL);
+        let entry = &source.channel.templates["alpine"];
+        pull_template(&source, &templates, "alpine", entry, &mut report).unwrap();
+        let installed = template::installed_from(&templates.join("alpine"));
+        let fails = |archive: &[u8], corrupt: bool| {
+            let channel = dir.join("channel");
+            let file = publish(&channel, "alpine.tar", archive);
+            if corrupt {
+                std::fs::write(channel.join("alpine.tar"), b"something else").unwrap();
+            }
+            let text = format!(r#"{{"format": 1, "templates": {{"alpine": {{{file}}}}}}}"#);
+            std::fs::write(channel.join(CHANNEL_FILE), text).unwrap();
+            let source = Source::open(Some(channel.to_str().unwrap())).unwrap();
+            let entry = &source.channel.templates["alpine"];
+            let mut report = |_| Ok(());
+            let error = pull_template(&source, &templates, "alpine", entry, &mut report);
+            // The template that was installed stays, and nothing is left behind.
+            assert_eq!(
+                template::installed_from(&templates.join("alpine")),
+                installed
+            );
+            assert_eq!(paths::names(&templates), ["alpine"]);
+            assert_eq!(std::fs::read_dir(&templates).unwrap().count(), 1);
+            format!("{:#}", error.unwrap_err())
+        };
+
+        // A disk that is a symbolic link, which we skip (and say so).
+        let settings = b"[template]\ndescription = \"Alpine\"\n";
+        let link = finish(&[
+            member("alpine/template.toml", b'0', "", settings),
+            member("alpine/disk.qcow2", b'2', "/dev/sda", b""),
+        ]);
+        let error = fails(&link, false);
+        assert!(
+            error.contains("\"alpine/disk.qcow2\", which is a symbolic link"),
+            "{error}"
+        );
+        // No template, a broken archive and one that is not what the channel lists.
+        let error = fails(&archive(&[("alpine/disk.qcow2", b'0', b"disk")]), false);
+        assert!(error.contains("no valid template"), "{error}");
+        assert!(!error.contains("skipped"), "{error}");
+        let error = fails(&link[..700], false);
+        assert!(error.contains("cannot unpack"), "{error}");
+        let error = fails(&link, true);
+        assert!(error.contains("SHA-256"), "{error}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn channels() {
         assert!(Channel::parse(br#"{"format": 1}"#).is_ok());
         let newer = br#"{"format": 2, "boot": "something else"}"#;
@@ -653,11 +880,13 @@ mod tests {
                     "escapes": {{"files": {{"../vmlinuz": {file}}}}},
                     "manifest": {{"files": {{"manifest.json": {file}}}}},
                     "linux": {{"files": {{"vmlinuz": {file}}}}}
-                }}
+                }},
+                "templates": {{"a/b": {file}, "ubuntu-24.04": {file}, "alpine": {file}}}
             }}"#
         );
         let channel = Channel::parse(text.as_bytes()).unwrap();
         assert_eq!(channel.boot.keys().collect::<Vec<_>>(), ["linux"]);
+        assert_eq!(channel.templates.keys().collect::<Vec<_>>(), ["alpine"]);
     }
 
     #[test]
