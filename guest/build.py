@@ -205,7 +205,7 @@ def write_channel(directory, entries, base=""):
     """Writes channel.json, which makes a directory with targets' files (or the URL `base`
     that serves them) a channel that `bifrost pull` installs from: the boot targets' files
     as the boot files linux and the images as templates. `entries` are the targets'
-    manifests."""
+    manifests. (Images from before templates were tar files are left out.)"""
 
     def file(name, sha256):
         size = (directory / name).stat().st_size
@@ -217,7 +217,7 @@ def write_channel(directory, entries, base=""):
         for name, sha256 in entry["files"].items():
             if target in BOOT_TARGETS:
                 boot["files"][name] = file(name, sha256)
-            else:
+            elif name == f"{target}.tar":
                 about = ["description", "settings", "boot"]
                 about = {key: entry[key] for key in about if key in entry}
                 templates[target] = {**file(name, sha256), **about}

@@ -1,28 +1,45 @@
 #!/usr/bin/env python3
 """Publishes the guest files that a run of .github/workflows/guest.yml built as a release
 (guest-<date>), for .github/workflows/guest-release.yml: the release has the run's files and
-those of the previous guest release for the targets that the run did not build, and
-manifest.json, which lists them (see `build.py install`). Old guest releases are deleted.
+those of the previous guest release for the targets that the run did not build,
+manifest.json, which lists the targets, and channel.json, which makes the release a channel
+that `bifrost pull --from` installs from (see build.py).
 
-    publish.py <dir> --run <id>
+The site directory gets a channel.json that lists the new release's files (by their URLs):
+the workflow deploys it to GitHub Pages, where it is the channel that midgard pulls from by
+default (see crates/midgard/src/pull.rs). Once it did, `prune` deletes old guest releases.
 
-<dir> has the run's artifacts. Needs gh (with a token that may create releases).
+    publish.py release <dir> --run <id> --site <site>
+    publish.py prune
+
+<dir> has the run's artifacts. Needs gh (with a token that may create and delete releases).
 """
 
 import argparse
 import datetime
 import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 
-from build import RELEASE_PREFIX, WORKFLOW, Failure, read_manifest, require, targets
+from build import (
+    CHANNEL_FILE,
+    RELEASE_PREFIX,
+    WORKFLOW,
+    Failure,
+    read_manifest,
+    require,
+    targets,
+    write_channel,
+)
 
 # The name of the workflow that builds the targets.
 WORKFLOW_NAME = "Guest"
 # The branch whose builds are published.
 RELEASE_BRANCH = "master"
-# How many guest releases are kept.
+# How many guest releases `prune` keeps. (The newest one is what the channel lists once the
+# workflow deployed it; the older ones are what a deployment of an older run lists.)
 KEEP_RELEASES = 5
 
 
@@ -43,7 +60,17 @@ def guest_releases():
     return [r["tagName"] for r in releases if r["tagName"].startswith(RELEASE_PREFIX)]
 
 
-def publish(directory, run):
+def write_site(site, directory, manifest, tag):
+    """Writes the site that GitHub Pages serves: channel.json, which lists the files of the
+    guest release `tag` by their URLs."""
+    repo = json.loads(gh("repo", "view", "--json", "nameWithOwner"))["nameWithOwner"]
+    write_channel(directory, manifest, f"https://github.com/{repo}/releases/download/{tag}/")
+    site.mkdir(parents=True, exist_ok=True)
+    shutil.move(directory / CHANNEL_FILE, site / CHANNEL_FILE)
+    log(f"the channel in {site} offers {tag}")
+
+
+def publish(directory, run, site):
     require("gh")
     fields = "conclusion,event,headBranch,headSha,url,workflowName"
     info = json.loads(gh("run", "view", run, "--json", fields))
@@ -79,7 +106,17 @@ def publish(directory, run):
             (directory / f"{target}.json").write_text(json.dumps(entry))
             manifest[target] = read_manifest(directory, target)
             notes.append(f"- {target}: built at {entry['commit']} (from {previous})")
+    # midgard cannot boot guests with less, and `bifrost pull` needs to know what the agent
+    # speaks.
+    if not {"kernel", "agent"} <= set(manifest) or "protocol" not in manifest["agent"]:
+        raise Failure(
+            "the release would lack the kernel or the agent (with the versions of the guest "
+            f"protocol that it speaks): publish a run of {WORKFLOW} that built them (one that "
+            "was started manually builds all targets)"
+        )
     (directory / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    # (With names instead of URLs: the release is a channel, too.)
+    write_channel(directory, manifest)
 
     # (guest-<date>, then guest-<date>.2 etc.)
     tag = f"{RELEASE_PREFIX}{datetime.date.today():%Y.%m.%d}"
@@ -93,22 +130,38 @@ def publish(directory, run):
     gh(
         "release", "create", tag, "--target", info["headSha"], "--title", tag,
         "--notes", "\n".join(notes), "--latest=false", *files, directory / "manifest.json",
+        directory / CHANNEL_FILE,
     )  # fmt: skip
     log(f"published {tag}")
-    for old_tag in [tag, *releases][KEEP_RELEASES:]:
-        gh("release", "delete", old_tag, "--cleanup-tag", "--yes")
-        log(f"deleted {old_tag}")
+    write_site(site, directory, manifest, tag)
+
+
+def prune():
+    """Deletes old guest releases."""
+    require("gh")
+    for tag in guest_releases()[KEEP_RELEASES:]:
+        gh("release", "delete", tag, "--cleanup-tag", "--yes")
+        log(f"deleted {tag}")
 
 
 def main():
     parser = argparse.ArgumentParser(
         description=__doc__.split("\n\n")[0], formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument("directory", type=Path, help="where the run's artifacts are")
-    parser.add_argument("--run", required=True, metavar="id", help="the run of the workflow")
+    commands = parser.add_subparsers(dest="command", required=True)
+    release = commands.add_parser("release", help="publish a run's files as a guest release")
+    release.add_argument("directory", type=Path, help="where the run's artifacts are")
+    release.add_argument("--run", required=True, metavar="id", help="the run of the workflow")
+    release.add_argument(
+        "--site", required=True, type=Path, help="where to write the site for GitHub Pages"
+    )
+    commands.add_parser("prune", help="delete old guest releases")
     args = parser.parse_args()
     try:
-        publish(args.directory.resolve(), args.run)
+        if args.command == "release":
+            publish(args.directory.resolve(), args.run, args.site.resolve())
+        else:
+            prune()
     except Failure as error:
         sys.exit(f"publish: {error}")
     except subprocess.CalledProcessError as error:
