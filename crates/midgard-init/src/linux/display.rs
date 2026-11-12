@@ -6,13 +6,18 @@
 //!
 //! midgard puts its static waypipe into the initramfs; we copy it into /run/midgard so
 //! that any distribution can use it.
+//!
+//! With [`Display::Agent`], X11 clients use xwayland-satellite if the distribution has
+//! it: it runs a rootless Xwayland on display :0 as a client of our Wayland display.
 
+use std::ffi::CStr;
 use std::io;
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use async_io::Timer;
@@ -135,23 +140,135 @@ pub async fn start(user: &User) {
         format!("HOME={}", user.home),
         format!("XDG_RUNTIME_DIR={dir}"),
     ];
-    let mut command = Command::new(HELPER, argv, env);
+    if let Err(error) = process::spawn_background(&user_command(user, HELPER, argv, env)) {
+        log!("starting waypipe: {error}");
+        return;
+    }
+    // Sessions find the socket, which waypipe creates soon after it started.
+    wait_for(Duration::from_secs(2), || Path::new(&socket).exists()).await;
+    log!("started the Wayland display of {}", user.name);
+    let _ = AGENT_DISPLAY.set((user.uid, socket));
+}
+
+/// A command that runs as `user`.
+fn user_command(user: &User, path: &str, argv: Vec<String>, env: Vec<String>) -> Command {
+    let mut command = Command::new(path, argv, env);
     command.credentials = (user.uid != 0).then(|| Credentials {
         uid: user.uid,
         gid: user.gid,
         groups: user.groups.clone(),
     });
-    if let Err(error) = process::spawn_background(&command) {
-        log!("starting waypipe: {error}");
+    command
+}
+
+/// The X11 display that xwayland-satellite provides.
+const X_DISPLAY: &str = ":0";
+const X_SOCKETS: &str = "/tmp/.X11-unix";
+const X_SOCKET: &str = "/tmp/.X11-unix/X0";
+/// [`X_SOCKET`] in [`X_SOCKETS`].
+const X_SOCKET_NAME: &CStr = c"X0";
+const X_LOCK: &str = "/tmp/.X0-lock";
+/// The running xwayland-satellite.
+static XWAYLAND: Mutex<Option<i32>> = Mutex::new(None);
+
+/// Starts xwayland-satellite for `user` (after [`start`]) if the distribution has it.
+pub async fn start_x11(user: &User) {
+    let Some(path) = process::resolve("xwayland-satellite", PATH) else {
+        return;
+    };
+    // It needs the Wayland display (see [`start`]).
+    let Some((_, wayland)) = AGENT_DISPLAY.get().filter(|(uid, _)| *uid == user.uid) else {
+        return;
+    };
+    if !Path::new(wayland).exists() {
+        log!("{wayland} does not exist; X11 forwarding is off");
         return;
     }
-    // Sessions find the socket, which waypipe creates soon after it started.
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while !Path::new(&socket).exists() && Instant::now() < deadline {
+    let dir = runtime_dir(user);
+    // Left over from an earlier boot (/tmp may be on the disk).
+    let _ = std::fs::remove_file(X_LOCK);
+    if let Err(error) = prepare_socket_dir(Path::new(X_SOCKETS), 0, X_SOCKET_NAME) {
+        log!("preparing {X_SOCKETS}: {error}; X11 forwarding is off");
+        return;
+    }
+    let argv = vec!["xwayland-satellite".to_string(), X_DISPLAY.to_string()];
+    let env = vec![
+        format!("PATH={PATH}"),
+        format!("HOME={}", user.home),
+        format!("XDG_RUNTIME_DIR={dir}"),
+        format!("WAYLAND_DISPLAY={wayland}"),
+    ];
+    let pid = match process::spawn_background(&user_command(user, &path, argv, env)) {
+        Ok(pid) => pid,
+        Err(error) => {
+            log!("starting xwayland-satellite: {error}");
+            return;
+        }
+    };
+    *XWAYLAND.lock().unwrap() = Some(pid);
+    // It creates the socket once Xwayland started, which takes a while on slow hosts. A
+    // session gets the display as long as it runs (it exits, e.g., if the compositor
+    // lacks a protocol that it needs).
+    wait_for(Duration::from_secs(2), || {
+        Path::new(X_SOCKET).exists() || !alive(pid)
+    })
+    .await;
+    if alive(pid) {
+        log!("started xwayland-satellite on {X_DISPLAY}");
+    }
+}
+
+/// Makes `path` a directory of `owner` in which everyone may create sockets (sticky, like
+/// /tmp), without the stale socket `stale`. Its parent is writable by everyone (/tmp,
+/// which may be on the disk), so its users may have left anything there, e.g., a
+/// symlink to a directory that we must not change: we only trust a directory that we
+/// opened without following symlinks.
+fn prepare_socket_dir(path: &Path, owner: u32, stale: &CStr) -> io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() && metadata.uid() == owner => {}
+        // (remove_dir_all() does not follow symlinks.)
+        Ok(metadata) if metadata.is_dir() => std::fs::remove_dir_all(path)?,
+        Ok(_) => std::fs::remove_file(path)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    match std::fs::create_dir(path) {
+        Err(error) if error.kind() != io::ErrorKind::AlreadyExists => return Err(error),
+        _ => {}
+    }
+    // Someone may have replaced it meanwhile.
+    let dir = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(path)?;
+    if dir.metadata()?.uid() != owner {
+        return Err(io::Error::other(format!(
+            "{} does not belong to {owner}",
+            path.display()
+        )));
+    }
+    dir.set_permissions(PermissionsExt::from_mode(0o1777))?;
+    // SAFETY: `stale` is a C string; the descriptor is open.
+    if unsafe { libc::unlinkat(dir.as_raw_fd(), stale.as_ptr(), 0) } != 0 {
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::NotFound {
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+fn alive(pid: i32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .is_ok_and(|comm| comm.starts_with("xwayland"))
+}
+
+/// Polls `condition` until it holds, for at most `timeout`.
+async fn wait_for(timeout: Duration, condition: impl Fn() -> bool) {
+    let deadline = Instant::now() + timeout;
+    while !condition() && Instant::now() < deadline {
         Timer::after(Duration::from_millis(10)).await;
     }
-    log!("started the Wayland display of {}", user.name);
-    let _ = AGENT_DISPLAY.set((user.uid, socket));
 }
 
 /// The variables that sessions of `user` get for the agent's display (if it runs one
@@ -160,11 +277,15 @@ pub fn session_environment(user: &User) -> Vec<(String, String)> {
     let Some((_, socket)) = AGENT_DISPLAY.get().filter(|(uid, _)| *uid == user.uid) else {
         return Vec::new();
     };
-    vec![
+    let mut env = vec![
         ("XDG_RUNTIME_DIR".into(), runtime_dir(user)),
         // (Wayland clients take a path, too.)
         ("WAYLAND_DISPLAY".into(), socket.clone()),
-    ]
+    ];
+    if XWAYLAND.lock().unwrap().is_some_and(alive) {
+        env.push(("DISPLAY".into(), X_DISPLAY.into()));
+    }
+    env
 }
 
 /// `midgard-init waypipe [<socket>]`: runs the server (as whoever runs us) on the socket
@@ -205,5 +326,53 @@ pub fn pause() -> ! {
     loop {
         // SAFETY: pause() has no preconditions.
         unsafe { libc::pause() };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn socket_dirs() {
+        let base = std::env::temp_dir().join(format!("midgard-init-x11-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        // SAFETY: geteuid() cannot fail.
+        let owner = unsafe { libc::geteuid() };
+        let sockets = base.join(".X11-unix");
+        let stale = c"X0";
+
+        // A symlink is replaced, and what it points to stays as it was.
+        let target = base.join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, PermissionsExt::from_mode(0o700)).unwrap();
+        std::fs::write(target.join("X0"), b"").unwrap();
+        std::os::unix::fs::symlink(&target, &sockets).unwrap();
+        prepare_socket_dir(&sockets, owner, stale).unwrap();
+        let metadata = std::fs::symlink_metadata(&sockets).unwrap();
+        assert!(metadata.is_dir());
+        assert_eq!(metadata.mode() & 0o7777, 0o1777);
+        assert_eq!(std::fs::metadata(&target).unwrap().mode() & 0o7777, 0o700);
+        assert!(target.join("X0").exists());
+
+        // A directory of ours loses its stale socket only.
+        std::fs::write(sockets.join("X0"), b"").unwrap();
+        std::fs::write(sockets.join("X1"), b"").unwrap();
+        prepare_socket_dir(&sockets, owner, stale).unwrap();
+        assert!(!sockets.join("X0").exists());
+        assert!(sockets.join("X1").exists());
+
+        // A directory of someone else is replaced (as we are not `owner + 1`, the new one
+        // is not trusted either).
+        prepare_socket_dir(&sockets, owner + 1, stale).unwrap_err();
+        assert!(sockets.is_dir());
+        assert!(!sockets.join("X1").exists());
+
+        // So is a file.
+        std::fs::remove_dir(&sockets).unwrap();
+        std::fs::write(&sockets, b"").unwrap();
+        prepare_socket_dir(&sockets, owner, stale).unwrap();
+        assert!(sockets.is_dir());
+        std::fs::remove_dir_all(&base).unwrap();
     }
 }

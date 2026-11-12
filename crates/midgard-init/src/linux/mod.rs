@@ -239,7 +239,10 @@ fn agent(watcher: ready::Watcher, agent_display: bool) -> Result<()> {
             if agent_display {
                 let name = config().user.as_deref().unwrap_or("root");
                 match users::lookup(name) {
-                    Ok(user) => display::start(&user).await,
+                    Ok(user) => {
+                        display::start(&user).await;
+                        display::start_x11(&user).await;
+                    }
                     Err(error) => log!("{error}"),
                 }
             }
