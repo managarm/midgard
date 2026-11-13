@@ -18,7 +18,7 @@ use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -263,6 +263,8 @@ enum State {
 struct Running {
     state: Mutex<State>,
     changed: Event,
+    /// The VM, once it exists (also while it boots).
+    machine: OnceLock<MachineHandle>,
 }
 
 impl Running {
@@ -339,6 +341,24 @@ impl Instances {
         })
     }
 
+    /// The counters of the VM of `name` (see [`control::Request::Counters`]; they may take
+    /// a moment to collect).
+    pub fn counters(&self, name: &str) -> control::Response {
+        if let Err(error) = instance::validate_name(name) {
+            return control::Response::Error(format!("{error:#}"));
+        }
+        let running = self.running.lock().unwrap().get(name).cloned();
+        let machine = running.as_ref().and_then(|running| running.machine.get());
+        match machine {
+            Some(machine) => match machine.counters() {
+                Ok(counters) => control::Response::Counters(counters),
+                Err(error) => control::Response::Error(format!("{error:#}")),
+            },
+            None if running.is_none() && !instance::exists(name) => control::Response::NoInstance,
+            None => control::Response::Error(format!("{name} is not running")),
+        }
+    }
+
     /// Connects `stream` to the agent in the VM of `name` (see
     /// [`control::Request::Session`]).
     pub async fn session(
@@ -364,6 +384,7 @@ impl Instances {
                     let running = Arc::new(Running {
                         state: Mutex::new(State::Booting),
                         changed: Event::new(),
+                        machine: OnceLock::new(),
                     });
                     instances.insert(name.to_string(), running.clone());
                     let instances = self.running.clone();
@@ -476,6 +497,7 @@ fn boot_instance(name: &str, display: Option<PathBuf>, running: &Running) -> Res
     let machine = midgard_vmm::start(&config, console, None)?;
     drop(files);
     let handle = machine.handle();
+    let _ = running.machine.set(handle.clone());
     if let Some(gui) = &gui {
         forward_waypipe(&handle, gui);
     }

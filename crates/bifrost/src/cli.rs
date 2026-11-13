@@ -1,5 +1,6 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use clap::error::ErrorKind;
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
@@ -47,6 +48,9 @@ pub enum Action {
 
     /// Show a VM instance's log
     Log(LogArgs),
+
+    /// Show the counters of a VM instance's VM (e.g., of VM exits and device accesses)
+    Counters(CountersArgs),
 
     /// Boot a VM in the foreground, with its console on stdin / stdout (for debugging;
     /// Ctrl-A x stops the VM, twice exits right away)
@@ -168,6 +172,32 @@ pub struct LogArgs {
 }
 
 #[derive(Debug, Args)]
+pub struct CountersArgs {
+    /// The VM instance [default: alpine]
+    pub name: Option<String>,
+
+    /// Show each vCPU's counters instead of their sums
+    #[arg(long)]
+    pub per_vcpu: bool,
+
+    /// Also show the counters that are zero
+    #[arg(short, long)]
+    pub all: bool,
+
+    /// Keep showing the counters, with their rates, every SECS seconds [default: 1]
+    #[arg(
+        short,
+        long,
+        value_name = "SECS",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "1",
+        value_parser = parse_interval
+    )]
+    pub watch: Option<Duration>,
+}
+
+#[derive(Debug, Args)]
 pub struct BootArgs {
     /// The guest kernel (a bzImage)
     #[arg(long, value_name = "FILE")]
@@ -267,6 +297,15 @@ impl RunArgs {
     }
 }
 
+/// Parses a positive number of seconds.
+fn parse_interval(text: &str) -> Result<Duration, String> {
+    text.parse()
+        .ok()
+        .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok())
+        .filter(|interval| !interval.is_zero())
+        .ok_or_else(|| format!("invalid interval: {text}"))
+}
+
 /// Parses `FILE[,ro]`.
 fn parse_disk(text: &str) -> Result<Disk, String> {
     let (path, read_only) = match text.strip_suffix(",ro") {
@@ -347,6 +386,23 @@ mod tests {
         assert_eq!(cli.run.env().collect::<Vec<_>>(), [("A", "-1")]);
         assert_eq!(cli.run.command, ["env"]);
         assert!(parse(&["-e", "A=B", "C", "env"]).is_err());
+    }
+
+    #[test]
+    fn counters() {
+        let cli = parse(&["counters", "-w", "dev"]).unwrap();
+        let Some(Action::Counters(args)) = cli.action else {
+            panic!("not counters: {:?}", cli.action);
+        };
+        assert_eq!(args.name.as_deref(), Some("dev"));
+        assert_eq!(args.watch, Some(Duration::from_secs(1)));
+        let cli = parse(&["counters", "--watch=0.5"]).unwrap();
+        assert!(
+            matches!(cli.action, Some(Action::Counters(args)) if args.watch == Some(Duration::from_millis(500)))
+        );
+        assert!(parse(&["counters", "--watch=0"]).is_err());
+        assert!(parse(&["counters", "--watch=-1"]).is_err());
+        assert!(parse(&["counters", "--watch=1e300"]).is_err());
     }
 
     #[test]

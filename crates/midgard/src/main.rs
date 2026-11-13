@@ -282,6 +282,7 @@ async fn serve(stream: Async<UnixStream>) -> Result<()> {
             }
         }
         Request::Running => Response::Running(INSTANCES.running()),
+        Request::Counters { name } => unblock(move || INSTANCES.counters(&name)).await,
         Request::Input(_) => Response::Error("no VM runs on this connection".into()),
         Request::List => Response::List(list()),
         Request::Create {

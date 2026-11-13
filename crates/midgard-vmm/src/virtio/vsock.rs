@@ -24,7 +24,7 @@ use crate::board::Board;
 use crate::logging::log;
 
 const NAME: &str = "virtio-vsock";
-const DEVICE_ID: u32 = 19;
+pub(super) const DEVICE_ID: u32 = 19;
 const RX_QUEUE: usize = 0;
 const TX_QUEUE: usize = 1;
 const QUEUE_SIZE: u16 = 256;

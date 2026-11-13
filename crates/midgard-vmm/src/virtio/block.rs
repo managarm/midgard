@@ -20,7 +20,7 @@ use crate::host::image::{Buffer, Image};
 use crate::logging::log;
 
 const NAME: &str = "virtio-blk";
-const DEVICE_ID: u32 = 2;
+pub(super) const DEVICE_ID: u32 = 2;
 const QUEUE_SIZE: u16 = 256;
 const SECTOR_SIZE: u64 = 512;
 

@@ -22,6 +22,7 @@ mod aml;
 mod board;
 mod boot;
 mod clock;
+mod counters;
 mod devices;
 mod host;
 mod logging;

@@ -10,6 +10,10 @@
 //! - KVM gets the CPUID table when the vCPU is created.
 
 use std::cell::Cell;
+use std::fs::File;
+use std::mem::offset_of;
+use std::os::fd::FromRawFd;
+use std::os::unix::fs::FileExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Once};
 
@@ -17,19 +21,21 @@ use anyhow::{Context, Result, bail};
 use kvm_bindings::{
     CpuId, KVM_CPUID_FLAG_SIGNIFCANT_INDEX, KVM_IRQ_ROUTING_MSI, KVM_MAX_CPUID_ENTRIES,
     KVM_MSR_EXIT_REASON_FILTER, KVM_MSR_EXIT_REASON_INVAL, KVM_MSR_EXIT_REASON_UNKNOWN,
-    KVM_VCPU_TSC_CTRL, KVM_VCPU_TSC_OFFSET, KvmIrqRouting, Msrs as KvmMsrs, kvm_cpuid_entry2,
-    kvm_device_attr, kvm_dtable, kvm_enable_cap, kvm_irq_routing_entry, kvm_msi, kvm_msr_entry,
-    kvm_regs, kvm_run, kvm_segment, kvm_userspace_memory_region, kvm_xcrs,
+    KVM_STATS_TYPE_CUMULATIVE, KVM_STATS_TYPE_MASK, KVM_VCPU_TSC_CTRL, KVM_VCPU_TSC_OFFSET,
+    KvmIrqRouting, Msrs as KvmMsrs, kvm_cpuid_entry2, kvm_device_attr, kvm_dtable, kvm_enable_cap,
+    kvm_irq_routing_entry, kvm_msi, kvm_msr_entry, kvm_regs, kvm_run, kvm_segment, kvm_stats_desc,
+    kvm_stats_header, kvm_userspace_memory_region, kvm_xcrs,
 };
 use kvm_ioctls::{
     Cap, Kvm, MsrFilterDefaultAction, MsrFilterRange, MsrFilterRangeFlags, VcpuExit, VcpuFd, VmFd,
 };
 
+use crate::counters::{ExitCounts, kinds};
 use crate::ioapic::{self, Interrupt, Ioapic};
 use crate::x86::{IOAPIC_BASE, LAPIC_BASE, cpuid, msr};
 use crate::{
-    BasicRegs, Completion, CpuidEntry, DescriptorTable, Exit, GuestMemory, HypervisorOps,
-    KickerOps, Msrs, RESERVED_BASE, Regs, Segment, VcpuOps,
+    BasicRegs, Completion, CountersOps, CpuidEntry, DescriptorTable, Exit, GuestMemory,
+    HypervisorOps, KickerOps, Msrs, RESERVED_BASE, Regs, Segment, VcpuOps,
 };
 
 // kvm-ioctls only wraps KVM_SET_DEVICE_ATTR for vCPUs on aarch64.
@@ -41,6 +47,8 @@ vmm_sys_util::ioctl_iow_nr!(
 );
 // kvm-ioctls only wraps KVM_GET_TSC_KHZ for vCPUs.
 vmm_sys_util::ioctl_io_nr!(KVM_GET_TSC_KHZ, kvm_bindings::KVMIO, 0xA3);
+// kvm-ioctls does not wrap KVM_GET_STATS_FD.
+vmm_sys_util::ioctl_io_nr!(KVM_GET_STATS_FD, kvm_bindings::KVMIO, 0xCE);
 
 /// Where KVM puts its identity map (one page) and real-mode TSS (three pages; both are
 /// only needed on Intel without unrestricted guest), in [`RESERVED_BASE`].
@@ -419,10 +427,13 @@ impl HypervisorOps for Hypervisor {
             thread: Mutex::new(None),
             kicked: AtomicBool::new(false),
         });
+        let stats = KvmStats::open(&fd, self.mapping.clone()).map(Arc::new);
         Ok(Vcpu {
             fd,
             kicker,
             interrupts: self.interrupts.clone(),
+            counts: Arc::new(ExitCounts::new()),
+            stats,
             incomplete: None,
             _mapping: self.mapping.clone(),
         })
@@ -529,10 +540,127 @@ impl Drop for Running<'_> {
     }
 }
 
+/// A vCPU's statistics from KVM (its binary statistics file): the counters that only
+/// grow, which include the exits that KVM handles itself (e.g., `kvm.halt_exits`).
+struct KvmStats {
+    /// The file holds a reference to the VM.
+    file: File,
+    /// The counters' names (`kvm.` and KVM's name) and their indices into the data
+    /// block.
+    counters: Vec<(String, usize)>,
+    /// Where the data block (of u64 values) is in the file.
+    data_offset: u64,
+    /// The number of values in the data block that we read.
+    data_len: usize,
+    /// Declared after `file`, such that the VM (which the file keeps alive) is
+    /// destroyed first (see [`Hypervisor`]).
+    _mapping: Arc<Mapping>,
+}
+
+impl KvmStats {
+    /// None if KVM has no binary statistics (before Linux 5.14) or reading them fails.
+    fn open(vcpu: &VcpuFd, mapping: Arc<Mapping>) -> Option<Self> {
+        // SAFETY: KVM_GET_STATS_FD takes no argument.
+        let fd = unsafe { vmm_sys_util::ioctl::ioctl(vcpu, KVM_GET_STATS_FD()) };
+        if fd < 0 {
+            return None;
+        }
+        // SAFETY: KVM returned a new file descriptor, which nothing else owns.
+        let file = unsafe { File::from_raw_fd(fd) };
+        let mut header = [0u8; size_of::<kvm_stats_header>()];
+        file.read_exact_at(&mut header, 0).ok()?;
+        let field = |offset| u32_at(&header, offset);
+        let name_size = field(offset_of!(kvm_stats_header, name_size)) as usize;
+        let num_desc = field(offset_of!(kvm_stats_header, num_desc)) as usize;
+        let desc_offset = field(offset_of!(kvm_stats_header, desc_offset));
+        let data_offset = field(offset_of!(kvm_stats_header, data_offset));
+        let mut descs = vec![0u8; (size_of::<kvm_stats_desc>() + name_size) * num_desc];
+        file.read_exact_at(&mut descs, desc_offset.into()).ok()?;
+        let counters = counters(&descs, name_size);
+        let data_len = counters.iter().map(|&(_, index)| index + 1).max();
+        Some(Self {
+            file,
+            data_offset: data_offset.into(),
+            data_len: data_len.unwrap_or(0),
+            counters,
+            _mapping: mapping,
+        })
+    }
+
+    /// Appends the counters' current values to `out`.
+    fn snapshot(&self, out: &mut Vec<(String, u64)>) -> Result<()> {
+        let mut data = vec![0u8; self.data_len * size_of::<u64>()];
+        self.file
+            .read_exact_at(&mut data, self.data_offset)
+            .context("reading KVM's vCPU statistics failed")?;
+        out.extend(self.counters.iter().map(|(name, index)| {
+            let bytes = &data[index * size_of::<u64>()..][..size_of::<u64>()];
+            (name.clone(), u64::from_ne_bytes(bytes.try_into().unwrap()))
+        }));
+        Ok(())
+    }
+}
+
+/// The counters (cumulative statistics with a single value) that the descriptors
+/// `descs` describe (each a struct kvm_stats_desc followed by a name of `name_size`
+/// bytes): their names (`kvm.` and KVM's name) and their indices into the data block.
+fn counters(descs: &[u8], name_size: usize) -> Vec<(String, usize)> {
+    let desc_size = size_of::<kvm_stats_desc>() + name_size;
+    descs
+        .chunks_exact(desc_size)
+        .filter_map(|desc| {
+            let flags = u32_at(desc, offset_of!(kvm_stats_desc, flags));
+            let size = offset_of!(kvm_stats_desc, size);
+            let size = u16::from_ne_bytes([desc[size], desc[size + 1]]);
+            // In bytes, from the start of the data block.
+            let offset = u32_at(desc, offset_of!(kvm_stats_desc, offset)) as usize;
+            if flags & KVM_STATS_TYPE_MASK != KVM_STATS_TYPE_CUMULATIVE || size != 1 {
+                return None;
+            }
+            let name = &desc[offset_of!(kvm_stats_desc, name)..];
+            let name = name.split(|&b| b == 0).next().unwrap_or_default();
+            let name = format!("kvm.{}", String::from_utf8_lossy(name));
+            Some((name, offset / size_of::<u64>()))
+        })
+        .collect()
+}
+
+fn u32_at(bytes: &[u8], offset: usize) -> u32 {
+    u32::from_ne_bytes(bytes[offset..offset + 4].try_into().unwrap())
+}
+
+kinds! {
+    /// The exits that the backend handles itself (see [`ExitCounts`]).
+    enum Internal {
+        Eoi => "exit.eoi",
+        /// An access to the I/O APIC.
+        Ioapic => "exit.ioapic",
+    }
+}
+
+#[derive(Clone)]
+pub struct Counters {
+    exits: Arc<ExitCounts<Internal>>,
+    stats: Option<Arc<KvmStats>>,
+}
+
+impl CountersOps for Counters {
+    fn snapshot(&self) -> Result<Vec<(String, u64)>> {
+        let mut out = Vec::new();
+        self.exits.snapshot(&mut out);
+        if let Some(stats) = &self.stats {
+            stats.snapshot(&mut out)?;
+        }
+        Ok(out)
+    }
+}
+
 pub struct Vcpu {
     fd: VcpuFd,
     kicker: Arc<KickState>,
     interrupts: Arc<Interrupts>,
+    counts: Arc<ExitCounts<Internal>>,
+    stats: Option<Arc<KvmStats>>,
     /// The instruction that waits for a [`Completion`].
     incomplete: Option<Incomplete>,
     /// Declared after `fd`, such that the vCPU (and thus maybe the VM) is destroyed first.
@@ -617,12 +745,14 @@ impl Vcpu {
             VcpuExit::IrqWindowOpen => return Ok(None),
             // We emulate the I/O APIC here; KVM completes the access on the next run.
             VcpuExit::MmioRead(address, data) if is_ioapic(address) => {
+                self.counts.count_internal(Internal::Ioapic);
                 let value = self.interrupts.read(address - IOAPIC_BASE).to_le_bytes();
                 let size = data.len().min(8);
                 data[..size].copy_from_slice(&value[..size]);
                 return Ok(None);
             }
             VcpuExit::MmioWrite(address, data) if is_ioapic(address) => {
+                self.counts.count_internal(Internal::Ioapic);
                 let mut bytes = [0u8; 8];
                 let size = data.len().min(8);
                 bytes[..size].copy_from_slice(&data[..size]);
@@ -631,6 +761,7 @@ impl Vcpu {
                 return Ok(None);
             }
             VcpuExit::IoapicEoi(vector) => {
+                self.counts.count_internal(Internal::Eoi);
                 self.interrupts.eoi(vector)?;
                 return Ok(None);
             }
@@ -795,9 +926,11 @@ impl VcpuOps for Vcpu {
             // A kick that arrives from here on makes KVM_RUN return immediately.
             self.fd.set_kvm_immediate_exit(0);
             if self.kicker.kicked.swap(false, Ordering::SeqCst) {
+                // Not an exit: we did not enter the guest.
                 return Ok(Exit::Kicked);
             }
             if let Some(exit) = self.enter()? {
+                self.counts.count(&exit);
                 return Ok(exit);
             }
         }
@@ -932,5 +1065,49 @@ impl VcpuOps for Vcpu {
 
     fn kicker(&self) -> Kicker {
         Kicker(self.kicker.clone())
+    }
+
+    fn counters(&self) -> Counters {
+        Counters {
+            exits: self.counts.clone(),
+            stats: self.stats.clone(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use kvm_bindings::{KVM_STATS_TYPE_INSTANT, KVM_STATS_TYPE_LOG_HIST};
+
+    use super::*;
+
+    /// A struct kvm_stats_desc with a name of `NAME_SIZE` bytes.
+    fn descriptor(flags: u32, size: u16, offset: u32, name: &str) -> Vec<u8> {
+        let mut desc = vec![0u8; size_of::<kvm_stats_desc>() + NAME_SIZE];
+        desc[offset_of!(kvm_stats_desc, flags)..][..4].copy_from_slice(&flags.to_ne_bytes());
+        desc[offset_of!(kvm_stats_desc, size)..][..2].copy_from_slice(&size.to_ne_bytes());
+        desc[offset_of!(kvm_stats_desc, offset)..][..4].copy_from_slice(&offset.to_ne_bytes());
+        desc[offset_of!(kvm_stats_desc, name)..][..name.len()].copy_from_slice(name.as_bytes());
+        desc
+    }
+
+    const NAME_SIZE: usize = 48;
+
+    #[test]
+    fn finds_the_counters() {
+        let descs = [
+            descriptor(KVM_STATS_TYPE_CUMULATIVE, 1, 0, "exits"),
+            descriptor(KVM_STATS_TYPE_INSTANT, 1, 8, "guest_mode"),
+            descriptor(KVM_STATS_TYPE_LOG_HIST, 32, 16, "halt_poll_success_hist"),
+            descriptor(KVM_STATS_TYPE_CUMULATIVE, 1, 272, "halt_exits"),
+        ]
+        .concat();
+        assert_eq!(
+            counters(&descs, NAME_SIZE),
+            [
+                ("kvm.exits".to_string(), 0),
+                ("kvm.halt_exits".to_string(), 34)
+            ]
+        );
     }
 }

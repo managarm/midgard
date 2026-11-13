@@ -7,6 +7,7 @@ use midgard_protocol::runtime::DEFAULT_VM;
 mod boot;
 mod cli;
 mod client;
+mod counters;
 mod terminal;
 
 use cli::Action;
@@ -48,6 +49,7 @@ fn main() -> ExitCode {
         Some(Action::List) => client::list(),
         Some(Action::Pull(args)) => client::pull(args),
         Some(Action::Log(args)) => client::log(vm(&args.name), args.follow),
+        Some(Action::Counters(args)) => counters::show(vm(&args.name), args).map(|()| 0),
         Some(Action::Boot(args)) => boot::boot(args).map(|()| 0),
     };
     terminal::restore();

@@ -16,14 +16,15 @@
 //! On Linux, [`create`] installs a process-wide handler for SIGRTMIN, the signal with
 //! which kicks interrupt KVM_RUN. The rest of the process must not use that signal.
 //!
-//! The backend is chosen at compile time: [`Hypervisor`], [`Vcpu`] and [`Kicker`] are
-//! the backend's own types, whose methods (see `backend!`) are the same on all of
-//! them. Nothing here is a trait object.
+//! The backend is chosen at compile time: [`Hypervisor`], [`Vcpu`], [`Kicker`] and
+//! [`Counters`] are the backend's own types, whose methods (see `backend!`) are the same
+//! on all of them. Nothing here is a trait object.
 
 #![warn(unreachable_pub)]
 
 use anyhow::Result;
 
+mod counters;
 #[cfg(any(target_os = "managarm", test))]
 mod decode;
 mod ioapic;
@@ -88,7 +89,7 @@ use kvm as imp;
 #[cfg(not(any(target_os = "managarm", target_os = "linux")))]
 compile_error!("midgard-hv has no backend for this target OS");
 
-pub use imp::{Hypervisor, Kicker, MAX_VCPUS, Vcpu};
+pub use imp::{Counters, Hypervisor, Kicker, MAX_VCPUS, Vcpu};
 
 /// Guest-physical addresses that the backend may use for itself, which the VMM must
 /// leave alone (KVM puts its identity map and real-mode TSS there).
@@ -269,6 +270,21 @@ backend! {
 }
 
 backend! {
+    /// What a backend's [`Counters`] do: they count what a vCPU does (e.g., its exits by
+    /// kind), for diagnostics. The names are the backend's: `exit.*` for the exits that
+    /// the VMM sees, which all backends count (except those on which the VM stops), and
+    /// whatever else the backend counts (the exits that it handles itself, e.g., the I/O
+    /// APIC's; on KVM, the exits that KVM handles are in KVM's statistics). The values
+    /// only grow. `Counters` are cheap to clone and work from any thread (also while the
+    /// vCPU runs).
+    pub struct Counters;
+    trait CountersOps {
+        /// The current values, by name.
+        fn snapshot(&self) -> Result<Vec<(String, u64)>>;
+    }
+}
+
+backend! {
     /// What a backend's [`Vcpu`] does (it can move to another thread between runs).
     pub struct Vcpu;
     trait VcpuOps {
@@ -283,6 +299,8 @@ backend! {
         fn set_msrs(&mut self, msrs: &Msrs) -> Result<()>;
         /// The vCPU's kicker (which other threads use while it runs).
         fn kicker(&self) -> Kicker;
+        /// The vCPU's counters (which other threads read while it runs).
+        fn counters(&self) -> Counters;
     }
 }
 

@@ -52,6 +52,7 @@ impl Vcpu {
             .hypervisor()
             .create_vcpu(id, &cpuid::table(id, board.num_cpus))?;
         board.add_kicker(backend.kicker());
+        board.add_vcpu_counters(id, backend.counters());
         let kvmclock = Kvmclock::new();
         Ok(Self {
             id,

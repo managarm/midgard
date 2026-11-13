@@ -2,6 +2,7 @@
 //! bifrost starts each connection with one [`Request`]; midgard answers with
 //! [`Response`]s.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -45,6 +46,9 @@ pub enum Request {
     },
     /// Delete a VM instance, whose VM must not run, and its disk ([`Response::Done`]).
     Delete { name: String },
+    /// The counters of a VM instance's VM, which must run ([`Response::Counters`], or
+    /// [`Response::NoInstance`]).
+    Counters { name: String },
     /// Download boot files and templates from a channel and install them. midgard says
     /// what it does ([`Response::Pull`]) until it is done ([`Response::Pulled`]).
     Pull(Pull),
@@ -80,6 +84,7 @@ pub enum Response {
     NoInstance,
     Running(Vec<String>),
     List(Listing),
+    Counters(Counters),
     /// Progress of [`Request::Pull`].
     Pull(PullEvent),
     /// [`Request::Pull`] succeeded.
@@ -146,4 +151,17 @@ pub struct Pulled {
     pub installed: Vec<String>,
     /// The templates of the channel that are not installed.
     pub available: Vec<String>,
+}
+
+/// Counters of a running VM, for diagnostics. The values only grow (since the VM
+/// started); the names are not part of the protocol (they depend on midgard's version
+/// and hypervisor backend), such that bifrost shows whatever midgard counts.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct Counters {
+    /// The counters of each vCPU (by index), which the hypervisor backend names (e.g.,
+    /// `exit.io`, the port I/O exits that midgard handled).
+    pub vcpus: Vec<BTreeMap<String, u64>>,
+    /// The counters of the devices that midgard emulates (e.g.,
+    /// `virtio-blk0.queue0.notifies`).
+    pub devices: BTreeMap<String, u64>,
 }

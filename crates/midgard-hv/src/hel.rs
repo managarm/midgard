@@ -10,13 +10,14 @@ use hel_sys::{
     HelX86VirtualizationBasicRegs, HelX86VirtualizationMsrs, HelX86VirtualizationRegs,
 };
 
+use crate::counters::{ExitCounts, kinds};
 use crate::decode::{self, Instruction, Operation};
 use crate::ioapic::{self, Interrupt, Ioapic};
 use crate::x86::cpuid::LEAF1_ECX_OSXSAVE;
 use crate::x86::{CR4_OSXSAVE, IOAPIC_BASE, xsave_compacted_size, xsave_size};
 use crate::{
-    BasicRegs, Completion, CpuidEntry, DescriptorTable, Exit, GuestMemory, HypervisorOps,
-    KickerOps, Msrs, Regs, Segment, VcpuOps,
+    BasicRegs, Completion, CountersOps, CpuidEntry, DescriptorTable, Exit, GuestMemory,
+    HypervisorOps, KickerOps, Msrs, Regs, Segment, VcpuOps,
 };
 
 /// Thor does not support more than one vCPU per VM yet.
@@ -156,6 +157,7 @@ impl HypervisorOps for Hypervisor {
         }
         Ok(Vcpu {
             handle,
+            counts: Arc::new(ExitCounts::new()),
             cpuid: cpuid.to_vec(),
             memory: self.memory.clone(),
             interrupts: self.interrupts.clone(),
@@ -198,8 +200,32 @@ impl KickerOps for Kicker {
     }
 }
 
+kinds! {
+    /// The exits that the backend handles itself (see [`ExitCounts`]).
+    enum Internal {
+        Cpuid => "exit.cpuid",
+        Eoi => "exit.eoi",
+        /// An access to the I/O APIC.
+        Ioapic => "exit.ioapic",
+    }
+}
+
+#[derive(Clone)]
+pub struct Counters {
+    exits: Arc<ExitCounts<Internal>>,
+}
+
+impl CountersOps for Counters {
+    fn snapshot(&self) -> Result<Vec<(String, u64)>> {
+        let mut out = Vec::new();
+        self.exits.snapshot(&mut out);
+        Ok(out)
+    }
+}
+
 pub struct Vcpu {
     handle: Arc<hel::Handle>,
+    counts: Arc<ExitCounts<Internal>>,
     cpuid: Vec<CpuidEntry>,
     memory: GuestMemory,
     interrupts: Arc<Interrupts>,
@@ -544,7 +570,10 @@ impl VcpuOps for Vcpu {
             let reason = match hel::run_virtualized_cpu(&self.handle, completion.take().as_ref()) {
                 Ok(reason) => reason,
                 // A signal interrupted the thread (thor applied the completion already).
-                Err(hel::Error::Cancelled) => return Ok(Exit::Kicked),
+                Err(hel::Error::Cancelled) => {
+                    self.counts.count(&Exit::Kicked);
+                    return Ok(Exit::Kicked);
+                }
                 Err(error) => return Err(error).context("helRunVirtualizedCpu() failed"),
             };
             let flags = reason.flags as u32;
@@ -567,7 +596,10 @@ impl VcpuOps for Vcpu {
                 }
                 hel_sys::kHelVmexitTranslationFault => match self.mmio(reason.address as u64)? {
                     Some(exit) => exit,
-                    None => continue,
+                    None => {
+                        self.counts.count_internal(Internal::Ioapic);
+                        continue;
+                    }
                 },
                 hel_sys::kHelVmexitRdmsr => Exit::Rdmsr {
                     index: reason.address as u32,
@@ -577,6 +609,7 @@ impl VcpuOps for Vcpu {
                     value: reason.data,
                 },
                 hel_sys::kHelVmexitCpuid => {
+                    self.counts.count_internal(Internal::Cpuid);
                     let result = self.cpuid(reason.address as u32, reason.data as u32)?;
                     let mut cpuid = to_hel_completion(Completion::Done(0));
                     cpuid.data = result.map(u64::from);
@@ -584,6 +617,7 @@ impl VcpuOps for Vcpu {
                     continue;
                 }
                 hel_sys::kHelVmexitEoi => {
+                    self.counts.count_internal(Internal::Eoi);
                     let interrupt = self
                         .interrupts
                         .ioapic
@@ -601,6 +635,7 @@ impl VcpuOps for Vcpu {
                 }
                 other => Exit::Failed(format!("unexpected exit {other} (code {:#x})", reason.code)),
             };
+            self.counts.count(&exit);
             return Ok(exit);
         }
     }
@@ -664,6 +699,12 @@ impl VcpuOps for Vcpu {
     fn kicker(&self) -> Kicker {
         Kicker {
             handle: self.handle.clone(),
+        }
+    }
+
+    fn counters(&self) -> Counters {
+        Counters {
+            exits: self.counts.clone(),
         }
     }
 }

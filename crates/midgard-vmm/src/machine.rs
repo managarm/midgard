@@ -13,6 +13,7 @@ use std::thread::JoinHandle;
 use anyhow::{Context, Result, anyhow, bail};
 use async_executor::Executor;
 use event_listener::Event;
+use midgard_protocol::control::Counters;
 use midgard_protocol::guest::Ready;
 use midgard_protocol::machine::{ConsoleKind, MachineConfig};
 use midgard_protocol::{SHARE_TAG, param};
@@ -381,6 +382,12 @@ impl MachineHandle {
     /// Connects to a vsock port that the guest listens on.
     pub async fn vsock_connect(&self, port: u32) -> io::Result<VsockStream> {
         VsockStream::connect(&self.board()?, port).await
+    }
+
+    /// The counters of the vCPUs and of the devices, for diagnostics. Blocks (e.g., while
+    /// a device works on its queues), so not for the VM's executor.
+    pub fn counters(&self) -> Result<Counters> {
+        self.board()?.counters()
     }
 
     /// Listens on a host vsock port for connections from the guest.
