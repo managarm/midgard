@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use midgard_protocol::control::{Listing, PullEvent, PullItem, Pulled};
+use midgard_protocol::control::{Counters, Listing, PullEvent, PullItem, Pulled};
 use midgard_protocol::session::{Exec, Request, Response, WindowSize};
 use midgard_protocol::size::format_size;
 use midgard_protocol::{control, runtime};
@@ -691,6 +691,15 @@ fn session(stream: UnixStream, writer: Arc<Mutex<UnixStream>>, tty: bool) -> Res
     })();
     stop_input();
     result
+}
+
+/// The counters of the VM of a VM instance, which must run.
+pub fn counters(name: &str) -> Result<Counters> {
+    match ask(control::Request::Counters { name: name.into() })? {
+        control::Response::Counters(counters) => Ok(counters),
+        control::Response::NoInstance => Err(NoInstance(name.into()).into()),
+        other => bail!("unexpected answer from midgard: {other:?}"),
+    }
 }
 
 /// The VM instances whose VMs run.
