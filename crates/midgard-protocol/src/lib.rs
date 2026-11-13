@@ -188,6 +188,10 @@ mod tests {
             control::Response::Ready { protocol: 1 },
             control::Response::NoInstance,
             control::Response::Running(vec!["alpine".into()]),
+            control::Response::Counters(control::Counters {
+                vcpus: vec![[("exit.io".to_string(), 12)].into()],
+                devices: [("virtio-blk0.queue0.notifies".to_string(), 3)].into(),
+            }),
             control::Response::List(control::Listing {
                 instances: vec![control::InstanceInfo {
                     name: "dev".into(),
@@ -245,6 +249,9 @@ mod tests {
                 memory: Some(2 << 30),
             },
             control::Request::Delete { name: "dev".into() },
+            control::Request::Counters {
+                name: "alpine".into(),
+            },
             control::Request::Pull(control::Pull {
                 templates: vec!["alpine".into()],
                 all: false,

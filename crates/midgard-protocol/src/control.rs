@@ -46,6 +46,9 @@ pub enum Request {
     },
     /// Delete a VM instance, whose VM must not run, and its disk ([`Response::Done`]).
     Delete { name: String },
+    /// The counters of a VM instance's VM, which must run ([`Response::Counters`], or
+    /// [`Response::NoInstance`]).
+    Counters { name: String },
     /// Download boot files and templates from a channel and install them. midgard says
     /// what it does ([`Response::Pull`]) until it is done ([`Response::Pulled`]).
     Pull(Pull),
@@ -81,6 +84,7 @@ pub enum Response {
     NoInstance,
     Running(Vec<String>),
     List(Listing),
+    Counters(Counters),
     /// Progress of [`Request::Pull`].
     Pull(PullEvent),
     /// [`Request::Pull`] succeeded.
