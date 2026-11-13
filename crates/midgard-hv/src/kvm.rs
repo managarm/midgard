@@ -25,11 +25,12 @@ use kvm_ioctls::{
     Cap, Kvm, MsrFilterDefaultAction, MsrFilterRange, MsrFilterRangeFlags, VcpuExit, VcpuFd, VmFd,
 };
 
+use crate::counters::{ExitCounts, kinds};
 use crate::ioapic::{self, Interrupt, Ioapic};
 use crate::x86::{IOAPIC_BASE, LAPIC_BASE, cpuid, msr};
 use crate::{
-    BasicRegs, Completion, CpuidEntry, DescriptorTable, Exit, GuestMemory, HypervisorOps,
-    KickerOps, Msrs, RESERVED_BASE, Regs, Segment, VcpuOps,
+    BasicRegs, Completion, CountersOps, CpuidEntry, DescriptorTable, Exit, GuestMemory,
+    HypervisorOps, KickerOps, Msrs, RESERVED_BASE, Regs, Segment, VcpuOps,
 };
 
 // kvm-ioctls only wraps KVM_SET_DEVICE_ATTR for vCPUs on aarch64.
@@ -423,6 +424,7 @@ impl HypervisorOps for Hypervisor {
             fd,
             kicker,
             interrupts: self.interrupts.clone(),
+            counts: Arc::new(ExitCounts::new()),
             incomplete: None,
             _mapping: self.mapping.clone(),
         })
@@ -529,10 +531,33 @@ impl Drop for Running<'_> {
     }
 }
 
+kinds! {
+    /// The exits that the backend handles itself (see [`ExitCounts`]).
+    enum Internal {
+        Eoi => "exit.eoi",
+        /// An access to the I/O APIC.
+        Ioapic => "exit.ioapic",
+    }
+}
+
+#[derive(Clone)]
+pub struct Counters {
+    exits: Arc<ExitCounts<Internal>>,
+}
+
+impl CountersOps for Counters {
+    fn snapshot(&self) -> Result<Vec<(String, u64)>> {
+        let mut out = Vec::new();
+        self.exits.snapshot(&mut out);
+        Ok(out)
+    }
+}
+
 pub struct Vcpu {
     fd: VcpuFd,
     kicker: Arc<KickState>,
     interrupts: Arc<Interrupts>,
+    counts: Arc<ExitCounts<Internal>>,
     /// The instruction that waits for a [`Completion`].
     incomplete: Option<Incomplete>,
     /// Declared after `fd`, such that the vCPU (and thus maybe the VM) is destroyed first.
@@ -617,12 +642,14 @@ impl Vcpu {
             VcpuExit::IrqWindowOpen => return Ok(None),
             // We emulate the I/O APIC here; KVM completes the access on the next run.
             VcpuExit::MmioRead(address, data) if is_ioapic(address) => {
+                self.counts.count_internal(Internal::Ioapic);
                 let value = self.interrupts.read(address - IOAPIC_BASE).to_le_bytes();
                 let size = data.len().min(8);
                 data[..size].copy_from_slice(&value[..size]);
                 return Ok(None);
             }
             VcpuExit::MmioWrite(address, data) if is_ioapic(address) => {
+                self.counts.count_internal(Internal::Ioapic);
                 let mut bytes = [0u8; 8];
                 let size = data.len().min(8);
                 bytes[..size].copy_from_slice(&data[..size]);
@@ -631,6 +658,7 @@ impl Vcpu {
                 return Ok(None);
             }
             VcpuExit::IoapicEoi(vector) => {
+                self.counts.count_internal(Internal::Eoi);
                 self.interrupts.eoi(vector)?;
                 return Ok(None);
             }
@@ -795,9 +823,11 @@ impl VcpuOps for Vcpu {
             // A kick that arrives from here on makes KVM_RUN return immediately.
             self.fd.set_kvm_immediate_exit(0);
             if self.kicker.kicked.swap(false, Ordering::SeqCst) {
+                // Not an exit: we did not enter the guest.
                 return Ok(Exit::Kicked);
             }
             if let Some(exit) = self.enter()? {
+                self.counts.count(&exit);
                 return Ok(exit);
             }
         }
@@ -932,5 +962,11 @@ impl VcpuOps for Vcpu {
 
     fn kicker(&self) -> Kicker {
         Kicker(self.kicker.clone())
+    }
+
+    fn counters(&self) -> Counters {
+        Counters {
+            exits: self.counts.clone(),
+        }
     }
 }
