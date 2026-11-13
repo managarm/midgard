@@ -3,7 +3,8 @@
 //! The model: the backend emulates the local APICs (including HLT, IPIs and INIT / SIPI),
 //! the I/O APIC and CPUID (from a table). (On Hel, thor emulates the local APIC of a
 //! single vCPU; the backend emulates the I/O APIC and CPUID, and decodes MMIO
-//! instructions.) Exits report *what* the guest did; port I/O, MMIO, MSR and hypercall
+//! instructions. On KVM, the kernel emulates the local APICs, and the backend the I/O
+//! APIC.) Exits report *what* the guest did; port I/O, MMIO, MSR and hypercall
 //! exits leave the instruction unfinished until the next run completes it (see
 //! [`Completion`]). A kick makes the running (or next) run return. Other backends (KVM,
 //! for development on Linux) translate to this model.
@@ -25,7 +26,6 @@ use anyhow::Result;
 
 #[cfg(any(target_os = "managarm", test))]
 mod decode;
-#[cfg(any(target_os = "managarm", test))]
 mod ioapic;
 pub mod memory;
 pub mod x86;

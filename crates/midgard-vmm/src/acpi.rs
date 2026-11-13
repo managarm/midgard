@@ -1,6 +1,7 @@
-//! Minimal ACPI tables: they tell Linux about the CPUs and the I/O APIC (the MADT) and
-//! give it a way to power off (the FADT's PM1a control block and \_S5 in the DSDT).
-//! There is no AML besides \_S5; the virtio devices are declared on the command line.
+//! Minimal ACPI tables: they tell Linux about the CPUs and the I/O APIC (the MADT), give
+//! it a way to power off (the FADT's PM1a control block and \_S5 in the DSDT) and
+//! describe the legacy devices (in the DSDT). The virtio devices are declared on the
+//! command line.
 
 use std::mem::offset_of;
 
@@ -8,8 +9,11 @@ use midgard_hv::{GuestMemory, MemoryError};
 use zerocopy::little_endian::{U16, U32, U64};
 use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout};
 
-use crate::devices::{pm1, rtc};
-use crate::platform::{IOAPIC_BASE, LAPIC_BASE, PM1A_CNT_BLK, PM1A_EVT_BLK, SCI_IRQ};
+use crate::aml;
+use crate::devices::{pm1, rtc, serial};
+use crate::platform::{
+    COM1_IRQ, COM1_PORT, IOAPIC_BASE, LAPIC_BASE, PM1A_CNT_BLK, PM1A_EVT_BLK, RTC_PORT, SCI_IRQ,
+};
 
 const OEM_ID: &[u8; 6] = b"MIDGRD";
 const OEM_TABLE_ID: &[u8; 8] = b"MIDGARD ";
@@ -265,13 +269,65 @@ impl Layout {
     }
 }
 
-/// The DSDT: \_S5 only, i.e., Name (_S5, Package () { 5, 5, 0, 0 }).
+/// The DSDT: \_S5 and the legacy devices, with their PNP IDs and resources (Linux finds
+/// them without, but its defaults do not always match, e.g., the RTC's IRQ).
 fn dsdt() -> Vec<u8> {
-    let s5 = pm1::S5_SLP_TYP as u8;
-    // NameOp "_S5_" PackageOp PkgLength NumElements BytePrefix 5 BytePrefix 5 Zero Zero.
-    let aml = [
-        0x08, b'_', b'S', b'5', b'_', 0x12, 0x08, 0x04, 0x0A, s5, 0x0A, s5, 0x00, 0x00,
-    ];
+    let s5 = u64::from(pm1::S5_SLP_TYP);
+    let aml = aml::term_list(&[
+        // SLP_TYPa and SLP_TYPb, then two reserved values.
+        aml::name(
+            "_S5",
+            aml::package(&[
+                aml::integer(s5),
+                aml::integer(s5),
+                aml::integer(0),
+                aml::integer(0),
+            ]),
+        ),
+        aml::scope(
+            "\\_SB",
+            &[
+                // No IRQ: the RTC does not raise its interrupts.
+                aml::device(
+                    "RTC",
+                    &[
+                        aml::name("_HID", aml::eisa_id("PNP0B00")),
+                        aml::name(
+                            "_CRS",
+                            aml::resource_template(&[aml::io(RTC_PORT, rtc::NUM_PORTS)]),
+                        ),
+                    ],
+                ),
+                aml::device(
+                    "COM1",
+                    &[
+                        aml::name("_HID", aml::eisa_id("PNP0501")),
+                        aml::name(
+                            "_CRS",
+                            aml::resource_template(&[
+                                aml::io(COM1_PORT, serial::NUM_PORTS),
+                                aml::irq_no_flags(COM1_IRQ),
+                            ]),
+                        ),
+                    ],
+                ),
+                // Motherboard resources: the PM1 blocks' ports (the FADT points to them).
+                aml::device(
+                    "PM1",
+                    &[
+                        aml::name("_HID", aml::eisa_id("PNP0C02")),
+                        aml::name(
+                            "_CRS",
+                            aml::resource_template(&[
+                                aml::io(PM1A_EVT_BLK, pm1::EVT_LEN),
+                                aml::io(PM1A_CNT_BLK, pm1::CNT_LEN),
+                            ]),
+                        ),
+                    ],
+                ),
+            ],
+        ),
+    ]);
     sdt(b"DSDT", 2, &aml)
 }
 

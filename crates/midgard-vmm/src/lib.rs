@@ -4,7 +4,8 @@
 //! The guest boots directly into the kernel (no firmware) with a minimal PC-like
 //! platform: x2APICs with TSC-deadline timers and an I/O APIC (both emulated by the
 //! hypervisor), kvmclock, a CMOS RTC, a 16550A UART and virtio-mmio devices (console,
-//! block, network, vsock). Minimal ACPI tables describe the CPUs and power off.
+//! block, network, vsock). Minimal ACPI tables describe the CPUs and the legacy devices
+//! and power off.
 //!
 //! Each vCPU runs on its own thread; everything else on the host side (disk I/O,
 //! the network stack, midgard's sessions) runs as tasks on one executor per VM (see [`Machine::run`]).
@@ -17,6 +18,7 @@
 #![warn(unreachable_pub)]
 
 mod acpi;
+mod aml;
 mod board;
 mod boot;
 mod clock;
