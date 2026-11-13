@@ -13,6 +13,7 @@ mod fuse;
 pub(crate) mod net;
 pub(crate) mod vsock;
 
+use std::collections::BTreeMap;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU32, Ordering, fence};
 use std::sync::{Arc, Condvar, Mutex};
@@ -20,6 +21,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use event_listener::Event;
 use midgard_hv::GuestMemory;
 
+use crate::counters::{self, Accesses};
 use crate::logging::log;
 use crate::platform;
 
@@ -210,6 +212,8 @@ pub(crate) struct Queue {
     /// The used index that we last decided on an interrupt for (None after a reset, such
     /// that the driver gets the next interrupt in any case).
     signaled_used: Option<u16>,
+    /// The chains that were returned to the driver (for statistics; across resets).
+    returned: u64,
 }
 
 impl Queue {
@@ -222,7 +226,10 @@ impl Queue {
     }
 
     fn reset(&mut self) {
-        *self = Self::new(self.max_size);
+        *self = Self {
+            returned: self.returned,
+            ..Self::new(self.max_size)
+        };
     }
 
     /// Takes the configuration that the driver wrote (when it makes the queue ready).
@@ -235,6 +242,7 @@ impl Queue {
             avail: config.avail,
             used: config.used,
             event_idx,
+            returned: self.returned,
             ..Default::default()
         };
     }
@@ -408,6 +416,7 @@ impl Queue {
         }
         self.next_used = self.next_used.wrapping_add(1);
         self.pushed = true;
+        self.returned += 1;
         // The driver must see the entry before the index.
         fence(Ordering::Release);
         if let Some(index) = self.used.checked_add(2) {
@@ -643,12 +652,24 @@ pub(crate) struct Transport {
     device_id: u32,
     device_features: u64,
     pub irq: usize,
+    counters: TransportCounters,
+}
+
+/// What a [`Transport`] counts (see [`Transport::snapshot`]).
+struct TransportCounters {
+    registers: Accesses,
+    /// The notifications of each queue.
+    notifies: Box<[counters::Counter]>,
+    /// The rounds of the device's queue task in which it processed notified queues
+    /// (see [`Transport::process_notified`]).
+    batches: counters::Counter,
 }
 
 impl Transport {
     pub(crate) fn new(device: Box<dyn Device>, irq: usize) -> Self {
         let sizes = device.queue_sizes();
         assert!(sizes.len() <= u32::BITS as usize, "too many queues");
+        let num_queues = sizes.len();
         Self {
             registers: Mutex::new(Registers {
                 status: 0,
@@ -669,6 +690,40 @@ impl Transport {
             notified: AtomicU32::new(0),
             notify: Event::new(),
             irq,
+            counters: TransportCounters {
+                registers: Accesses::default(),
+                notifies: (0..num_queues)
+                    .map(|_| counters::Counter::default())
+                    .collect(),
+                batches: counters::Counter::default(),
+            },
+        }
+    }
+
+    /// The kind of device (in the names of its counters), from its device ID.
+    pub(crate) fn kind(&self) -> &'static str {
+        match self.device_id {
+            net::DEVICE_ID => "net",
+            block::DEVICE_ID => "blk",
+            console::DEVICE_ID => "console",
+            vsock::DEVICE_ID => "vsock",
+            fs::DEVICE_ID => "fs",
+            _ => "device",
+        }
+    }
+
+    /// Adds the transport's counters to `out`, as the device `name`'s: the accesses to
+    /// its registers, the notifications of each queue, the chains that each queue
+    /// returned to the driver and the rounds in which the device processed its queues.
+    pub(crate) fn snapshot(&self, name: &str, out: &mut BTreeMap<String, u64>) {
+        let counters = &self.counters;
+        counters.registers.snapshot(name, "mmio", out);
+        out.insert(format!("{name}.batches"), counters.batches.get());
+        let state = self.device.lock().unwrap();
+        for (index, queue) in state.queues.iter().enumerate() {
+            let notifies = counters.notifies[index].get();
+            out.insert(format!("{name}.queue{index}.notifies"), notifies);
+            out.insert(format!("{name}.queue{index}.used"), queue.returned);
         }
     }
 
@@ -693,6 +748,7 @@ impl Transport {
     }
 
     pub(crate) fn read(&self, offset: u64, size: u8) -> u64 {
+        self.counters.registers.reads.add();
         if offset >= REG_CONFIG {
             let mut data = [0u8; 8];
             let size = (size as usize).min(8);
@@ -732,12 +788,16 @@ impl Transport {
     }
 
     pub(crate) fn write(&self, offset: u64, size: u8, value: u64) -> Effect {
+        self.counters.registers.writes.add();
         // Without the registers' lock: the driver notifies queues and acknowledges
         // interrupts all the time.
         match offset {
             REG_QUEUE_NOTIFY => {
                 // The device's queue task processes the queue (see process_notified()).
                 let queue = value as u32 & 0xFFFF;
+                if let Some(counter) = self.counters.notifies.get(queue as usize) {
+                    counter.add();
+                }
                 if queue < u32::BITS {
                     self.notified.fetch_or(1 << queue, Ordering::SeqCst);
                     self.notify.notify(1);
@@ -907,6 +967,7 @@ impl Transport {
                 }
                 continue;
             }
+            self.counters.batches.add();
             {
                 // Notifications that arrive in the meantime are taken together.
                 let mut state = self.device.lock().unwrap();
@@ -975,6 +1036,7 @@ mod tests {
             pushed: false,
             event_idx: false,
             signaled_used: None,
+            returned: 0,
         }
     }
 
@@ -1185,6 +1247,32 @@ mod tests {
         wait.wait();
         transport.finish_reset();
         assert_eq!(transport.read(REG_STATUS, 4), 0);
+    }
+
+    #[test]
+    fn counts_accesses_and_notifications() {
+        let transport = Transport::new(Box::new(Busy(InFlight::default())), 5);
+        transport.read(REG_MAGIC, 4);
+        transport.write(REG_QUEUE_NOTIFY, 4, 0);
+        transport.write(REG_QUEUE_NOTIFY, 4, 0);
+        // There is no such queue.
+        transport.write(REG_QUEUE_NOTIFY, 4, 7);
+        let mut out = BTreeMap::new();
+        transport.snapshot("dev", &mut out);
+        assert_eq!(out["dev.mmio_reads"], 1);
+        assert_eq!(out["dev.mmio_writes"], 3);
+        assert_eq!(out["dev.queue0.notifies"], 2);
+        assert_eq!(out["dev.queue0.used"], 0);
+        assert_eq!(out.len(), 5);
+    }
+
+    #[test]
+    fn queue_counts_returned_chains_across_resets() {
+        let memory = memory();
+        let mut queue = queue();
+        queue.push(&memory, 0, 0);
+        queue.reset();
+        assert_eq!(queue.returned, 1);
     }
 
     /// A device that counts the notifications of its queues.

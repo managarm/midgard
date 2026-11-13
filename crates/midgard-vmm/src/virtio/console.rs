@@ -18,7 +18,7 @@ use crate::host::console::ConsoleOutput;
 use crate::logging::log;
 
 const NAME: &str = "virtio-console";
-const DEVICE_ID: u32 = 3;
+pub(super) const DEVICE_ID: u32 = 3;
 const RECEIVE_QUEUE: usize = 0;
 const TRANSMIT_QUEUE: usize = 1;
 const QUEUE_SIZE: u16 = 64;

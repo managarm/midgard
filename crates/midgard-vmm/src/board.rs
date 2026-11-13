@@ -1,12 +1,15 @@
 //! The guest's hardware (see [`Board`]).
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use anyhow::Result;
 use event_listener::Event;
-use midgard_hv::{GuestMemory, Hypervisor, Kicker};
+use midgard_hv::{Counters, GuestMemory, Hypervisor, Kicker};
+use midgard_protocol::control;
 
+use crate::counters::{Accesses, Counter};
 use crate::devices::pm1::{self, Pm1};
 use crate::devices::rtc::{self, Rtc};
 use crate::devices::serial::{self, Serial};
@@ -25,6 +28,24 @@ enum Unhandled {
     IrqLine(usize),
     Port(u16),
     Mmio(u64),
+}
+
+/// The number of interrupt lines whose edges the board counts (the ISA IRQs).
+const NUM_COUNTED_IRQS: usize = 16;
+
+/// What the board counts (see [`Board::counters`]); the virtio transports count for
+/// themselves.
+#[derive(Default)]
+struct DeviceCounters {
+    serial: Accesses,
+    rtc: Accesses,
+    pm1: Accesses,
+    /// The ports of devices that we do not have, which we ignore on purpose.
+    ignored: Accesses,
+    unhandled_pio: Accesses,
+    unhandled_mmio: Accesses,
+    /// The rising edges of each interrupt line.
+    irqs: [Counter; NUM_COUNTED_IRQS],
 }
 
 /// The guest's hardware, shared by all vCPUs: RAM, the devices that are not in the
@@ -51,6 +72,9 @@ pub(crate) struct Board {
     pm1: Mutex<Pm1>,
     /// The vCPUs' kickers (see [`Board::stop`]).
     kickers: Mutex<Vec<Kicker>>,
+    /// The vCPUs' counters, by vCPU ID (see [`Board::counters`]).
+    vcpu_counters: Mutex<BTreeMap<u32, Counters>>,
+    device_counters: DeviceCounters,
     /// [`Board::stop`] was called.
     stopping: AtomicBool,
     /// The virtio devices, in the order of their slots (see [`platform::virtio_slot`]).
@@ -83,6 +107,8 @@ impl Board {
             rtc: Mutex::new(Rtc::default()),
             pm1: Mutex::new(Pm1::default()),
             kickers: Mutex::new(Vec::new()),
+            vcpu_counters: Mutex::new(BTreeMap::new()),
+            device_counters: DeviceCounters::default(),
             stopping: AtomicBool::new(false),
             virtio,
             vsock,
@@ -101,6 +127,45 @@ impl Board {
         self.kickers.lock().unwrap().push(kicker);
     }
 
+    /// Lets [`Board::counters`] read the counters of vCPU `id`.
+    pub(crate) fn add_vcpu_counters(&self, id: u32, counters: Counters) {
+        self.vcpu_counters.lock().unwrap().insert(id, counters);
+    }
+
+    /// The vCPUs' and the devices' counters.
+    pub(crate) fn counters(&self) -> Result<control::Counters> {
+        let vcpu_counters = self.vcpu_counters.lock().unwrap().clone();
+        let vcpus = vcpu_counters
+            .values()
+            .map(|counters| Ok(counters.snapshot()?.into_iter().collect()))
+            .collect::<Result<_>>()?;
+        let counters = &self.device_counters;
+        let mut devices = BTreeMap::new();
+        counters.serial.snapshot("serial", "pio", &mut devices);
+        counters.rtc.snapshot("rtc", "pio", &mut devices);
+        counters.pm1.snapshot("pm1", "pio", &mut devices);
+        counters.ignored.snapshot("ignored", "pio", &mut devices);
+        counters
+            .unhandled_pio
+            .snapshot("unhandled", "pio", &mut devices);
+        counters
+            .unhandled_mmio
+            .snapshot("unhandled", "mmio", &mut devices);
+        let irqs = |pin: usize| counters.irqs.get(pin).map_or(0, Counter::get);
+        devices.insert("serial.irqs".into(), irqs(platform::COM1_IRQ));
+        // Devices of the same kind are numbered in the order of their slots.
+        let mut kinds = BTreeMap::<&str, usize>::new();
+        for transport in &self.virtio {
+            let kind = transport.kind();
+            let number = kinds.entry(kind).or_default();
+            let name = format!("virtio-{kind}{number}");
+            *number += 1;
+            transport.snapshot(&name, &mut devices);
+            devices.insert(format!("{name}.irqs"), irqs(transport.irq));
+        }
+        Ok(control::Counters { vcpus, devices })
+    }
+
     /// Makes all vCPUs stop with [`Stop::Requested`] (from any thread).
     pub(crate) fn stop(&self) {
         self.stopping.store(true, Ordering::SeqCst);
@@ -115,6 +180,9 @@ impl Board {
     }
 
     fn set_irq_line(&self, pin: usize, level: bool) {
+        if level && let Some(counter) = self.device_counters.irqs.get(pin) {
+            counter.add();
+        }
         if let Err(error) = self.hypervisor.set_irq_line(pin as u32, level)
             && self.reported.first(Unhandled::IrqLine(pin))
         {
@@ -204,6 +272,7 @@ impl Board {
     /// Port input of `size` bytes.
     pub(crate) fn pio_in(&self, port: u16, size: u32) -> u32 {
         if let Some(offset) = port_offset(port, platform::COM1_PORT, serial::NUM_PORTS) {
+            self.device_counters.serial.reads.add();
             let mut serial = self.serial.lock().unwrap();
             let value = read_bytes(serial::NUM_PORTS, offset, size, |o| serial.read(o));
             self.set_serial_irq(serial.irq_level());
@@ -211,14 +280,17 @@ impl Board {
             return value;
         }
         if let Some(offset) = port_offset(port, platform::RTC_PORT, rtc::NUM_PORTS) {
+            self.device_counters.rtc.reads.add();
             let rtc = self.rtc.lock().unwrap();
             return read_bytes(rtc::NUM_PORTS, offset, size, |o| rtc.read(o));
         }
         if let Some(offset) = port_offset(port, platform::PM1A_EVT_BLK, pm1::EVT_LEN) {
+            self.device_counters.pm1.reads.add();
             let pm1 = self.pm1.lock().unwrap();
             return read_bytes(pm1::EVT_LEN, offset, size, |o| pm1.read_event(o));
         }
         if let Some(offset) = port_offset(port, platform::PM1A_CNT_BLK, pm1::CNT_LEN) {
+            self.device_counters.pm1.reads.add();
             let pm1 = self.pm1.lock().unwrap();
             return read_bytes(pm1::CNT_LEN, offset, size, |o| pm1.read_control(o));
         }
@@ -227,7 +299,7 @@ impl Board {
         } else {
             (1u32 << (8 * size)) - 1
         };
-        match port {
+        let value = match port {
             // There is no 8259 PIC; Linux detects that from a mask register that
             // does not read back as written.
             0x20 | 0x21 | 0xA0 | 0xA1 => 0,
@@ -238,18 +310,22 @@ impl Board {
             // No PCI configuration space (Linux probes it early, despite pci=off).
             0xCF8..=0xCFF => ones,
             _ => {
+                self.device_counters.unhandled_pio.reads.add();
                 self.report(
                     Unhandled::Port(port),
                     format_args!("port read at {port:#x}"),
                 );
-                ones
+                return ones;
             }
-        }
+        };
+        self.device_counters.ignored.reads.add();
+        value
     }
 
     /// Port output of `size` bytes.
     pub(crate) fn pio_out(&self, port: u16, size: u32, value: u32) -> Option<Stop> {
         if let Some(offset) = port_offset(port, platform::COM1_PORT, serial::NUM_PORTS) {
+            self.device_counters.serial.writes.add();
             let mut serial = self.serial.lock().unwrap();
             write_bytes(serial::NUM_PORTS, offset, size, value, |o, byte| {
                 serial.write(o, byte)
@@ -260,6 +336,7 @@ impl Board {
             return None;
         }
         if let Some(offset) = port_offset(port, platform::RTC_PORT, rtc::NUM_PORTS) {
+            self.device_counters.rtc.writes.add();
             let mut rtc = self.rtc.lock().unwrap();
             write_bytes(rtc::NUM_PORTS, offset, size, value, |o, byte| {
                 rtc.write(o, byte)
@@ -267,6 +344,7 @@ impl Board {
             return None;
         }
         if let Some(offset) = port_offset(port, platform::PM1A_EVT_BLK, pm1::EVT_LEN) {
+            self.device_counters.pm1.writes.add();
             let mut pm1 = self.pm1.lock().unwrap();
             write_bytes(pm1::EVT_LEN, offset, size, value, |o, byte| {
                 pm1.write_event(o, byte)
@@ -274,6 +352,7 @@ impl Board {
             return None;
         }
         if let Some(offset) = port_offset(port, platform::PM1A_CNT_BLK, pm1::CNT_LEN) {
+            self.device_counters.pm1.writes.add();
             let mut pm1 = self.pm1.lock().unwrap();
             let mut poweroff = false;
             write_bytes(pm1::CNT_LEN, offset, size, value, |o, byte| {
@@ -288,11 +367,16 @@ impl Board {
             0xCF9 if value & 0x4 != 0 => return Some(Stop::Reset),
             0x20 | 0x21 | 0xA0 | 0xA1 | 0x60 | 0x64 | 0x40..=0x43 | 0x61 | 0x80..=0x8F => {}
             0x2F8..=0x2FF | 0x3E8..=0x3EF | 0x2E8..=0x2EF | 0xCF8..=0xCFF => {}
-            _ => self.report(
-                Unhandled::Port(port),
-                format_args!("port write at {port:#x}"),
-            ),
+            _ => {
+                self.device_counters.unhandled_pio.writes.add();
+                self.report(
+                    Unhandled::Port(port),
+                    format_args!("port write at {port:#x}"),
+                );
+                return None;
+            }
         }
+        self.device_counters.ignored.writes.add();
         None
     }
 
@@ -308,6 +392,7 @@ impl Board {
         if let Some((index, offset)) = self.virtio_device(address) {
             return self.virtio[index].read(offset, size);
         }
+        self.device_counters.unhandled_mmio.reads.add();
         self.report(
             Unhandled::Mmio(address),
             format_args!("MMIO read of {size} bytes at {address:#x}"),
@@ -330,6 +415,7 @@ impl Board {
             }
             return;
         }
+        self.device_counters.unhandled_mmio.writes.add();
         self.report(
             Unhandled::Mmio(address),
             format_args!("MMIO write of {size} bytes at {address:#x}"),

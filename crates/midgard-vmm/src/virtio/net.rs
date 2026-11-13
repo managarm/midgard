@@ -13,7 +13,7 @@ use crate::host::net;
 use crate::logging::log;
 
 const NAME: &str = "virtio-net";
-const DEVICE_ID: u32 = 1;
+pub(super) const DEVICE_ID: u32 = 1;
 const RX_QUEUE: usize = 0;
 const TX_QUEUE: usize = 1;
 const QUEUE_SIZE: u16 = 256;

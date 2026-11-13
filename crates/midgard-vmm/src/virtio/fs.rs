@@ -53,7 +53,7 @@ use crate::host::image::Buffer;
 use crate::logging::log;
 
 const NAME: &str = "virtio-fs";
-const DEVICE_ID: u32 = 26;
+pub(super) const DEVICE_ID: u32 = 26;
 const QUEUE_SIZE: u16 = 256;
 /// The high-priority queue and one request queue.
 const NUM_REQUEST_QUEUES: u32 = 1;
