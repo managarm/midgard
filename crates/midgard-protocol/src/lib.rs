@@ -235,6 +235,7 @@ mod tests {
             control::Request::Session {
                 name: "alpine".into(),
                 start: true,
+                display: Some("/run/user/1000/wayland-0".into()),
             },
             control::Request::Input(b"ls\r".to_vec()),
             control::Request::Create {

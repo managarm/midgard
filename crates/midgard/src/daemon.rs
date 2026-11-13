@@ -6,6 +6,10 @@
 //!
 //! For Wayland forwarding, midgard runs `waypipe client` next to the compositor and
 //! connects each connection from the guest's waypipe (vsock port [`WAYPIPE_PORT`]) to it.
+//! The compositor is the one of the bifrost that starts the VM, never one from midgard's
+//! own environment: systemd starts midgard with the user manager's environment, which
+//! need not name the session's display, and a bifrost without a display (e.g. over SSH)
+//! must not get windows on someone's screen.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
@@ -165,12 +169,13 @@ fn waypipe_debug() -> bool {
     std::env::var_os("MIDGARD_WAYPIPE_DEBUG").is_some_and(|value| !value.is_empty() && value != "0")
 }
 
-/// Starts `waypipe client` on `socket` if we run in a Wayland session and have waypipe.
-fn start_waypipe(socket: PathBuf) -> Option<Gui> {
-    if std::env::var_os("WAYLAND_DISPLAY").is_none() {
-        log!("WAYLAND_DISPLAY is not set; Wayland forwarding is off");
+/// Starts `waypipe client` on `socket` for `display` (bifrost's) if there is one and we
+/// have waypipe.
+fn start_waypipe(socket: PathBuf, display: Option<PathBuf>) -> Option<Gui> {
+    let Some(display) = display else {
+        log!("bifrost has no Wayland display; Wayland forwarding is off");
         return None;
-    }
+    };
     let _ = std::fs::remove_file(&socket);
     let program = std::env::var_os("MIDGARD_WAYPIPE").unwrap_or_else(|| "waypipe".into());
     // No compression (the guest's waypipe has none) and no DMABUFs (shared memory only).
@@ -182,6 +187,7 @@ fn start_waypipe(socket: PathBuf) -> Option<Gui> {
         .args(["--compress", "none", "--no-gpu", "--socket"])
         .arg(&socket)
         .arg("client")
+        .env("WAYLAND_DISPLAY", display)
         .stdin(Stdio::null());
     #[cfg(target_os = "linux")]
     {
@@ -335,7 +341,13 @@ impl Instances {
 
     /// Connects `stream` to the agent in the VM of `name` (see
     /// [`control::Request::Session`]).
-    pub async fn session(&self, stream: Async<UnixStream>, name: &str, start: bool) -> Result<()> {
+    pub async fn session(
+        &self,
+        stream: Async<UnixStream>,
+        name: &str,
+        start: bool,
+        display: Option<PathBuf>,
+    ) -> Result<()> {
         if let Err(error) = instance::validate_name(name) {
             return respond(&stream, control::Response::Error(format!("{error:#}"))).await;
         }
@@ -358,7 +370,7 @@ impl Instances {
                     let name = name.to_string();
                     let thread_running = running.clone();
                     std::thread::spawn(move || {
-                        run_instance(&name, &thread_running);
+                        run_instance(&name, display, &thread_running);
                         let mut instances = instances.lock().unwrap();
                         if instances
                             .get(&name)
@@ -427,9 +439,10 @@ impl Drop for ConsoleLog {
     }
 }
 
-/// Runs the VM of `name` (see [`Instance::config`]) until it stops.
-fn run_instance(name: &str, running: &Running) {
-    let reason = match boot_instance(name, running) {
+/// Runs the VM of `name` (see [`Instance::config`]) until it stops; its Wayland clients go
+/// to `display` (bifrost's), if any.
+fn run_instance(name: &str, display: Option<PathBuf>, running: &Running) {
+    let reason = match boot_instance(name, display, running) {
         Ok(reason) => reason,
         Err(error) => format!("{error:#} (its console: bifrost log {name})"),
     };
@@ -439,7 +452,7 @@ fn run_instance(name: &str, running: &Running) {
 
 /// Boots the VM of `name`, makes it ready for sessions and runs it until it stops;
 /// returns why it stopped.
-fn boot_instance(name: &str, running: &Running) -> Result<String> {
+fn boot_instance(name: &str, display: Option<PathBuf>, running: &Running) -> Result<String> {
     // A pull does not replace the boot files until the VM read them.
     let files = pull::reading();
     let mut config = Instance::load(name)?.config()?;
@@ -455,7 +468,7 @@ fn boot_instance(name: &str, running: &Running) -> Result<String> {
     let gui = config
         .waypipe
         .is_some()
-        .then(|| start_waypipe(runtime::waypipe_socket(name)))
+        .then(|| start_waypipe(runtime::waypipe_socket(name), display))
         .flatten();
     if gui.is_none() {
         config.waypipe = None;
