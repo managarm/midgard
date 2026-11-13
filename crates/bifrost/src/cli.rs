@@ -9,8 +9,9 @@ use midgard_protocol::size::parse_size;
 
 /// Runs a command, or your login shell, in the VM.
 ///
-/// The VM is started on demand and keeps running until it is shut down. To run a
-/// command that has the name of an action, put `--` in front of it.
+/// The VM is started on demand and keeps running until it is shut down. The command
+/// follows `--`, e.g. `bifrost -C /tmp -- ls -la`, such that it is never mistaken for
+/// an action.
 #[derive(Debug, Parser)]
 #[command(
     version,
@@ -98,7 +99,7 @@ pub struct RunArgs {
     pub yes: bool,
 
     /// The command and its arguments [default: your login shell]
-    #[arg(trailing_var_arg = true, value_name = "COMMAND")]
+    #[arg(last = true, value_name = "COMMAND")]
     pub command: Vec<String>,
 }
 
@@ -331,13 +332,23 @@ mod tests {
 
     #[test]
     fn run() {
-        let cli = parse(&["--vm", "dev", "ls", "-la", "--color"]).unwrap();
+        let cli = parse(&["--vm", "dev", "--", "ls", "-la", "--color"]).unwrap();
         assert!(cli.action.is_none());
         assert_eq!(cli.run.vm.as_deref(), Some("dev"));
         assert_eq!(cli.run.command, ["ls", "-la", "--color"]);
-        // The VM is not an argument (that would be the command).
-        assert_eq!(parse(&["dev", "ls"]).unwrap().run.command, ["dev", "ls"]);
-        assert!(parse(&["-d", "dev", "ls"]).is_err());
+        // Options after `--` belong to the command.
+        let cli = parse(&["--", "--vm", "dev"]).unwrap();
+        assert_eq!(cli.run.vm, None);
+        assert_eq!(cli.run.command, ["--vm", "dev"]);
+        assert!(parse(&["-d", "dev", "--", "ls"]).is_err());
+    }
+
+    #[test]
+    fn run_needs_a_separator() {
+        assert!(parse(&["ls"]).is_err());
+        assert!(parse(&["dev", "ls"]).is_err());
+        assert!(parse(&["--vm", "dev", "ls"]).is_err());
+        assert!(parse(&["-C", "/tmp", "boot"]).is_err());
     }
 
     #[test]
@@ -358,6 +369,9 @@ mod tests {
         let cli = parse(&[]).unwrap();
         assert!(cli.action.is_none());
         assert!(cli.run.command.is_empty());
+        let cli = parse(&["-C", "/tmp", "--"]).unwrap();
+        assert!(cli.action.is_none());
+        assert!(cli.run.command.is_empty());
     }
 
     #[test]
@@ -366,10 +380,7 @@ mod tests {
         assert!(cli.action.is_none());
         assert_eq!(cli.run.command, ["list", "-v"]);
 
-        let cli = parse(&["help"]).unwrap();
-        assert_eq!(cli.run.command, ["help"]);
-
-        let cli = parse(&["-C", "/tmp", "boot"]).unwrap();
+        let cli = parse(&["-C", "/tmp", "--", "boot"]).unwrap();
         assert!(cli.action.is_none());
         assert_eq!(cli.run.command, ["boot"]);
     }
@@ -382,10 +393,10 @@ mod tests {
 
     #[test]
     fn env() {
-        let cli = parse(&["-e", "A", "-1", "env"]).unwrap();
+        let cli = parse(&["-e", "A", "-1", "--", "env"]).unwrap();
         assert_eq!(cli.run.env().collect::<Vec<_>>(), [("A", "-1")]);
         assert_eq!(cli.run.command, ["env"]);
-        assert!(parse(&["-e", "A=B", "C", "env"]).is_err());
+        assert!(parse(&["-e", "A=B", "C", "--", "env"]).is_err());
     }
 
     #[test]
