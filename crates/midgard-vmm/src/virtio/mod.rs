@@ -1,9 +1,8 @@
-//! virtio 1.x with split virtqueues.
+//! virtio 1.x over PCI, with split virtqueues and MSI-X.
 //!
 //! Each device implements [`Device`]; its [`Transport`] handles feature negotiation, the
-//! device status and the queues' setup, independent of where the driver finds their
-//! registers. The register layout is the MMIO transport's (see [`mmio`]), to which the
-//! board routes MMIO accesses.
+//! device status, the queues' setup and their interrupts. Each device is a PCI function
+//! (see [`pci`]); the board routes accesses to its BAR to the transport.
 //! Devices with a host side (e.g., input that arrives from the host) reach their device
 //! through [`DeviceRef`] (see [`crate::board::Board::with_device`]).
 
@@ -11,13 +10,13 @@ pub(crate) mod block;
 pub(crate) mod console;
 pub(crate) mod fs;
 mod fuse;
-mod mmio;
 pub(crate) mod net;
+mod pci;
 pub(crate) mod vsock;
 
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicU32, Ordering, fence};
+use std::sync::atomic::{AtomicU16, AtomicU32, Ordering, fence};
 use std::sync::{Arc, Condvar, Mutex};
 
 use event_listener::Event;
@@ -25,9 +24,8 @@ use midgard_hv::GuestMemory;
 
 use crate::counters::{self, Accesses};
 use crate::logging::log;
-use crate::platform;
 
-pub(crate) use mmio::MMIO_SIZE;
+pub(crate) use pci::BAR_SIZE;
 
 pub(crate) const F_VERSION_1: u64 = 1 << 32;
 /// We support indirect descriptors for all devices.
@@ -40,6 +38,9 @@ const STATUS_FEATURES_OK: u32 = 8;
 
 // Interrupt status bits.
 const INTERRUPT_USED_BUFFER: u32 = 1;
+
+/// The MSI-X vector of a queue (or of configuration changes) that does not interrupt.
+const NO_VECTOR: u16 = 0xFFFF;
 
 // Descriptor flags.
 const DESC_NEXT: u16 = 1;
@@ -505,9 +506,9 @@ impl Drop for Pending {
 pub(crate) enum Effect {
     None,
     /// The driver reset the device, whose host side may still work on requests (e.g.,
-    /// I/O into the driver's buffers). With virtio-mmio version 2, the reset is complete
-    /// when the write is, so the write must wait for them (without the device's lock,
-    /// which their completion takes) and then call [`Transport::finish_reset`].
+    /// I/O into the driver's buffers). The write waits for them (without the device's
+    /// lock, which their completion takes) and then calls [`Transport::finish_reset`];
+    /// until then, the device status shows that the reset is not complete.
     Reset(InFlight),
 }
 
@@ -526,7 +527,7 @@ impl<D> Clone for DeviceRef<D> {
 impl<D> Copy for DeviceRef<D> {}
 
 impl<D> DeviceRef<D> {
-    /// The device's slot (see [`platform::virtio_slot`]).
+    /// The device's index in the [`DeviceList`] (see [`crate::platform::virtio_slot`]).
     pub(crate) fn slot(self) -> usize {
         self.slot
     }
@@ -549,18 +550,14 @@ impl DeviceList {
         self.0.len()
     }
 
-    /// The devices' transports, with their interrupt lines.
+    /// The devices' transports.
     pub(crate) fn into_transports(self) -> Vec<Transport> {
-        self.0
-            .into_iter()
-            .enumerate()
-            .map(|(slot, device)| Transport::new(device, platform::virtio_slot(slot).1))
-            .collect()
+        self.0.into_iter().map(Transport::new).collect()
     }
 }
 
-/// A register that every transport has (at an offset of its own). The queue registers
-/// are the selected queue's (see [`Register::QueueSel`]).
+/// A register of the common configuration (see [`pci`]). The queue registers are the
+/// selected queue's (see [`Register::QueueSel`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Register {
     DeviceFeaturesSel,
@@ -569,11 +566,18 @@ pub(super) enum Register {
     DriverFeaturesSel,
     /// The 32 bits of the driver's features that DriverFeaturesSel selects.
     DriverFeatures,
+    /// The MSI-X vector of configuration changes.
+    ConfigVector,
+    /// The number of queues (read-only).
+    NumQueues,
     QueueSel,
-    /// The maximum size (read-only).
-    QueueSizeMax,
+    /// The size, which is the maximum size until the driver writes it.
     QueueSize,
+    /// The MSI-X vector.
+    QueueVector,
     QueueReady,
+    /// Where the driver notifies the queue (read-only, see [`pci`]).
+    QueueNotifyOff,
     /// The address of the descriptor table.
     QueueDesc(Half),
     /// The address of the available ring.
@@ -651,13 +655,20 @@ struct DeviceState {
 
 /// The transport of one device.
 ///
-/// The registers and the device (with its queues) have locks of their own, such that
-/// the driver's register accesses do not wait while the device works on its queues
-/// (e.g., for its host side). The interrupt status is in neither. Where both locks are
-/// taken, the registers' lock comes first.
+/// The registers, the device (with its queues) and the MSI-X table have locks of their
+/// own, such that the driver's register accesses do not wait while the device works on
+/// its queues (e.g., for its host side). The interrupt status and the MSI-X vectors are
+/// in none of them. Where more than one lock is taken, they are taken in that order (the
+/// MSI-X table's also after the PCI configuration space's, see
+/// [`crate::pci::WriteEffects`]).
 pub(crate) struct Transport {
     registers: Mutex<Registers>,
     device: Mutex<DeviceState>,
+    msix: Mutex<pci::Msix>,
+    /// The MSI-X vectors of the queues and of configuration changes, which the device
+    /// reads without the registers' lock when it interrupts.
+    queue_vectors: Vec<AtomicU16>,
+    config_vector: AtomicU16,
     interrupt_status: AtomicU32,
     /// The queues that the driver notified (a bit for each), which the device's queue
     /// task did not process yet (see [`Transport::process_notified`]).
@@ -666,7 +677,6 @@ pub(crate) struct Transport {
     notify: Event,
     device_id: u32,
     device_features: u64,
-    pub irq: usize,
     counters: TransportCounters,
 }
 
@@ -681,11 +691,15 @@ struct TransportCounters {
 }
 
 impl Transport {
-    pub(crate) fn new(device: Box<dyn Device>, irq: usize) -> Self {
+    pub(crate) fn new(device: Box<dyn Device>) -> Self {
         let sizes = device.queue_sizes();
         assert!(sizes.len() <= u32::BITS as usize, "too many queues");
         let num_queues = sizes.len();
         Self {
+            // A vector for each queue, and one for configuration changes.
+            msix: Mutex::new(pci::Msix::new(sizes.len() + 1)),
+            queue_vectors: sizes.iter().map(|_| AtomicU16::new(NO_VECTOR)).collect(),
+            config_vector: AtomicU16::new(NO_VECTOR),
             registers: Mutex::new(Registers {
                 status: 0,
                 device_features_sel: 0,
@@ -704,7 +718,6 @@ impl Transport {
             interrupt_status: AtomicU32::new(0),
             notified: AtomicU32::new(0),
             notify: Event::new(),
-            irq,
             counters: TransportCounters {
                 registers: Accesses::default(),
                 notifies: (0..num_queues)
@@ -728,12 +741,15 @@ impl Transport {
     }
 
     /// Adds the transport's counters to `out`, as the device `name`'s: the accesses to
-    /// its registers, the notifications of each queue, the chains that each queue
-    /// returned to the driver and the rounds in which the device processed its queues.
+    /// its BAR, the MSIs that it sent, the notifications of each queue, the chains that
+    /// each queue returned to the driver and the rounds in which the device processed its
+    /// queues.
     pub(crate) fn snapshot(&self, name: &str, out: &mut BTreeMap<String, u64>) {
         let counters = &self.counters;
         counters.registers.snapshot(name, "mmio", out);
         out.insert(format!("{name}.batches"), counters.batches.get());
+        let interrupts = self.msix.lock().unwrap().sent();
+        out.insert(format!("{name}.irqs"), interrupts);
         let state = self.device.lock().unwrap();
         for (index, queue) in state.queues.iter().enumerate() {
             let notifies = counters.notifies[index].get();
@@ -742,24 +758,45 @@ impl Transport {
         }
     }
 
-    /// Sets the used buffer interrupt if any queue returned chains to the driver since
-    /// the last call (and the driver wants an interrupt for them, see
-    /// [`Queue::event_idx`]); returns whether to raise the interrupt line. (Without
-    /// VIRTIO_RING_F_EVENT_IDX, we ignore VRING_AVAIL_F_NO_INTERRUPT; spurious interrupts
-    /// are harmless.)
+    /// Interrupts the driver for the queues that returned chains to it since the last
+    /// call (if it wants an interrupt for them, see [`Queue::event_idx`]): sets the used
+    /// buffer interrupt and signals each queue's MSI-X vector with `send` (once per
+    /// vector, if queues share one). (Without VIRTIO_RING_F_EVENT_IDX, we ignore
+    /// VRING_AVAIL_F_NO_INTERRUPT; spurious interrupts are harmless.)
     ///
-    /// The line must be raised with the device's lock held: the edges of two threads must
-    /// not merge into one (after the driver saw the first one's used buffers, but not
-    /// the second one's).
-    fn signal_used(&self, queues: &mut [Queue], memory: &GuestMemory) -> bool {
-        let interrupt = queues.iter_mut().fold(false, |interrupt, queue| {
-            queue.take_interrupt(memory) | interrupt
-        });
-        if interrupt {
-            self.interrupt_status
-                .fetch_or(INTERRUPT_USED_BUFFER, Ordering::SeqCst);
+    /// With the device's lock held, such that the interrupt does not overtake used
+    /// buffers of another thread that it does not cover.
+    fn signal_used(&self, queues: &mut [Queue], memory: &GuestMemory, send: &dyn Fn(u64, u32)) {
+        let mut vectors = Vec::new();
+        for (index, queue) in queues.iter_mut().enumerate() {
+            if queue.take_interrupt(memory) {
+                let vector = self.queue_vectors[index].load(Ordering::SeqCst);
+                if !vectors.contains(&vector) {
+                    vectors.push(vector);
+                }
+            }
         }
-        interrupt
+        if vectors.is_empty() {
+            return;
+        }
+        self.interrupt_status
+            .fetch_or(INTERRUPT_USED_BUFFER, Ordering::SeqCst);
+        let mut msix = self.msix.lock().unwrap();
+        for vector in vectors {
+            if vector != NO_VECTOR {
+                msix.signal(vector, send);
+            }
+        }
+    }
+
+    /// The vector that the driver wrote, unless the MSI-X table does not have it.
+    fn checked_vector(&self, value: u32) -> u16 {
+        let vector = value as u16;
+        if usize::from(vector) < self.queue_vectors.len() + 1 {
+            vector
+        } else {
+            NO_VECTOR
+        }
     }
 
     pub(super) fn device_id(&self) -> u32 {
@@ -802,14 +839,9 @@ impl Transport {
         }
     }
 
-    pub(super) fn interrupt_status(&self) -> u32 {
-        self.interrupt_status.load(Ordering::SeqCst)
-    }
-
-    /// Clears bits of the interrupt status (without the registers' lock: the driver
-    /// acknowledges interrupts all the time).
-    pub(super) fn acknowledge_interrupt(&self, bits: u32) {
-        self.interrupt_status.fetch_and(!bits, Ordering::SeqCst);
+    /// Reads and clears the interrupt status (without the registers' lock).
+    pub(super) fn take_interrupt_status(&self) -> u32 {
+        self.interrupt_status.swap(0, Ordering::SeqCst)
     }
 
     pub(super) fn read_register(&self, register: Register) -> u32 {
@@ -828,10 +860,15 @@ impl Transport {
                 1 => Half::High.get(registers.driver_features),
                 _ => 0,
             },
+            Register::ConfigVector => self.config_vector.load(Ordering::SeqCst).into(),
+            Register::NumQueues => registers.queues.len() as u32,
             Register::QueueSel => registers.queue_sel,
-            Register::QueueSizeMax => selected.map_or(0, |q| q.max_size as u32),
             Register::QueueSize => selected.map_or(0, |q| q.size as u32),
+            Register::QueueVector => (self.queue_vectors.get(registers.queue_sel as usize))
+                .map_or(NO_VECTOR, |vector| vector.load(Ordering::SeqCst))
+                .into(),
             Register::QueueReady => selected.map_or(0, |q| q.ready as u32),
+            Register::QueueNotifyOff => registers.queue_sel,
             Register::QueueDesc(half) => selected.map_or(0, |q| half.get(q.desc)),
             Register::QueueDriver(half) => selected.map_or(0, |q| half.get(q.avail)),
             Register::QueueDevice(half) => selected.map_or(0, |q| half.get(q.used)),
@@ -858,7 +895,15 @@ impl Transport {
                 _ => {}
             },
             Register::DriverFeaturesSel => registers.driver_features_sel = value,
+            Register::ConfigVector => {
+                (self.config_vector).store(self.checked_vector(value), Ordering::SeqCst);
+            }
             Register::QueueSel => registers.queue_sel = value,
+            Register::QueueVector => {
+                if let Some(vector) = self.queue_vectors.get(queue_sel) {
+                    vector.store(self.checked_vector(value), Ordering::SeqCst);
+                }
+            }
             Register::QueueSize => {
                 if let Some(queue) = selected
                     && value <= queue.max_size as u32
@@ -923,7 +968,10 @@ impl Transport {
                 }
             }
             // Read-only.
-            Register::DeviceFeatures | Register::QueueSizeMax | Register::ConfigGeneration => {}
+            Register::DeviceFeatures
+            | Register::NumQueues
+            | Register::QueueNotifyOff
+            | Register::ConfigGeneration => {}
         }
         Effect::None
     }
@@ -944,6 +992,10 @@ impl Transport {
         state.device.reset();
         // With the device's lock held, such that no used buffers are signaled after this.
         self.interrupt_status.store(0, Ordering::SeqCst);
+        for vector in &self.queue_vectors {
+            vector.store(NO_VECTOR, Ordering::SeqCst);
+        }
+        self.config_vector.store(NO_VECTOR, Ordering::SeqCst);
         // Notifications from before the reset are for queues that are gone.
         self.notified.store(0, Ordering::SeqCst);
         state.device.in_flight()
@@ -960,9 +1012,9 @@ impl Transport {
     }
 
     /// Processes the queues that the driver notifies, for as long as the future runs (on
-    /// the VM's executor, such that the vCPUs return to the guest right away). `raise`
-    /// raises the device's interrupt line (see [`Transport::signal_used`]).
-    pub(crate) async fn process_notified(&self, memory: &GuestMemory, raise: impl Fn()) {
+    /// the VM's executor, such that the vCPUs return to the guest right away). `send`
+    /// sends the device's MSIs (see [`Transport::signal_used`]).
+    pub(crate) async fn process_notified(&self, memory: &GuestMemory, send: impl Fn(u64, u32)) {
         loop {
             let notified = self.notified.swap(0, Ordering::SeqCst);
             if notified == 0 {
@@ -983,9 +1035,7 @@ impl Transport {
                         state.device.process(queue, &mut state.queues, memory);
                     }
                 }
-                if self.signal_used(&mut state.queues, memory) {
-                    raise();
-                }
+                self.signal_used(&mut state.queues, memory, &send);
             }
             // The VM's other tasks run in between, also while the guest keeps notifying.
             futures_lite::future::yield_now().await;
@@ -993,13 +1043,13 @@ impl Transport {
     }
 
     /// Runs `f` on the device, which is a `D` (e.g., for host-side requests). If it
-    /// returned chains to the driver, `raise` raises the device's interrupt line (see
+    /// returned chains to the driver, `send` sends the device's MSIs (see
     /// [`Transport::signal_used`]).
     pub(crate) fn with_device<D: Device, R>(
         &self,
         memory: &GuestMemory,
         f: impl FnOnce(&mut D, &mut [Queue], &GuestMemory) -> R,
-        raise: impl FnOnce(),
+        send: impl Fn(u64, u32),
     ) -> R {
         let mut state = self.device.lock().unwrap();
         let state = &mut *state;
@@ -1007,9 +1057,7 @@ impl Transport {
             .downcast_mut::<D>()
             .expect("DeviceRef of the wrong device type");
         let result = f(device, &mut state.queues, memory);
-        if self.signal_used(&mut state.queues, memory) {
-            raise();
-        }
+        self.signal_used(&mut state.queues, memory, &send);
         result
     }
 }
@@ -1239,7 +1287,7 @@ mod tests {
     fn reset_waits_for_requests() {
         let in_flight = InFlight::default();
         let request = in_flight.start();
-        let transport = Transport::new(Box::new(Busy(in_flight.clone())), 5);
+        let transport = Transport::new(Box::new(Busy(in_flight.clone())));
         transport.write_register(Register::Status, 1);
         let Effect::Reset(wait) = transport.write_register(Register::Status, 0) else {
             panic!("the reset does not wait");
@@ -1253,24 +1301,6 @@ mod tests {
         wait.wait();
         transport.finish_reset();
         assert_eq!(transport.read_register(Register::Status), 0);
-    }
-
-    #[test]
-    fn counts_accesses_and_notifications() {
-        let transport = Transport::new(Box::new(Busy(InFlight::default())), 5);
-        // The magic value, then notifications (at REG_QUEUE_NOTIFY).
-        transport.read(0x000, 4);
-        transport.write(0x050, 4, 0);
-        transport.write(0x050, 4, 0);
-        // There is no such queue.
-        transport.write(0x050, 4, 7);
-        let mut out = BTreeMap::new();
-        transport.snapshot("dev", &mut out);
-        assert_eq!(out["dev.mmio_reads"], 1);
-        assert_eq!(out["dev.mmio_writes"], 3);
-        assert_eq!(out["dev.queue0.notifies"], 2);
-        assert_eq!(out["dev.queue0.used"], 0);
-        assert_eq!(out.len(), 5);
     }
 
     #[test]
@@ -1308,7 +1338,7 @@ mod tests {
     #[test]
     fn notified_queues_are_processed_by_the_task() {
         let memory = memory();
-        let transport = Transport::new(Box::<Counting>::default(), 5);
+        let transport = Transport::new(Box::<Counting>::default());
         for queue in 0..3 {
             transport.write_register(Register::QueueSel, queue);
             transport.write_register(Register::QueueReady, 1);
@@ -1318,7 +1348,7 @@ mod tests {
             transport.notify(queue);
         }
         let raised = std::sync::atomic::AtomicUsize::new(0);
-        let raise = || {
+        let raise = |_, _| {
             raised.fetch_add(1, Ordering::SeqCst);
         };
         // Run the task until it waits for notifications.
@@ -1326,18 +1356,19 @@ mod tests {
             transport.process_notified(&memory, raise),
             futures_lite::future::ready(()),
         ));
-        let processed = transport.with_device(&memory, |c: &mut Counting, _, _| c.0.clone(), || {});
+        let processed =
+            transport.with_device(&memory, |c: &mut Counting, _, _| c.0.clone(), |_, _| {});
         assert_eq!(processed, [1, 2]);
-        assert_eq!(raised.load(Ordering::SeqCst), 1);
-        assert_eq!(transport.interrupt_status(), INTERRUPT_USED_BUFFER);
-        transport.acknowledge_interrupt(INTERRUPT_USED_BUFFER);
-        assert_eq!(transport.interrupt_status(), 0);
+        // The queue has no vector.
+        assert_eq!(raised.load(Ordering::SeqCst), 0);
+        assert_eq!(transport.take_interrupt_status(), INTERRUPT_USED_BUFFER);
+        assert_eq!(transport.take_interrupt_status(), 0);
     }
 
     #[test]
     fn queues_take_their_configuration_when_ready() {
         let memory = memory();
-        let transport = Transport::new(Box::new(Busy(InFlight::default())), 5);
+        let transport = Transport::new(Box::new(Busy(InFlight::default())));
         transport.write_register(Register::QueueDriver(Half::Low), 0x2000);
         transport.write_register(Register::QueueReady, 1);
         let position = |transport: &Transport| {
@@ -1346,14 +1377,14 @@ mod tests {
                 |_: &mut Busy, queues, _| {
                     (queues[0].is_ready(), queues[0].avail, queues[0].next_avail)
                 },
-                || {},
+                |_, _| {},
             )
         };
         assert_eq!(position(&transport), (true, 0x2000, 0));
         transport.with_device(
             &memory,
             |_: &mut Busy, queues, _| queues[0].next_avail = 3,
-            || {},
+            |_, _| {},
         );
         // Making the queue ready again does not move it back to the start of the rings.
         transport.write_register(Register::QueueReady, 1);
@@ -1366,7 +1397,7 @@ mod tests {
     fn queues_use_event_idx_once_negotiated() {
         let memory = memory();
         let event_idx = |accept: u64| {
-            let transport = Transport::new(Box::<Counting>::default(), 5);
+            let transport = Transport::new(Box::<Counting>::default());
             for (select, features) in [(0, accept as u32), (1, (accept >> 32) as u32)] {
                 transport.write_register(Register::DriverFeaturesSel, select);
                 transport.write_register(Register::DriverFeatures, features);
@@ -1380,7 +1411,7 @@ mod tests {
             transport.with_device(
                 &memory,
                 |_: &mut Counting, queues, _| queues[0].event_idx,
-                || {},
+                |_, _| {},
             )
         };
         assert!(event_idx(F_VERSION_1 | F_EVENT_IDX));
@@ -1402,12 +1433,12 @@ mod tests {
         use std::task::{Context, Waker};
 
         let memory = memory();
-        let transport = Transport::new(Box::<Counting>::default(), 5);
+        let transport = Transport::new(Box::<Counting>::default());
         transport.write_register(Register::QueueReady, 1);
         let wakeups = Arc::new(Wakeups(Default::default()));
         let waker = Waker::from(wakeups.clone());
         let mut context = Context::from_waker(&waker);
-        let mut task = std::pin::pin!(transport.process_notified(&memory, || {}));
+        let mut task = std::pin::pin!(transport.process_notified(&memory, |_, _| {}));
         // Nothing was notified: the task waits.
         assert!(task.as_mut().poll(&mut context).is_pending());
         assert_eq!(wakeups.0.load(Ordering::SeqCst), 0);
@@ -1417,7 +1448,8 @@ mod tests {
         // continue).
         assert!(task.as_mut().poll(&mut context).is_pending());
         assert_eq!(wakeups.0.load(Ordering::SeqCst), 2);
-        let processed = transport.with_device(&memory, |c: &mut Counting, _, _| c.0.clone(), || {});
+        let processed =
+            transport.with_device(&memory, |c: &mut Counting, _, _| c.0.clone(), |_, _| {});
         assert_eq!(processed, [0]);
     }
 

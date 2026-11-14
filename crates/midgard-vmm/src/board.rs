@@ -26,6 +26,8 @@ use crate::{pci, platform, vcpu};
 enum Unhandled {
     /// Setting an interrupt line failed.
     IrqLine(usize),
+    /// Sending an MSI failed.
+    Msi,
     Port(u16),
     Mmio(u64),
 }
@@ -51,8 +53,8 @@ struct DeviceCounters {
 }
 
 /// The guest's hardware, shared by all vCPUs: RAM, the devices that are not in the
-/// hypervisor (UART, RTC, PM1, the PCI bus, the virtio transports) and the routing of port I/O,
-/// MMIO and interrupt lines to them. The local APICs and the I/O APIC are the
+/// hypervisor (UART, RTC, PM1, the PCI bus with the virtio devices) and the routing of
+/// port I/O, MMIO and interrupts to them. The local APICs and the I/O APIC are the
 /// hypervisor's. Also tracks whether the guest is done (stop requested).
 ///
 /// vCPU threads call into it on every exit. The virtio devices' queues are processed by
@@ -80,7 +82,7 @@ pub(crate) struct Board {
     device_counters: DeviceCounters,
     /// [`Board::stop`] was called.
     stopping: AtomicBool,
-    /// The virtio devices, in the order of their slots (see [`platform::virtio_slot`]).
+    /// The virtio devices, in the order of their PCI slots (see [`platform::virtio_slot`]).
     virtio: Vec<Transport>,
     vsock: Option<DeviceRef<Vsock>>,
     reported: ReportOnce<Unhandled>,
@@ -99,6 +101,11 @@ impl Board {
         virtio: Vec<Transport>,
         vsock: Option<DeviceRef<Vsock>>,
     ) -> Self {
+        let mut pci = pci::Bus::new();
+        for (index, transport) in virtio.iter().enumerate() {
+            let (slot, bar) = platform::virtio_slot(index);
+            pci.add(slot, transport.config_space(bar as u32));
+        }
         Self {
             hypervisor,
             memory,
@@ -109,7 +116,7 @@ impl Board {
             serial_drained: Event::new(),
             rtc: Mutex::new(Rtc::default()),
             pm1: Mutex::new(Pm1::default()),
-            pci: pci::Bus::new(),
+            pci,
             kickers: Mutex::new(Vec::new()),
             vcpu_counters: Mutex::new(BTreeMap::new()),
             device_counters: DeviceCounters::default(),
@@ -156,8 +163,11 @@ impl Board {
         counters
             .unhandled_mmio
             .snapshot("unhandled", "mmio", &mut devices);
-        let irqs = |pin: usize| counters.irqs.get(pin).map_or(0, Counter::get);
-        devices.insert("serial.irqs".into(), irqs(platform::COM1_IRQ));
+        let serial_irqs = counters
+            .irqs
+            .get(platform::COM1_IRQ)
+            .map_or(0, Counter::get);
+        devices.insert("serial.irqs".into(), serial_irqs);
         // Devices of the same kind are numbered in the order of their slots.
         let mut kinds = BTreeMap::<&str, usize>::new();
         for transport in &self.virtio {
@@ -166,7 +176,6 @@ impl Board {
             let name = format!("virtio-{kind}{number}");
             *number += 1;
             transport.snapshot(&name, &mut devices);
-            devices.insert(format!("{name}.irqs"), irqs(transport.irq));
         }
         Ok(control::Counters { vcpus, devices })
     }
@@ -202,10 +211,13 @@ impl Board {
         }
     }
 
-    /// Generates an edge on an (ISA, edge-triggered) interrupt line.
-    fn pulse_irq(&self, pin: usize) {
-        self.set_irq_line(pin, true);
-        self.set_irq_line(pin, false);
+    /// Sends a message signaled interrupt (of a PCI device).
+    fn signal_msi(&self, address: u64, data: u32) {
+        if let Err(error) = self.hypervisor.signal_msi(address, data)
+            && self.reported.first(Unhandled::Msi)
+        {
+            log!("{error:#} (further failures are not reported)");
+        }
     }
 
     /// Passes the console's input to the serial port, as fast as the guest reads it (a
@@ -237,15 +249,15 @@ impl Board {
         }
     }
 
-    /// Runs `f` on a virtio device (for the host side of devices); raises its interrupt
-    /// if `f` returned chains to the driver.
+    /// Runs `f` on a virtio device (for the host side of devices); interrupts the driver
+    /// if `f` returned chains to it.
     pub(crate) fn with_device<D: virtio::Device, R>(
         &self,
         device: DeviceRef<D>,
         f: impl FnOnce(&mut D, &mut [virtio::Queue], &GuestMemory) -> R,
     ) -> R {
-        let transport = &self.virtio[device.slot()];
-        transport.with_device(&self.memory, f, || self.pulse_irq(transport.irq))
+        let send = |address, data| self.signal_msi(address, data);
+        self.virtio[device.slot()].with_device(&self.memory, f, send)
     }
 
     /// The number of virtio devices.
@@ -253,11 +265,11 @@ impl Board {
         self.virtio.len()
     }
 
-    /// Processes the queues of the virtio device in `slot` when the guest notifies them
-    /// (a task on the VM's executor, which runs as long as the VM does).
-    pub(crate) async fn process_virtio(self: Arc<Self>, slot: usize) {
-        let transport = &self.virtio[slot];
-        (transport.process_notified(&self.memory, || self.pulse_irq(transport.irq))).await;
+    /// Processes the queues of the virtio device `index` when the guest notifies them (a
+    /// task on the VM's executor, which runs as long as the VM does).
+    pub(crate) async fn process_virtio(self: Arc<Self>, index: usize) {
+        let send = |address, data| self.signal_msi(address, data);
+        (self.virtio[index].process_notified(&self.memory, send)).await;
     }
 
     /// Runs `f` on the vsock device; returns None without one.
@@ -385,11 +397,16 @@ impl Board {
         None
     }
 
-    /// The virtio device whose registers are at `address`, and the offset into them.
-    fn virtio_device(&self, address: u64) -> Option<(usize, u64)> {
-        let offset = address.checked_sub(platform::VIRTIO_BASE)?;
-        let index = (offset / virtio::MMIO_SIZE) as usize;
-        (index < self.virtio.len()).then_some((index, offset % virtio::MMIO_SIZE))
+    /// The virtio device in a PCI slot.
+    fn virtio_in_slot(&self, slot: usize) -> Option<&Transport> {
+        self.virtio
+            .get(slot.checked_sub(platform::FIRST_VIRTIO_SLOT)?)
+    }
+
+    /// The virtio device whose BAR is at `address`, and the offset into it.
+    fn virtio_bar(&self, address: u64) -> Option<(&Transport, u64)> {
+        let (slot, _, offset) = self.pci.find_bar(address)?;
+        Some((self.virtio_in_slot(slot)?, offset))
     }
 
     /// The offset of `address` in the PCI bus' configuration space.
@@ -405,8 +422,8 @@ impl Board {
             self.device_counters.pci.reads.add();
             return self.pci.config_read(offset, size);
         }
-        if let Some((index, offset)) = self.virtio_device(address) {
-            return self.virtio[index].read(offset, size);
+        if let Some((transport, offset)) = self.virtio_bar(address) {
+            return transport.bar_read(offset, size);
         }
         self.device_counters.unhandled_mmio.reads.add();
         self.report(
@@ -418,14 +435,20 @@ impl Board {
 
     /// MMIO write of `size` bytes.
     pub(crate) fn mmio_write(&self, address: u64, size: u8, value: u64) {
+        let send = |address, data| self.signal_msi(address, data);
         if let Some(offset) = Self::ecam_offset(address) {
             self.device_counters.pci.writes.add();
-            self.pci.config_write(offset, size, value);
+            // The effects hold the configuration space's lock until they are applied.
+            if let Some(effects) = self.pci.config_write(offset, size, value)
+                && let Some(control) = effects.msix_control
+                && let Some(transport) = self.virtio_in_slot(effects.slot)
+            {
+                transport.set_msix_control(control, send);
+            }
             return;
         }
-        if let Some((index, offset)) = self.virtio_device(address) {
-            let transport = &self.virtio[index];
-            match transport.write(offset, size, value) {
+        if let Some((transport, offset)) = self.virtio_bar(address) {
+            match transport.bar_write(offset, size, value, send) {
                 Effect::None => {}
                 Effect::Reset(in_flight) => {
                     // The requests complete on the VM's executor, which keeps running
