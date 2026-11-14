@@ -84,15 +84,22 @@ pub(crate) struct Ioapic {
     /// The levels of the pins (one bit per pin).
     lines: u32,
     redirection: [u64; NUM_PINS],
+    /// Whether a local APIC accepts an interrupt (see [`Ioapic::new`]).
+    accepts: fn(&Interrupt) -> bool,
 }
 
 impl Ioapic {
-    pub(crate) fn new() -> Self {
+    /// `accepts` says whether a local APIC accepts an interrupt, i.e., whether its
+    /// destination addresses one. Interrupts that none accepts go nowhere and, if
+    /// level-triggered, leave Remote IRR clear (like KVM's I/O APIC does), such that the
+    /// pin interrupts once the guest points it at a local APIC that exists.
+    pub(crate) fn new(accepts: fn(&Interrupt) -> bool) -> Self {
         Self {
             select: 0,
             id: 0,
             lines: 0,
             redirection: [RTE_MASKED; NUM_PINS],
+            accepts,
         }
     }
 
@@ -218,9 +225,10 @@ impl Ioapic {
         })
     }
 
-    /// Sends the pin's interrupt unless it is masked or (level-triggered) in service.
+    /// Sends the pin's interrupt unless it is masked, (level-triggered) in service or no
+    /// local APIC accepts it.
     fn service(&mut self, pin: usize) -> Option<Interrupt> {
-        let interrupt = self.redirection(pin)?;
+        let interrupt = self.redirection(pin).filter(self.accepts)?;
         if interrupt.level {
             if self.redirection[pin] & RTE_REMOTE_IRR != 0 {
                 return None;
@@ -257,7 +265,7 @@ mod tests {
 
     #[test]
     fn version_and_reset() {
-        let mut ioapic = Ioapic::new();
+        let mut ioapic = Ioapic::new(|_| true);
         ioapic.write(IOREGSEL, 1);
         assert_eq!(ioapic.read(IOWIN), 0x0017_0011);
         assert_eq!(entry(&mut ioapic, 5), RTE_MASKED as u32);
@@ -267,7 +275,7 @@ mod tests {
 
     #[test]
     fn edge() {
-        let mut ioapic = Ioapic::new();
+        let mut ioapic = Ioapic::new(|_| true);
         assert_eq!(program(&mut ioapic, 4, 0x30), None);
         let interrupt = interrupt(0x30, false);
         assert_eq!(ioapic.set_irq(4, true), Some(interrupt));
@@ -279,7 +287,7 @@ mod tests {
 
     #[test]
     fn level() {
-        let mut ioapic = Ioapic::new();
+        let mut ioapic = Ioapic::new(|_| true);
         let low = 0x31 | RTE_LEVEL as u32;
         program(&mut ioapic, 9, low);
         let interrupt = interrupt(0x31, true);
@@ -299,7 +307,7 @@ mod tests {
 
     #[test]
     fn unmask_level() {
-        let mut ioapic = Ioapic::new();
+        let mut ioapic = Ioapic::new(|_| true);
         let low = 0x32 | RTE_LEVEL as u32;
         program(&mut ioapic, 13, low | RTE_MASKED as u32);
         assert_eq!(ioapic.set_irq(13, true), None);
@@ -308,7 +316,7 @@ mod tests {
 
     #[test]
     fn destination() {
-        let mut ioapic = Ioapic::new();
+        let mut ioapic = Ioapic::new(|_| true);
         // Lowest priority, logical destination 0x0C (in the high half).
         program(
             &mut ioapic,
@@ -374,8 +382,25 @@ mod tests {
     }
 
     #[test]
+    fn undeliverable() {
+        // Only the local APIC with x2APIC ID 0 exists.
+        let mut ioapic = Ioapic::new(|interrupt| interrupt.targets(0));
+        let low = 0x34 | RTE_LEVEL as u32;
+        program(&mut ioapic, 10, low);
+        ioapic.write(IOREGSEL, 0x10 + 2 * 10 + 1);
+        ioapic.write(IOWIN, 0x0100_0000);
+        // To APIC ID 1: the interrupt goes nowhere and is not in service.
+        assert_eq!(ioapic.set_irq(10, true), None);
+        assert_eq!(entry(&mut ioapic, 10) & RTE_REMOTE_IRR as u32, 0);
+        // Pointing the pin at APIC ID 0 interrupts (the pin is still high).
+        ioapic.write(IOREGSEL, 0x10 + 2 * 10 + 1);
+        assert_eq!(ioapic.write(IOWIN, 0), Some(interrupt(0x34, true)));
+        assert_ne!(entry(&mut ioapic, 10) & RTE_REMOTE_IRR as u32, 0);
+    }
+
+    #[test]
     fn unsupported_delivery() {
-        let mut ioapic = Ioapic::new();
+        let mut ioapic = Ioapic::new(|_| true);
         // NMI.
         program(&mut ioapic, 3, 0x30 | 4 << 8);
         assert_eq!(ioapic.set_irq(3, true), None);

@@ -337,7 +337,8 @@ pub(crate) fn create(memory_size: u64) -> Result<(Hypervisor, GuestMemory)> {
     let interrupts = Arc::new(Interrupts {
         vm: vm.clone(),
         state: Mutex::new(IoapicState {
-            ioapic: Ioapic::new(),
+            // KVM delivers the interrupts to the local APICs that they address.
+            ioapic: Ioapic::new(|_| true),
             routes: Vec::new(),
         }),
     });
