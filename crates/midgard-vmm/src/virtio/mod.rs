@@ -1,8 +1,9 @@
-//! virtio 1.x over the MMIO transport (version 2), with split virtqueues.
-//! Linux finds the devices through `virtio_mmio.device=` on its command line.
+//! virtio 1.x with split virtqueues.
 //!
-//! Each device implements [`Device`]; its [`Transport`] handles the registers, feature
-//! negotiation and the queues' setup. The board routes MMIO accesses to the transports.
+//! Each device implements [`Device`]; its [`Transport`] handles feature negotiation, the
+//! device status and the queues' setup, independent of where the driver finds their
+//! registers. The register layout is the MMIO transport's (see [`mmio`]), to which the
+//! board routes MMIO accesses.
 //! Devices with a host side (e.g., input that arrives from the host) reach their device
 //! through [`DeviceRef`] (see [`crate::board::Board::with_device`]).
 
@@ -10,6 +11,7 @@ pub(crate) mod block;
 pub(crate) mod console;
 pub(crate) mod fs;
 mod fuse;
+mod mmio;
 pub(crate) mod net;
 pub(crate) mod vsock;
 
@@ -25,12 +27,7 @@ use crate::counters::{self, Accesses};
 use crate::logging::log;
 use crate::platform;
 
-/// The register window of one device.
-pub(crate) const MMIO_SIZE: u64 = 0x1000;
-
-const MAGIC: u32 = 0x7472_6976; // "virt"
-const VERSION: u32 = 2;
-const VENDOR: u32 = 0x4D47_524D; // "MRGM"
+pub(crate) use mmio::MMIO_SIZE;
 
 pub(crate) const F_VERSION_1: u64 = 1 << 32;
 /// We support indirect descriptors for all devices.
@@ -43,36 +40,6 @@ const STATUS_FEATURES_OK: u32 = 8;
 
 // Interrupt status bits.
 const INTERRUPT_USED_BUFFER: u32 = 1;
-
-// Register offsets.
-const REG_MAGIC: u64 = 0x000;
-const REG_VERSION: u64 = 0x004;
-const REG_DEVICE_ID: u64 = 0x008;
-const REG_VENDOR_ID: u64 = 0x00C;
-const REG_DEVICE_FEATURES: u64 = 0x010;
-const REG_DEVICE_FEATURES_SEL: u64 = 0x014;
-const REG_DRIVER_FEATURES: u64 = 0x020;
-const REG_DRIVER_FEATURES_SEL: u64 = 0x024;
-const REG_QUEUE_SEL: u64 = 0x030;
-const REG_QUEUE_NUM_MAX: u64 = 0x034;
-const REG_QUEUE_NUM: u64 = 0x038;
-const REG_QUEUE_READY: u64 = 0x044;
-const REG_QUEUE_NOTIFY: u64 = 0x050;
-const REG_INTERRUPT_STATUS: u64 = 0x060;
-const REG_INTERRUPT_ACK: u64 = 0x064;
-const REG_STATUS: u64 = 0x070;
-const REG_QUEUE_DESC_LOW: u64 = 0x080;
-const REG_QUEUE_DESC_HIGH: u64 = 0x084;
-const REG_QUEUE_DRIVER_LOW: u64 = 0x090;
-const REG_QUEUE_DRIVER_HIGH: u64 = 0x094;
-const REG_QUEUE_DEVICE_LOW: u64 = 0x0A0;
-const REG_QUEUE_DEVICE_HIGH: u64 = 0x0A4;
-const REG_SHM_LEN_LOW: u64 = 0x0B0;
-const REG_SHM_LEN_HIGH: u64 = 0x0B4;
-const REG_SHM_BASE_LOW: u64 = 0x0B8;
-const REG_SHM_BASE_HIGH: u64 = 0x0BC;
-const REG_CONFIG_GENERATION: u64 = 0x0FC;
-const REG_CONFIG: u64 = 0x100;
 
 // Descriptor flags.
 const DESC_NEXT: u16 = 1;
@@ -534,7 +501,7 @@ impl Drop for Pending {
     }
 }
 
-/// What the board does after a register write (see [`Transport::write`]).
+/// What the board does after a register write (see [`Transport::write_register`]).
 pub(crate) enum Effect {
     None,
     /// The driver reset the device, whose host side may still work on requests (e.g.,
@@ -592,6 +559,54 @@ impl DeviceList {
     }
 }
 
+/// A register that every transport has (at an offset of its own). The queue registers
+/// are the selected queue's (see [`Register::QueueSel`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Register {
+    DeviceFeaturesSel,
+    /// The 32 bits of the device's features that DeviceFeaturesSel selects (read-only).
+    DeviceFeatures,
+    DriverFeaturesSel,
+    /// The 32 bits of the driver's features that DriverFeaturesSel selects.
+    DriverFeatures,
+    QueueSel,
+    /// The maximum size (read-only).
+    QueueSizeMax,
+    QueueSize,
+    QueueReady,
+    /// The address of the descriptor table.
+    QueueDesc(Half),
+    /// The address of the available ring.
+    QueueDriver(Half),
+    /// The address of the used ring.
+    QueueDevice(Half),
+    Status,
+    ConfigGeneration,
+}
+
+/// Half of a 64-bit register.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Half {
+    Low,
+    High,
+}
+
+impl Half {
+    fn get(self, value: u64) -> u32 {
+        match self {
+            Half::Low => value as u32,
+            Half::High => (value >> 32) as u32,
+        }
+    }
+
+    fn set(self, old: &mut u64, value: u32) {
+        *old = match self {
+            Half::Low => (*old & !0xFFFF_FFFF) | value as u64,
+            Half::High => (*old & 0xFFFF_FFFF) | (value as u64) << 32,
+        };
+    }
+}
+
 /// The transport's registers, except for the configuration space (which is the
 /// device's) and the interrupt status (see [`Transport`]).
 struct Registers {
@@ -634,7 +649,7 @@ struct DeviceState {
     queues: Vec<Queue>,
 }
 
-/// The MMIO transport of one device.
+/// The transport of one device.
 ///
 /// The registers and the device (with its queues) have locks of their own, such that
 /// the driver's register accesses do not wait while the device works on its queues
@@ -747,105 +762,104 @@ impl Transport {
         interrupt
     }
 
-    pub(crate) fn read(&self, offset: u64, size: u8) -> u64 {
-        self.counters.registers.reads.add();
-        if offset >= REG_CONFIG {
-            let mut data = [0u8; 8];
-            let size = (size as usize).min(8);
-            let state = self.device.lock().unwrap();
-            state
-                .device
-                .read_config(offset - REG_CONFIG, &mut data[..size]);
-            return u64::from_le_bytes(data);
-        }
-        if offset == REG_INTERRUPT_STATUS {
-            return self.interrupt_status.load(Ordering::SeqCst) as u64;
-        }
-        let registers = self.registers.lock().unwrap();
-        let selected = registers.queues.get(registers.queue_sel as usize);
-        let features = self.device_features;
-        let value = match offset {
-            REG_MAGIC => MAGIC,
-            REG_VERSION => VERSION,
-            REG_DEVICE_ID => self.device_id,
-            REG_VENDOR_ID => VENDOR,
-            REG_DEVICE_FEATURES => match registers.device_features_sel {
-                0 => features as u32,
-                1 => (features >> 32) as u32,
-                _ => 0,
-            },
-            REG_QUEUE_NUM_MAX => selected.map_or(0, |q| q.max_size as u32),
-            REG_QUEUE_READY => selected.map_or(0, |q| q.ready as u32),
-            REG_STATUS => registers.status,
-            // No shared memory regions: a length of all ones means "absent".
-            REG_SHM_LEN_LOW | REG_SHM_LEN_HIGH => u32::MAX,
-            REG_SHM_BASE_LOW | REG_SHM_BASE_HIGH => u32::MAX,
-            // The configuration never changes.
-            REG_CONFIG_GENERATION => 0,
-            _ => 0,
-        };
-        value as u64
+    pub(super) fn device_id(&self) -> u32 {
+        self.device_id
     }
 
-    pub(crate) fn write(&self, offset: u64, size: u8, value: u64) -> Effect {
-        self.counters.registers.writes.add();
-        // Without the registers' lock: the driver notifies queues and acknowledges
-        // interrupts all the time.
-        match offset {
-            REG_QUEUE_NOTIFY => {
-                // The device's queue task processes the queue (see process_notified()).
-                let queue = value as u32 & 0xFFFF;
-                if let Some(counter) = self.counters.notifies.get(queue as usize) {
-                    counter.add();
-                }
-                if queue < u32::BITS {
-                    self.notified.fetch_or(1 << queue, Ordering::SeqCst);
-                    self.notify.notify(1);
-                }
-                return Effect::None;
-            }
-            REG_INTERRUPT_ACK => {
-                self.interrupt_status
-                    .fetch_and(!(value as u32), Ordering::SeqCst);
-                return Effect::None;
-            }
-            _ => {}
+    /// Reads `size` bytes of the device's configuration space at `offset`.
+    pub(super) fn read_config(&self, offset: u64, size: u8) -> u64 {
+        let mut data = [0u8; 8];
+        let size = (size as usize).min(8);
+        let state = self.device.lock().unwrap();
+        state.device.read_config(offset, &mut data[..size]);
+        u64::from_le_bytes(data)
+    }
+
+    /// Writes `size` bytes of the device's configuration space at `offset`.
+    pub(super) fn write_config(&self, offset: u64, size: u8, value: u64) {
+        let registers = self.registers.lock().unwrap();
+        // The driver must wait for the reset (see finish_reset()).
+        if registers.resetting {
+            return;
         }
+        let bytes = value.to_le_bytes();
+        let mut state = self.device.lock().unwrap();
+        state
+            .device
+            .write_config(offset, &bytes[..(size as usize).min(8)]);
+    }
+
+    /// The driver notified `queue` (without the registers' lock: the driver notifies
+    /// queues all the time). The device's queue task processes it (see
+    /// [`Transport::process_notified`]).
+    pub(super) fn notify(&self, queue: u32) {
+        if let Some(counter) = self.counters.notifies.get(queue as usize) {
+            counter.add();
+        }
+        if queue < u32::BITS {
+            self.notified.fetch_or(1 << queue, Ordering::SeqCst);
+            self.notify.notify(1);
+        }
+    }
+
+    pub(super) fn interrupt_status(&self) -> u32 {
+        self.interrupt_status.load(Ordering::SeqCst)
+    }
+
+    /// Clears bits of the interrupt status (without the registers' lock: the driver
+    /// acknowledges interrupts all the time).
+    pub(super) fn acknowledge_interrupt(&self, bits: u32) {
+        self.interrupt_status.fetch_and(!bits, Ordering::SeqCst);
+    }
+
+    pub(super) fn read_register(&self, register: Register) -> u32 {
+        let registers = self.registers.lock().unwrap();
+        let selected = registers.queues.get(registers.queue_sel as usize);
+        match register {
+            Register::DeviceFeaturesSel => registers.device_features_sel,
+            Register::DeviceFeatures => match registers.device_features_sel {
+                0 => Half::Low.get(self.device_features),
+                1 => Half::High.get(self.device_features),
+                _ => 0,
+            },
+            Register::DriverFeaturesSel => registers.driver_features_sel,
+            Register::DriverFeatures => match registers.driver_features_sel {
+                0 => Half::Low.get(registers.driver_features),
+                1 => Half::High.get(registers.driver_features),
+                _ => 0,
+            },
+            Register::QueueSel => registers.queue_sel,
+            Register::QueueSizeMax => selected.map_or(0, |q| q.max_size as u32),
+            Register::QueueSize => selected.map_or(0, |q| q.size as u32),
+            Register::QueueReady => selected.map_or(0, |q| q.ready as u32),
+            Register::QueueDesc(half) => selected.map_or(0, |q| half.get(q.desc)),
+            Register::QueueDriver(half) => selected.map_or(0, |q| half.get(q.avail)),
+            Register::QueueDevice(half) => selected.map_or(0, |q| half.get(q.used)),
+            Register::Status => registers.status,
+            // The configuration never changes.
+            Register::ConfigGeneration => 0,
+        }
+    }
+
+    pub(super) fn write_register(&self, register: Register, value: u32) -> Effect {
         let mut registers = self.registers.lock().unwrap();
         // The driver must wait for the reset (see finish_reset()).
         if registers.resetting {
             return Effect::None;
         }
-        if offset >= REG_CONFIG {
-            let bytes = value.to_le_bytes();
-            let mut state = self.device.lock().unwrap();
-            state
-                .device
-                .write_config(offset - REG_CONFIG, &bytes[..(size as usize).min(8)]);
-            return Effect::None;
-        }
-        let value = value as u32;
-        let set_low = |old: &mut u64, value: u32| *old = (*old & !0xFFFF_FFFF) | value as u64;
-        let set_high =
-            |old: &mut u64, value: u32| *old = (*old & 0xFFFF_FFFF) | (value as u64) << 32;
         let queue_sel = registers.queue_sel as usize;
         let event_idx = registers.driver_features & F_EVENT_IDX != 0;
         let selected = registers.queues.get_mut(queue_sel);
-        match offset {
-            REG_DEVICE_FEATURES_SEL => registers.device_features_sel = value,
-            REG_DRIVER_FEATURES => {
-                let shift = match registers.driver_features_sel {
-                    0 => 0,
-                    1 => 32,
-                    _ => return Effect::None,
-                };
-                registers.driver_features = (registers.driver_features
-                    & !(0xFFFF_FFFFu64 << shift))
-                    | ((value as u64) << shift);
-            }
-            REG_DRIVER_FEATURES_SEL => registers.driver_features_sel = value,
-            REG_QUEUE_SEL => registers.queue_sel = value,
-            REG_QUEUE_NUM => {
+        match register {
+            Register::DeviceFeaturesSel => registers.device_features_sel = value,
+            Register::DriverFeatures => match registers.driver_features_sel {
+                0 => Half::Low.set(&mut registers.driver_features, value),
+                1 => Half::High.set(&mut registers.driver_features, value),
+                _ => {}
+            },
+            Register::DriverFeaturesSel => registers.driver_features_sel = value,
+            Register::QueueSel => registers.queue_sel = value,
+            Register::QueueSize => {
                 if let Some(queue) = selected
                     && value <= queue.max_size as u32
                     && value.is_power_of_two()
@@ -853,7 +867,7 @@ impl Transport {
                     queue.size = value as u16;
                 }
             }
-            REG_QUEUE_READY => {
+            Register::QueueReady => {
                 // Writing the current state again changes nothing (e.g., the queue
                 // keeps its position in the rings).
                 if let Some(config) = selected
@@ -869,25 +883,16 @@ impl Transport {
                     }
                 }
             }
-            REG_QUEUE_DESC_LOW => selected
+            Register::QueueDesc(half) => selected
                 .into_iter()
-                .for_each(|q| set_low(&mut q.desc, value)),
-            REG_QUEUE_DESC_HIGH => selected
+                .for_each(|q| half.set(&mut q.desc, value)),
+            Register::QueueDriver(half) => selected
                 .into_iter()
-                .for_each(|q| set_high(&mut q.desc, value)),
-            REG_QUEUE_DRIVER_LOW => selected
+                .for_each(|q| half.set(&mut q.avail, value)),
+            Register::QueueDevice(half) => selected
                 .into_iter()
-                .for_each(|q| set_low(&mut q.avail, value)),
-            REG_QUEUE_DRIVER_HIGH => selected
-                .into_iter()
-                .for_each(|q| set_high(&mut q.avail, value)),
-            REG_QUEUE_DEVICE_LOW => selected
-                .into_iter()
-                .for_each(|q| set_low(&mut q.used, value)),
-            REG_QUEUE_DEVICE_HIGH => selected
-                .into_iter()
-                .for_each(|q| set_high(&mut q.used, value)),
-            REG_STATUS => {
+                .for_each(|q| half.set(&mut q.used, value)),
+            Register::Status => {
                 if value == 0 {
                     let status = registers.status;
                     let in_flight = self.reset(&mut registers);
@@ -917,7 +922,8 @@ impl Transport {
                     registers.status = value;
                 }
             }
-            _ => {}
+            // Read-only.
+            Register::DeviceFeatures | Register::QueueSizeMax | Register::ConfigGeneration => {}
         }
         Effect::None
     }
@@ -1234,29 +1240,30 @@ mod tests {
         let in_flight = InFlight::default();
         let request = in_flight.start();
         let transport = Transport::new(Box::new(Busy(in_flight.clone())), 5);
-        transport.write(REG_STATUS, 4, 1);
-        let Effect::Reset(wait) = transport.write(REG_STATUS, 4, 0) else {
+        transport.write_register(Register::Status, 1);
+        let Effect::Reset(wait) = transport.write_register(Register::Status, 0) else {
             panic!("the reset does not wait");
         };
         // The reset is not complete, and the driver cannot use the device.
-        assert_eq!(transport.read(REG_STATUS, 4), 1);
-        transport.write(REG_STATUS, 4, 3);
-        assert_eq!(transport.read(REG_STATUS, 4), 1);
+        assert_eq!(transport.read_register(Register::Status), 1);
+        transport.write_register(Register::Status, 3);
+        assert_eq!(transport.read_register(Register::Status), 1);
         assert_eq!(wait.count(), 1);
         drop(request);
         wait.wait();
         transport.finish_reset();
-        assert_eq!(transport.read(REG_STATUS, 4), 0);
+        assert_eq!(transport.read_register(Register::Status), 0);
     }
 
     #[test]
     fn counts_accesses_and_notifications() {
         let transport = Transport::new(Box::new(Busy(InFlight::default())), 5);
-        transport.read(REG_MAGIC, 4);
-        transport.write(REG_QUEUE_NOTIFY, 4, 0);
-        transport.write(REG_QUEUE_NOTIFY, 4, 0);
+        // The magic value, then notifications (at REG_QUEUE_NOTIFY).
+        transport.read(0x000, 4);
+        transport.write(0x050, 4, 0);
+        transport.write(0x050, 4, 0);
         // There is no such queue.
-        transport.write(REG_QUEUE_NOTIFY, 4, 7);
+        transport.write(0x050, 4, 7);
         let mut out = BTreeMap::new();
         transport.snapshot("dev", &mut out);
         assert_eq!(out["dev.mmio_reads"], 1);
@@ -1303,12 +1310,12 @@ mod tests {
         let memory = memory();
         let transport = Transport::new(Box::<Counting>::default(), 5);
         for queue in 0..3 {
-            transport.write(REG_QUEUE_SEL, 4, queue);
-            transport.write(REG_QUEUE_READY, 4, 1);
+            transport.write_register(Register::QueueSel, queue);
+            transport.write_register(Register::QueueReady, 1);
         }
         // Queue 1 twice: the task takes the notifications together.
         for queue in [1, 2, 1, 7] {
-            transport.write(REG_QUEUE_NOTIFY, 4, queue);
+            transport.notify(queue);
         }
         let raised = std::sync::atomic::AtomicUsize::new(0);
         let raise = || {
@@ -1322,20 +1329,17 @@ mod tests {
         let processed = transport.with_device(&memory, |c: &mut Counting, _, _| c.0.clone(), || {});
         assert_eq!(processed, [1, 2]);
         assert_eq!(raised.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            transport.read(REG_INTERRUPT_STATUS, 4),
-            INTERRUPT_USED_BUFFER as u64
-        );
-        transport.write(REG_INTERRUPT_ACK, 4, INTERRUPT_USED_BUFFER as u64);
-        assert_eq!(transport.read(REG_INTERRUPT_STATUS, 4), 0);
+        assert_eq!(transport.interrupt_status(), INTERRUPT_USED_BUFFER);
+        transport.acknowledge_interrupt(INTERRUPT_USED_BUFFER);
+        assert_eq!(transport.interrupt_status(), 0);
     }
 
     #[test]
     fn queues_take_their_configuration_when_ready() {
         let memory = memory();
         let transport = Transport::new(Box::new(Busy(InFlight::default())), 5);
-        transport.write(REG_QUEUE_DRIVER_LOW, 4, 0x2000);
-        transport.write(REG_QUEUE_READY, 4, 1);
+        transport.write_register(Register::QueueDriver(Half::Low), 0x2000);
+        transport.write_register(Register::QueueReady, 1);
         let position = |transport: &Transport| {
             transport.with_device(
                 &memory,
@@ -1352,9 +1356,9 @@ mod tests {
             || {},
         );
         // Making the queue ready again does not move it back to the start of the rings.
-        transport.write(REG_QUEUE_READY, 4, 1);
+        transport.write_register(Register::QueueReady, 1);
         assert_eq!(position(&transport), (true, 0x2000, 3));
-        transport.write(REG_QUEUE_READY, 4, 0);
+        transport.write_register(Register::QueueReady, 0);
         assert_eq!(position(&transport), (false, 0, 0));
     }
 
@@ -1364,12 +1368,15 @@ mod tests {
         let event_idx = |accept: u64| {
             let transport = Transport::new(Box::<Counting>::default(), 5);
             for (select, features) in [(0, accept as u32), (1, (accept >> 32) as u32)] {
-                transport.write(REG_DRIVER_FEATURES_SEL, 4, select);
-                transport.write(REG_DRIVER_FEATURES, 4, features as u64);
+                transport.write_register(Register::DriverFeaturesSel, select);
+                transport.write_register(Register::DriverFeatures, features);
             }
-            transport.write(REG_STATUS, 4, STATUS_FEATURES_OK as u64);
-            assert_eq!(transport.read(REG_STATUS, 4), STATUS_FEATURES_OK as u64);
-            transport.write(REG_QUEUE_READY, 4, 1);
+            transport.write_register(Register::Status, STATUS_FEATURES_OK);
+            assert_eq!(
+                transport.read_register(Register::Status),
+                STATUS_FEATURES_OK
+            );
+            transport.write_register(Register::QueueReady, 1);
             transport.with_device(
                 &memory,
                 |_: &mut Counting, queues, _| queues[0].event_idx,
@@ -1396,7 +1403,7 @@ mod tests {
 
         let memory = memory();
         let transport = Transport::new(Box::<Counting>::default(), 5);
-        transport.write(REG_QUEUE_READY, 4, 1);
+        transport.write_register(Register::QueueReady, 1);
         let wakeups = Arc::new(Wakeups(Default::default()));
         let waker = Waker::from(wakeups.clone());
         let mut context = Context::from_waker(&waker);
@@ -1404,7 +1411,7 @@ mod tests {
         // Nothing was notified: the task waits.
         assert!(task.as_mut().poll(&mut context).is_pending());
         assert_eq!(wakeups.0.load(Ordering::SeqCst), 0);
-        transport.write(REG_QUEUE_NOTIFY, 4, 0);
+        transport.notify(0);
         assert_eq!(wakeups.0.load(Ordering::SeqCst), 1);
         // The task processes the queue, then lets other tasks run (it wakes itself to
         // continue).
