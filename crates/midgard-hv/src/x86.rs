@@ -66,6 +66,25 @@ pub mod msr {
     pub const APIC_BASE_ENABLE: u64 = 1 << 11;
 }
 
+/// The format of message signaled interrupts (to the local APICs, without interrupt
+/// remapping): the address selects the destination, the data the vector and how it is
+/// delivered.
+pub mod msi {
+    /// The address window of MSIs: bits 31:20 of the address (bits 63:32 are zero).
+    pub const ADDRESS_BASE: u64 = 0xFEE0_0000;
+    pub const ADDRESS_MASK: u64 = 0xFFFF_FFFF_FFF0_0000;
+    /// The destination that addresses all local APICs.
+    pub const BROADCAST: u8 = 0xFF;
+    /// The local APIC ID (or, in logical mode, the logical destination).
+    pub const ADDRESS_DESTINATION_SHIFT: u32 = 12;
+    pub const ADDRESS_LOGICAL: u64 = 1 << 2;
+    pub const DATA_VECTOR: u32 = 0xFF;
+    pub const DATA_DELIVERY_MODE: u32 = 7 << 8;
+    pub const DATA_LOWEST_PRIORITY: u32 = 1 << 8;
+    pub const DATA_ASSERT: u32 = 1 << 14;
+    pub const DATA_LEVEL: u32 = 1 << 15;
+}
+
 /// CPUID feature bits.
 pub mod cpuid {
     pub const LEAF1_ECX_X2APIC: u32 = 1 << 21;

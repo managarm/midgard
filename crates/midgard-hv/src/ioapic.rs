@@ -38,6 +38,46 @@ pub(crate) struct Interrupt {
     pub(crate) lowest_priority: bool,
 }
 
+impl Interrupt {
+    /// Decodes an MSI (see [`crate::x86::msi`]). Fixed and lowest priority interrupts are
+    /// supported; the others (SMI, NMI, INIT and ExtINT), vectors that the local APIC
+    /// rejects and addresses outside of the MSI window are not.
+    #[cfg(any(target_os = "managarm", test))]
+    pub(crate) fn from_msi(address: u64, data: u32) -> Option<Self> {
+        use crate::x86::msi;
+        let vector = (data & msi::DATA_VECTOR) as u8;
+        let fixed = (data & msi::DATA_DELIVERY_MODE) >> 8 <= 1;
+        if address & msi::ADDRESS_MASK != msi::ADDRESS_BASE || !fixed || vector < 16 {
+            return None;
+        }
+        Some(Self {
+            vector,
+            level: data & msi::DATA_LEVEL != 0,
+            destination: (address >> msi::ADDRESS_DESTINATION_SHIFT) as u8,
+            logical: address & msi::ADDRESS_LOGICAL != 0,
+            lowest_priority: data & msi::DATA_DELIVERY_MODE == msi::DATA_LOWEST_PRIORITY,
+        })
+    }
+
+    /// Whether the interrupt goes to the local APIC with x2APIC ID `id`, which is in
+    /// x2APIC mode (on Hel, it always is). Without interrupt remapping, destinations have
+    /// 8 bits, and the broadcast destination addresses all local APICs (like on KVM). In
+    /// logical mode, the destination is a bitmask of cluster 0: an x2APIC's logical ID is
+    /// its cluster (bits 31:4 of its ID) and one bit for its position in the cluster
+    /// (bits 3:0). Lowest priority delivery picks one of the local APICs that match.
+    #[cfg(any(target_os = "managarm", test))]
+    pub(crate) fn targets(&self, id: u32) -> bool {
+        let destination = u32::from(self.destination);
+        if self.destination == crate::x86::msi::BROADCAST {
+            true
+        } else if self.logical {
+            id >> 4 == 0 && destination & 1 << (id & 0xF) != 0
+        } else {
+            destination == id
+        }
+    }
+}
+
 pub(crate) struct Ioapic {
     select: u32,
     id: u32,
@@ -287,6 +327,50 @@ mod tests {
                 lowest_priority: true,
             })
         );
+    }
+
+    #[test]
+    fn msi() {
+        // Linux's MSI to APIC ID 3: fixed, edge-triggered.
+        assert_eq!(
+            Interrupt::from_msi(0xFEE0_3000, 0x0041),
+            Some(Interrupt {
+                destination: 3,
+                ..interrupt(0x41, false)
+            })
+        );
+        assert_eq!(
+            Interrupt::from_msi(0xFEE0_0C04, 0x0142),
+            Some(Interrupt {
+                vector: 0x42,
+                level: false,
+                destination: 0,
+                logical: true,
+                lowest_priority: true,
+            })
+        );
+        // NMI, an illegal vector and addresses outside of the MSI window.
+        assert_eq!(Interrupt::from_msi(0xFEE0_0000, 0x0402), None);
+        assert_eq!(Interrupt::from_msi(0xFEE0_0000, 0x0005), None);
+        assert_eq!(Interrupt::from_msi(0xFED0_0000, 0x0041), None);
+        assert_eq!(Interrupt::from_msi(0x1_FEE0_0000, 0x0041), None);
+    }
+
+    #[test]
+    fn destinations() {
+        let target = |address| Interrupt::from_msi(address, 0x41).unwrap();
+        // Physical: the x2APIC ID, or broadcast.
+        assert!(target(0xFEE0_0000).targets(0));
+        assert!(!target(0xFEE0_1000).targets(0));
+        assert!(target(0xFEE0_1000).targets(1));
+        assert!(target(0xFEE0_0000 | 0xFF << 12).targets(0));
+        // Logical: a bitmask of cluster 0.
+        assert!(target(0xFEE0_1004).targets(0));
+        assert!(!target(0xFEE0_2004).targets(0));
+        assert!(target(0xFEE0_2004).targets(1));
+        assert!(target(0xFEE8_0004).targets(7));
+        assert!(!target(0xFEE0_1004).targets(16));
+        assert!(target(0xFEEF_F004).targets(16));
     }
 
     #[test]

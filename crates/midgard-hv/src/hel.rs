@@ -178,6 +178,23 @@ impl HypervisorOps for Hypervisor {
         self.interrupts.raise(interrupt)
     }
 
+    fn signal_msi(&self, address: u64, data: u32) -> Result<()> {
+        let Some(interrupt) = Interrupt::from_msi(address, data) else {
+            bail!("unsupported MSI {data:#x} to {address:#x}");
+        };
+        // The single vCPU has x2APIC ID 0. Like on hardware, an MSI to other local APICs
+        // goes nowhere.
+        if !interrupt.targets(0) {
+            bail!("MSI {data:#x} to {address:#x} does not target the vCPU");
+        }
+        // MSIs from PCI devices are edge-triggered; nothing would report the EOI of a
+        // level-triggered one.
+        self.interrupts.raise(Some(Interrupt {
+            level: false,
+            ..interrupt
+        }))
+    }
+
     fn tsc_hz(&self) -> Result<u64> {
         managarm::clock::tsc_hz().context("failed to read the TSC frequency from thor's clock page")
     }

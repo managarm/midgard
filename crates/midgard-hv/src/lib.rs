@@ -329,6 +329,9 @@ backend! {
         /// Sets the level of an I/O APIC pin. An edge-triggered pin interrupts on the
         /// rising edge.
         fn set_irq_line(&self, pin: u32, level: bool) -> Result<()>;
+        /// Sends a message signaled interrupt (see [`x86::msi`]), e.g., from a PCI device's
+        /// MSI-X table. Only fixed and lowest priority delivery need to be supported.
+        fn signal_msi(&self, address: u64, data: u32) -> Result<()>;
         /// The frequency (in Hz) of the vCPUs' TSC, which is the host's TSC, as the host
         /// kernel knows it (such that the VMM does not have to measure it).
         fn tsc_hz(&self) -> Result<u64>;
