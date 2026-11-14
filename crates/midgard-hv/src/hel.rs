@@ -22,6 +22,8 @@ use crate::{
 
 /// Thor does not support more than one vCPU per VM yet.
 pub const MAX_VCPUS: u32 = 1;
+/// The x2APIC ID of the single vCPU (whose local APIC is always in x2APIC mode).
+const VCPU_X2APIC_ID: u32 = 0;
 
 /// The size of the I/O APIC's MMIO window.
 const IOAPIC_SIZE: u64 = 0x100;
@@ -131,7 +133,8 @@ pub(crate) fn create(memory_size: u64) -> Result<(Hypervisor, GuestMemory)> {
     // SAFETY: The GuestMemory owns the mapping.
     let memory = unsafe { GuestMemory::new(mapping.base(), memory_size, Arc::new(mapping)) };
     let interrupts = Arc::new(Interrupts {
-        ioapic: Mutex::new(Ioapic::new()),
+        // Interrupts to other local APICs go nowhere, like on hardware.
+        ioapic: Mutex::new(Ioapic::new(|interrupt| interrupt.targets(VCPU_X2APIC_ID))),
         vcpu: OnceLock::new(),
     });
     Ok((
@@ -176,6 +179,22 @@ impl HypervisorOps for Hypervisor {
             .unwrap()
             .set_irq(pin as usize, level);
         self.interrupts.raise(interrupt)
+    }
+
+    fn signal_msi(&self, address: u64, data: u32) -> Result<()> {
+        let Some(interrupt) = Interrupt::from_msi(address, data) else {
+            bail!("unsupported MSI {data:#x} to {address:#x}");
+        };
+        // Like on hardware, an MSI to other local APICs goes nowhere.
+        if !interrupt.targets(VCPU_X2APIC_ID) {
+            bail!("MSI {data:#x} to {address:#x} does not target the vCPU");
+        }
+        // MSIs from PCI devices are edge-triggered; nothing would report the EOI of a
+        // level-triggered one.
+        self.interrupts.raise(Some(Interrupt {
+            level: false,
+            ..interrupt
+        }))
     }
 
     fn tsc_hz(&self) -> Result<u64> {

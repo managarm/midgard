@@ -32,7 +32,7 @@ use kvm_ioctls::{
 
 use crate::counters::{ExitCounts, kinds};
 use crate::ioapic::{self, Interrupt, Ioapic};
-use crate::x86::{IOAPIC_BASE, LAPIC_BASE, cpuid, msr};
+use crate::x86::{IOAPIC_BASE, LAPIC_BASE, cpuid, msi, msr};
 use crate::{
     BasicRegs, Completion, CountersOps, CpuidEntry, DescriptorTable, Exit, GuestMemory,
     HypervisorOps, KickerOps, Msrs, RESERVED_BASE, Regs, Segment, VcpuOps,
@@ -58,14 +58,6 @@ const _: () = assert!(KVM_TSS + 0x3000 <= RESERVED_BASE + crate::RESERVED_SIZE);
 
 /// The I/O APIC's MMIO window.
 const IOAPIC_SIZE: u64 = 0x100;
-
-// The MSI address and data of an interrupt from the I/O APIC.
-const MSI_ADDRESS_BASE: u32 = 0xFEE0_0000;
-const MSI_ADDRESS_DESTINATION_SHIFT: u32 = 12;
-const MSI_ADDRESS_LOGICAL: u32 = 1 << 2;
-const MSI_DATA_LOWEST_PRIORITY: u32 = 1 << 8;
-const MSI_DATA_ASSERT: u32 = 1 << 14;
-const MSI_DATA_LEVEL: u32 = 1 << 15;
 
 /// Like on Hel, the local APIC starts in x2APIC mode at the default base.
 const APIC_BASE_X2APIC: u64 = LAPIC_BASE | msr::APIC_BASE_ENABLE | msr::APIC_BASE_EXTD;
@@ -141,18 +133,18 @@ pub struct Hypervisor {
 /// The MSI address and data of `interrupt`.
 fn msi(interrupt: &Interrupt) -> (u32, u32) {
     let mut address =
-        MSI_ADDRESS_BASE | u32::from(interrupt.destination) << MSI_ADDRESS_DESTINATION_SHIFT;
+        msi::ADDRESS_BASE | u64::from(interrupt.destination) << msi::ADDRESS_DESTINATION_SHIFT;
     if interrupt.logical {
-        address |= MSI_ADDRESS_LOGICAL;
+        address |= msi::ADDRESS_LOGICAL;
     }
-    let mut data = u32::from(interrupt.vector) | MSI_DATA_ASSERT;
+    let mut data = u32::from(interrupt.vector) | msi::DATA_ASSERT;
     if interrupt.lowest_priority {
-        data |= MSI_DATA_LOWEST_PRIORITY;
+        data |= msi::DATA_LOWEST_PRIORITY;
     }
     if interrupt.level {
-        data |= MSI_DATA_LEVEL;
+        data |= msi::DATA_LEVEL;
     }
-    (address, data)
+    (address as u32, data)
 }
 
 /// The I/O APIC and the VM whose local APICs its interrupts go to.
@@ -185,6 +177,20 @@ impl Interrupts {
         self.vm
             .signal_msi(msi)
             .with_context(|| format!("KVM_SIGNAL_MSI for vector {:#x} failed", interrupt.vector))?;
+        Ok(())
+    }
+
+    /// Sends an MSI as the device wrote it (KVM decodes it).
+    fn signal_msi(&self, address: u64, data: u32) -> Result<()> {
+        let msi = kvm_msi {
+            address_lo: address as u32,
+            address_hi: (address >> 32) as u32,
+            data,
+            ..Default::default()
+        };
+        self.vm
+            .signal_msi(msi)
+            .with_context(|| format!("KVM_SIGNAL_MSI of {data:#x} to {address:#x} failed"))?;
         Ok(())
     }
 
@@ -331,7 +337,8 @@ pub(crate) fn create(memory_size: u64) -> Result<(Hypervisor, GuestMemory)> {
     let interrupts = Arc::new(Interrupts {
         vm: vm.clone(),
         state: Mutex::new(IoapicState {
-            ioapic: Ioapic::new(),
+            // KVM delivers the interrupts to the local APICs that they address.
+            ioapic: Ioapic::new(|_| true),
             routes: Vec::new(),
         }),
     });
@@ -444,6 +451,10 @@ impl HypervisorOps for Hypervisor {
             bail!("I/O APIC pin {pin} does not exist");
         }
         self.interrupts.set_irq(pin as usize, level)
+    }
+
+    fn signal_msi(&self, address: u64, data: u32) -> Result<()> {
+        self.interrupts.signal_msi(address, data)
     }
 
     fn tsc_hz(&self) -> Result<u64> {

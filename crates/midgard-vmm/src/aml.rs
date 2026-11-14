@@ -27,6 +27,19 @@ const SMALL_END_TAG: u8 = 0x0F;
 /// IO: the device decodes 16 address bits.
 const IO_DECODE_16: u8 = 1 << 0;
 
+// Large resource descriptors: their types, and flags.
+const LARGE_MEMORY32_FIXED: u8 = 0x06;
+const LARGE_DWORD_ADDRESS: u8 = 0x07;
+const LARGE_WORD_ADDRESS: u8 = 0x08;
+/// Memory: the range can be written.
+const MEMORY_READ_WRITE: u8 = 1 << 0;
+// The resource types of address space descriptors.
+const ADDRESS_MEMORY: u8 = 0;
+const ADDRESS_BUS_NUMBER: u8 = 2;
+/// Address space descriptors: the range is fixed (MinFixed, MaxFixed), positively
+/// decoded, and the device produces it (for its children; a bridge's windows).
+const ADDRESS_FIXED_PRODUCER: u8 = 1 << 3 | 1 << 2;
+
 /// An encoded term (an element of a TermList), e.g., a Name.
 pub(crate) struct Term(Vec<u8>);
 
@@ -208,6 +221,46 @@ fn small_resource(kind: u8, data: &[u8]) -> Resource {
     Resource(bytes)
 }
 
+/// A large resource descriptor: the type, the length of `data`, then `data`.
+fn large_resource(kind: u8, data: &[u8]) -> Resource {
+    let length = u16::try_from(data.len()).unwrap();
+    let mut bytes = vec![0x80 | kind];
+    bytes.extend(length.to_le_bytes());
+    bytes.extend_from_slice(data);
+    Resource(bytes)
+}
+
+/// `WordBusNumber (ResourceProducer, MinFixed, MaxFixed, PosDecode, 0, first, last, 0,
+/// last - first + 1)`: the bus numbers that a host bridge decodes.
+pub(crate) fn word_bus_number(first: u8, last: u8) -> Resource {
+    assert!(first <= last);
+    let mut data = vec![ADDRESS_BUS_NUMBER, ADDRESS_FIXED_PRODUCER, 0];
+    let length = u16::from(last - first) + 1;
+    for value in [0, first.into(), last.into(), 0, length] {
+        data.extend(u16::to_le_bytes(value));
+    }
+    large_resource(LARGE_WORD_ADDRESS, &data)
+}
+
+/// `DWordMemory (ResourceProducer, PosDecode, MinFixed, MaxFixed, NonCacheable, ReadWrite,
+/// 0, base, base + len - 1, 0, len)`: a memory window of a host bridge.
+pub(crate) fn dword_memory(base: u32, len: u32) -> Resource {
+    let last = base.checked_add(len - 1).expect("memory window too long");
+    let mut data = vec![ADDRESS_MEMORY, ADDRESS_FIXED_PRODUCER, MEMORY_READ_WRITE];
+    for value in [0, base, last, 0, len] {
+        data.extend(value.to_le_bytes());
+    }
+    large_resource(LARGE_DWORD_ADDRESS, &data)
+}
+
+/// `Memory32Fixed (ReadWrite, base, len)`: memory that the device uses.
+pub(crate) fn memory32_fixed(base: u32, len: u32) -> Resource {
+    let mut data = vec![MEMORY_READ_WRITE];
+    data.extend(base.to_le_bytes());
+    data.extend(len.to_le_bytes());
+    large_resource(LARGE_MEMORY32_FIXED, &data)
+}
+
 /// `IO (Decode16, base, base, 1, len)`: `len` ports at a fixed `base`.
 pub(crate) fn io(base: u16, len: u16) -> Resource {
     let len = u8::try_from(len).expect("I/O port range too long");
@@ -288,6 +341,36 @@ mod tests {
     #[should_panic]
     fn eisa_id_lowercase() {
         eisa_id("pnp0501");
+    }
+
+    #[test]
+    fn large_resources() {
+        // As iasl encodes them:
+        //   WordBusNumber (ResourceProducer, MinFixed, MaxFixed, PosDecode,
+        //     0x0000, 0x0000, 0x00FF, 0x0000, 0x0100)
+        //   DWordMemory (ResourceProducer, PosDecode, MinFixed, MaxFixed, NonCacheable,
+        //     ReadWrite, 0x00000000, 0xE0000000, 0xEFFFFFFF, 0x00000000, 0x10000000)
+        //   Memory32Fixed (ReadWrite, 0xF0000000, 0x00100000)
+        assert_eq!(
+            word_bus_number(0, 0xFF).0,
+            [
+                0x88, 0x0D, 0x00, 0x02, 0x0C, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x00,
+                0x00, 0x01
+            ]
+        );
+        assert_eq!(
+            dword_memory(0xE000_0000, 0x1000_0000).0,
+            [
+                0x87, 0x17, 0x00, 0x00, 0x0C, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xE0,
+                0xFF, 0xFF, 0xFF, 0xEF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10
+            ]
+        );
+        assert_eq!(
+            memory32_fixed(0xF000_0000, 0x10_0000).0,
+            [
+                0x86, 0x09, 0x00, 0x01, 0x00, 0x00, 0x00, 0xF0, 0x00, 0x00, 0x10, 0x00
+            ]
+        );
     }
 
     #[test]

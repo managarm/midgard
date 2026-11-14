@@ -2,7 +2,7 @@
 //! which I/O ports and which interrupt lines its devices use. Keeping them in one place
 //! makes it easy to see that nothing overlaps.
 
-use crate::virtio;
+use crate::{pci, virtio};
 
 // Guest-physical memory. RAM starts at zero; the MMIO hole is at the top of the 4 GiB.
 
@@ -15,8 +15,12 @@ pub(crate) const ACPI_TABLES: u64 = 0xE_0000;
 pub(crate) const HIGH_MEMORY: u64 = 0x10_0000;
 /// RAM must end below the MMIO hole.
 pub(crate) const MAX_LOW_RAM: u64 = 0xC000_0000;
-/// The first virtio-mmio device; each one has [`virtio::MMIO_SIZE`] bytes.
-pub(crate) const VIRTIO_BASE: u64 = 0xD000_0000;
+/// The memory window of the PCI host bridge, where the devices' BARs are (see
+/// [`virtio_slot`]).
+pub(crate) const PCI_MMIO_BASE: u64 = 0xC000_0000;
+pub(crate) const PCI_MMIO_SIZE: u64 = 0x3000_0000;
+/// The PCI bus' configuration space (ECAM, [`pci::ECAM_SIZE`] bytes).
+pub(crate) const PCI_ECAM_BASE: u64 = 0xF000_0000;
 /// The I/O APIC (24 pins, ID 0), which the hypervisor emulates (the backends put it at
 /// its default base).
 pub(crate) const IOAPIC_BASE: u64 = midgard_hv::x86::IOAPIC_BASE;
@@ -44,28 +48,31 @@ pub(crate) const PM1A_CNT_BLK: u16 = 0x604;
 pub(crate) const COM1_IRQ: usize = 4;
 /// The ACPI SCI; it is never raised, but needs a line that no device uses.
 pub(crate) const SCI_IRQ: usize = 13;
-/// The (edge-triggered) lines of the virtio devices, in the order of their slots. This
-/// also limits the number of virtio devices.
-pub(crate) const VIRTIO_IRQS: [usize; 9] = [5, 6, 7, 9, 10, 11, 12, 14, 15];
+// PCI slots.
+
+/// The slot of the first virtio device; the others follow (slot 0 is the host bridge).
+pub(crate) const FIRST_VIRTIO_SLOT: usize = 1;
+/// The most virtio devices: one in each of the other slots.
+pub(crate) const MAX_VIRTIO_DEVICES: usize = pci::NUM_SLOTS - FIRST_VIRTIO_SLOT;
 
 const _: () = {
     assert!(COM1_IRQ != SCI_IRQ);
-    let mut i = 0;
-    while i < VIRTIO_IRQS.len() {
-        assert!(VIRTIO_IRQS[i] != COM1_IRQ && VIRTIO_IRQS[i] != SCI_IRQ);
-        i += 1;
-    }
-    assert!(MAX_LOW_RAM <= VIRTIO_BASE);
-    assert!(VIRTIO_BASE + VIRTIO_IRQS.len() as u64 * virtio::MMIO_SIZE <= IOAPIC_BASE);
+    assert!(MAX_LOW_RAM <= PCI_MMIO_BASE);
+    // The BARs are naturally aligned and fit into the window.
+    assert!(PCI_MMIO_BASE.is_multiple_of(virtio::BAR_SIZE));
+    assert!(MAX_VIRTIO_DEVICES as u64 * virtio::BAR_SIZE <= PCI_MMIO_SIZE);
+    assert!(PCI_MMIO_BASE + PCI_MMIO_SIZE <= PCI_ECAM_BASE);
+    assert!(PCI_ECAM_BASE + pci::ECAM_SIZE <= IOAPIC_BASE);
     assert!(IOAPIC_BASE + IOAPIC_SIZE <= LAPIC_BASE);
     assert!(LAPIC_BASE + LAPIC_SIZE <= midgard_hv::RESERVED_BASE);
 };
 
-/// The MMIO window and the interrupt line of the virtio device in slot `index`.
-pub(crate) fn virtio_slot(index: usize) -> (u64, usize) {
+/// The PCI slot and the BAR's address of the virtio device `index` (in the order of the
+/// [`virtio::DeviceList`]).
+pub(crate) fn virtio_slot(index: usize) -> (usize, u64) {
     (
-        VIRTIO_BASE + index as u64 * virtio::MMIO_SIZE,
-        VIRTIO_IRQS[index],
+        FIRST_VIRTIO_SLOT + index,
+        PCI_MMIO_BASE + index as u64 * virtio::BAR_SIZE,
     )
 }
 

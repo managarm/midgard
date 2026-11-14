@@ -38,21 +38,68 @@ pub(crate) struct Interrupt {
     pub(crate) lowest_priority: bool,
 }
 
+impl Interrupt {
+    /// Decodes an MSI (see [`crate::x86::msi`]). Fixed and lowest priority interrupts are
+    /// supported; the others (SMI, NMI, INIT and ExtINT), vectors that the local APIC
+    /// rejects and addresses outside of the MSI window are not.
+    #[cfg(any(target_os = "managarm", test))]
+    pub(crate) fn from_msi(address: u64, data: u32) -> Option<Self> {
+        use crate::x86::msi;
+        let vector = (data & msi::DATA_VECTOR) as u8;
+        let fixed = (data & msi::DATA_DELIVERY_MODE) >> 8 <= 1;
+        if address & msi::ADDRESS_MASK != msi::ADDRESS_BASE || !fixed || vector < 16 {
+            return None;
+        }
+        Some(Self {
+            vector,
+            level: data & msi::DATA_LEVEL != 0,
+            destination: (address >> msi::ADDRESS_DESTINATION_SHIFT) as u8,
+            logical: address & msi::ADDRESS_LOGICAL != 0,
+            lowest_priority: data & msi::DATA_DELIVERY_MODE == msi::DATA_LOWEST_PRIORITY,
+        })
+    }
+
+    /// Whether the interrupt goes to the local APIC with x2APIC ID `id`, which is in
+    /// x2APIC mode (on Hel, it always is). Without interrupt remapping, destinations have
+    /// 8 bits, and the broadcast destination addresses all local APICs (like on KVM). In
+    /// logical mode, the destination is a bitmask of cluster 0: an x2APIC's logical ID is
+    /// its cluster (bits 31:4 of its ID) and one bit for its position in the cluster
+    /// (bits 3:0). Lowest priority delivery picks one of the local APICs that match.
+    #[cfg(any(target_os = "managarm", test))]
+    pub(crate) fn targets(&self, id: u32) -> bool {
+        let destination = u32::from(self.destination);
+        if self.destination == crate::x86::msi::BROADCAST {
+            true
+        } else if self.logical {
+            id >> 4 == 0 && destination & 1 << (id & 0xF) != 0
+        } else {
+            destination == id
+        }
+    }
+}
+
 pub(crate) struct Ioapic {
     select: u32,
     id: u32,
     /// The levels of the pins (one bit per pin).
     lines: u32,
     redirection: [u64; NUM_PINS],
+    /// Whether a local APIC accepts an interrupt (see [`Ioapic::new`]).
+    accepts: fn(&Interrupt) -> bool,
 }
 
 impl Ioapic {
-    pub(crate) fn new() -> Self {
+    /// `accepts` says whether a local APIC accepts an interrupt, i.e., whether its
+    /// destination addresses one. Interrupts that none accepts go nowhere and, if
+    /// level-triggered, leave Remote IRR clear (like KVM's I/O APIC does), such that the
+    /// pin interrupts once the guest points it at a local APIC that exists.
+    pub(crate) fn new(accepts: fn(&Interrupt) -> bool) -> Self {
         Self {
             select: 0,
             id: 0,
             lines: 0,
             redirection: [RTE_MASKED; NUM_PINS],
+            accepts,
         }
     }
 
@@ -178,9 +225,10 @@ impl Ioapic {
         })
     }
 
-    /// Sends the pin's interrupt unless it is masked or (level-triggered) in service.
+    /// Sends the pin's interrupt unless it is masked, (level-triggered) in service or no
+    /// local APIC accepts it.
     fn service(&mut self, pin: usize) -> Option<Interrupt> {
-        let interrupt = self.redirection(pin)?;
+        let interrupt = self.redirection(pin).filter(self.accepts)?;
         if interrupt.level {
             if self.redirection[pin] & RTE_REMOTE_IRR != 0 {
                 return None;
@@ -217,7 +265,7 @@ mod tests {
 
     #[test]
     fn version_and_reset() {
-        let mut ioapic = Ioapic::new();
+        let mut ioapic = Ioapic::new(|_| true);
         ioapic.write(IOREGSEL, 1);
         assert_eq!(ioapic.read(IOWIN), 0x0017_0011);
         assert_eq!(entry(&mut ioapic, 5), RTE_MASKED as u32);
@@ -227,7 +275,7 @@ mod tests {
 
     #[test]
     fn edge() {
-        let mut ioapic = Ioapic::new();
+        let mut ioapic = Ioapic::new(|_| true);
         assert_eq!(program(&mut ioapic, 4, 0x30), None);
         let interrupt = interrupt(0x30, false);
         assert_eq!(ioapic.set_irq(4, true), Some(interrupt));
@@ -239,7 +287,7 @@ mod tests {
 
     #[test]
     fn level() {
-        let mut ioapic = Ioapic::new();
+        let mut ioapic = Ioapic::new(|_| true);
         let low = 0x31 | RTE_LEVEL as u32;
         program(&mut ioapic, 9, low);
         let interrupt = interrupt(0x31, true);
@@ -259,7 +307,7 @@ mod tests {
 
     #[test]
     fn unmask_level() {
-        let mut ioapic = Ioapic::new();
+        let mut ioapic = Ioapic::new(|_| true);
         let low = 0x32 | RTE_LEVEL as u32;
         program(&mut ioapic, 13, low | RTE_MASKED as u32);
         assert_eq!(ioapic.set_irq(13, true), None);
@@ -268,7 +316,7 @@ mod tests {
 
     #[test]
     fn destination() {
-        let mut ioapic = Ioapic::new();
+        let mut ioapic = Ioapic::new(|_| true);
         // Lowest priority, logical destination 0x0C (in the high half).
         program(
             &mut ioapic,
@@ -290,8 +338,69 @@ mod tests {
     }
 
     #[test]
+    fn msi() {
+        // Linux's MSI to APIC ID 3: fixed, edge-triggered.
+        assert_eq!(
+            Interrupt::from_msi(0xFEE0_3000, 0x0041),
+            Some(Interrupt {
+                destination: 3,
+                ..interrupt(0x41, false)
+            })
+        );
+        assert_eq!(
+            Interrupt::from_msi(0xFEE0_0C04, 0x0142),
+            Some(Interrupt {
+                vector: 0x42,
+                level: false,
+                destination: 0,
+                logical: true,
+                lowest_priority: true,
+            })
+        );
+        // NMI, an illegal vector and addresses outside of the MSI window.
+        assert_eq!(Interrupt::from_msi(0xFEE0_0000, 0x0402), None);
+        assert_eq!(Interrupt::from_msi(0xFEE0_0000, 0x0005), None);
+        assert_eq!(Interrupt::from_msi(0xFED0_0000, 0x0041), None);
+        assert_eq!(Interrupt::from_msi(0x1_FEE0_0000, 0x0041), None);
+    }
+
+    #[test]
+    fn destinations() {
+        let target = |address| Interrupt::from_msi(address, 0x41).unwrap();
+        // Physical: the x2APIC ID, or broadcast.
+        assert!(target(0xFEE0_0000).targets(0));
+        assert!(!target(0xFEE0_1000).targets(0));
+        assert!(target(0xFEE0_1000).targets(1));
+        assert!(target(0xFEE0_0000 | 0xFF << 12).targets(0));
+        // Logical: a bitmask of cluster 0.
+        assert!(target(0xFEE0_1004).targets(0));
+        assert!(!target(0xFEE0_2004).targets(0));
+        assert!(target(0xFEE0_2004).targets(1));
+        assert!(target(0xFEE8_0004).targets(7));
+        assert!(!target(0xFEE0_1004).targets(16));
+        assert!(target(0xFEEF_F004).targets(16));
+    }
+
+    #[test]
+    fn undeliverable() {
+        // Only the local APIC with x2APIC ID 0 exists.
+        let mut ioapic = Ioapic::new(|interrupt| interrupt.targets(0));
+        let low = 0x34 | RTE_LEVEL as u32;
+        program(&mut ioapic, 10, low);
+        ioapic.write(IOREGSEL, 0x10 + 2 * 10 + 1);
+        ioapic.write(IOWIN, 0x0100_0000);
+        // To APIC ID 1: the interrupt goes nowhere and is not in service.
+        assert_eq!(ioapic.set_irq(10, true), None);
+        assert_eq!(entry(&mut ioapic, 10) & RTE_REMOTE_IRR as u32, 0);
+        // Pointing the pin at APIC ID 0 interrupts (the pin is still high).
+        ioapic.write(IOREGSEL, 0x10 + 2 * 10 + 1);
+        assert_eq!(ioapic.write(IOWIN, 0), Some(interrupt(0x34, true)));
+        assert_ne!(entry(&mut ioapic, 10) & RTE_REMOTE_IRR as u32, 0);
+    }
+
+    #[test]
     fn unsupported_delivery() {
-        let mut ioapic = Ioapic::new();
+        let mut ioapic = Ioapic::new(|_| true);
         // NMI.
         program(&mut ioapic, 3, 0x30 | 4 << 8);
         assert_eq!(ioapic.set_irq(3, true), None);

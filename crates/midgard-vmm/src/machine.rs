@@ -28,11 +28,11 @@ use crate::virtio::fs::{self, VirtioFs};
 use crate::virtio::net::VirtioNet;
 use crate::virtio::vsock::{Vsock, VsockListener, VsockStream};
 use crate::virtio::{DeviceList, DeviceRef};
-use crate::{acpi, boot, platform, vcpu, virtio};
+use crate::{acpi, boot, platform, vcpu};
 
 /// Kernel parameters that every guest needs (unless the configuration replaces them);
-/// the console and the virtio devices are added.
-const BASE_CMDLINE: &str = "pci=off reboot=k panic=-1";
+/// the console is added.
+const BASE_CMDLINE: &str = "reboot=k panic=-1";
 /// The default number of vCPUs: the host's CPUs, up to this many.
 const DEFAULT_MAX_CPUS: u32 = 8;
 
@@ -130,11 +130,11 @@ fn create_devices(config: &MachineConfig, output: &ConsoleOutput) -> Result<Devi
         let (block, backend) = Block::new(image, disk.read_only, index);
         disks.push((list.add(block), backend));
     }
-    // Each device needs an interrupt line.
-    if list.len() > platform::VIRTIO_IRQS.len() {
+    // Each device needs a PCI slot.
+    if list.len() > platform::MAX_VIRTIO_DEVICES {
         bail!(
             "too many devices (a VM can have at most {} virtio devices)",
-            platform::VIRTIO_IRQS.len()
+            platform::MAX_VIRTIO_DEVICES
         );
     }
     Ok(Devices {
@@ -155,13 +155,6 @@ fn kernel_cmdline(config: &MachineConfig, devices: &Devices) -> String {
         ConsoleKind::Serial => "console=ttyS0",
     };
     let mut cmdline = vec![base.to_string(), console.to_string()];
-    for slot in 0..devices.list.len() {
-        let (base, irq) = platform::virtio_slot(slot);
-        cmdline.push(format!(
-            "virtio_mmio.device={}K@{base:#x}:{irq}",
-            virtio::MMIO_SIZE >> 10
-        ));
-    }
     if devices.network.is_some() {
         cmdline.push(net::kernel_parameter());
     }
@@ -508,8 +501,8 @@ pub fn start(
         config.memory >> 20,
     );
     let executor = Arc::new(Executor::new());
-    for slot in 0..board.num_virtio() {
-        executor.spawn(board.clone().process_virtio(slot)).detach();
+    for index in 0..board.num_virtio() {
+        executor.spawn(board.clone().process_virtio(index)).detach();
     }
     if let Some(input) = input {
         match devices.console {
