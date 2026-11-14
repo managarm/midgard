@@ -13,7 +13,8 @@ use midgard_hv::{DescriptorTable, GuestMemory, MemoryError, Regs, Segment};
 use zerocopy::little_endian::{U16, U32, U64};
 use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout};
 
-use crate::platform::{ACPI_TABLES, HIGH_MEMORY, LEGACY_HOLE};
+use crate::pci;
+use crate::platform::{ACPI_TABLES, HIGH_MEMORY, LEGACY_HOLE, PCI_ECAM_BASE};
 
 pub(crate) mod initramfs;
 
@@ -229,6 +230,7 @@ pub(crate) fn load(
         (0, LEGACY_HOLE, E820_RAM),
         (LEGACY_HOLE, HIGH_MEMORY - LEGACY_HOLE, E820_RESERVED),
         (HIGH_MEMORY, memory.size() - HIGH_MEMORY, E820_RAM),
+        (PCI_ECAM_BASE, pci::ECAM_SIZE, E820_RESERVED),
     ];
     for (entry, (address, size, kind)) in zero_page.e820_table.iter_mut().zip(e820) {
         *entry = E820Entry {

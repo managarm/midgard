@@ -32,7 +32,7 @@ use crate::{acpi, boot, platform, vcpu, virtio};
 
 /// Kernel parameters that every guest needs (unless the configuration replaces them);
 /// the console and the virtio devices are added.
-const BASE_CMDLINE: &str = "pci=off reboot=k panic=-1";
+const BASE_CMDLINE: &str = "reboot=k panic=-1";
 /// The default number of vCPUs: the host's CPUs, up to this many.
 const DEFAULT_MAX_CPUS: u32 = 8;
 

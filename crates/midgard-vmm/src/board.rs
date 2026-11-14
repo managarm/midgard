@@ -19,7 +19,7 @@ use crate::logging::{ReportOnce, log};
 use crate::machine::Stop;
 use crate::virtio::vsock::Vsock;
 use crate::virtio::{self, DeviceRef, Effect, Transport};
-use crate::{platform, vcpu};
+use crate::{pci, platform, vcpu};
 
 /// Problems that are reported once (see [`ReportOnce`]).
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
@@ -40,6 +40,8 @@ struct DeviceCounters {
     serial: Accesses,
     rtc: Accesses,
     pm1: Accesses,
+    /// The PCI bus' configuration space.
+    pci: Accesses,
     /// The ports of devices that we do not have, which we ignore on purpose.
     ignored: Accesses,
     unhandled_pio: Accesses,
@@ -49,7 +51,7 @@ struct DeviceCounters {
 }
 
 /// The guest's hardware, shared by all vCPUs: RAM, the devices that are not in the
-/// hypervisor (UART, RTC, PM1, the virtio transports) and the routing of port I/O,
+/// hypervisor (UART, RTC, PM1, the PCI bus, the virtio transports) and the routing of port I/O,
 /// MMIO and interrupt lines to them. The local APICs and the I/O APIC are the
 /// hypervisor's. Also tracks whether the guest is done (stop requested).
 ///
@@ -70,6 +72,7 @@ pub(crate) struct Board {
     serial_drained: Event,
     rtc: Mutex<Rtc>,
     pm1: Mutex<Pm1>,
+    pci: pci::Bus,
     /// The vCPUs' kickers (see [`Board::stop`]).
     kickers: Mutex<Vec<Kicker>>,
     /// The vCPUs' counters, by vCPU ID (see [`Board::counters`]).
@@ -106,6 +109,7 @@ impl Board {
             serial_drained: Event::new(),
             rtc: Mutex::new(Rtc::default()),
             pm1: Mutex::new(Pm1::default()),
+            pci: pci::Bus::new(),
             kickers: Mutex::new(Vec::new()),
             vcpu_counters: Mutex::new(BTreeMap::new()),
             device_counters: DeviceCounters::default(),
@@ -144,6 +148,7 @@ impl Board {
         counters.serial.snapshot("serial", "pio", &mut devices);
         counters.rtc.snapshot("rtc", "pio", &mut devices);
         counters.pm1.snapshot("pm1", "pio", &mut devices);
+        counters.pci.snapshot("pci", "ecam", &mut devices);
         counters.ignored.snapshot("ignored", "pio", &mut devices);
         counters
             .unhandled_pio
@@ -307,7 +312,7 @@ impl Board {
             // from Linux probing them.
             0x60 | 0x64 | 0x40..=0x43 | 0x61 | 0x80..=0x8F => ones,
             0x2F8..=0x2FF | 0x3E8..=0x3EF | 0x2E8..=0x2EF => ones,
-            // No PCI configuration space (Linux probes it early, despite pci=off).
+            // No PCI configuration mechanism #1, such that Linux uses ECAM (see pci).
             0xCF8..=0xCFF => ones,
             _ => {
                 self.device_counters.unhandled_pio.reads.add();
@@ -387,8 +392,19 @@ impl Board {
         (index < self.virtio.len()).then_some((index, offset % virtio::MMIO_SIZE))
     }
 
+    /// The offset of `address` in the PCI bus' configuration space.
+    fn ecam_offset(address: u64) -> Option<u64> {
+        address
+            .checked_sub(platform::PCI_ECAM_BASE)
+            .filter(|&offset| offset < pci::ECAM_SIZE)
+    }
+
     /// MMIO read of `size` bytes.
     pub(crate) fn mmio_read(&self, address: u64, size: u8) -> u64 {
+        if let Some(offset) = Self::ecam_offset(address) {
+            self.device_counters.pci.reads.add();
+            return self.pci.config_read(offset, size);
+        }
         if let Some((index, offset)) = self.virtio_device(address) {
             return self.virtio[index].read(offset, size);
         }
@@ -402,6 +418,11 @@ impl Board {
 
     /// MMIO write of `size` bytes.
     pub(crate) fn mmio_write(&self, address: u64, size: u8, value: u64) {
+        if let Some(offset) = Self::ecam_offset(address) {
+            self.device_counters.pci.writes.add();
+            self.pci.config_write(offset, size, value);
+            return;
+        }
         if let Some((index, offset)) = self.virtio_device(address) {
             let transport = &self.virtio[index];
             match transport.write(offset, size, value) {

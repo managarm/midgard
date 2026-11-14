@@ -1,7 +1,7 @@
 //! Minimal ACPI tables: they tell Linux about the CPUs and the I/O APIC (the MADT), give
-//! it a way to power off (the FADT's PM1a control block and \_S5 in the DSDT) and
-//! describe the legacy devices (in the DSDT). The virtio devices are declared on the
-//! command line.
+//! it a way to power off (the FADT's PM1a control block and \_S5 in the DSDT), describe
+//! the legacy devices and the PCI host bridge (in the DSDT) and where the PCI bus'
+//! configuration space is (the MCFG).
 
 use std::mem::offset_of;
 
@@ -11,8 +11,10 @@ use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout};
 
 use crate::aml;
 use crate::devices::{pm1, rtc, serial};
+use crate::pci;
 use crate::platform::{
-    COM1_IRQ, COM1_PORT, IOAPIC_BASE, LAPIC_BASE, PM1A_CNT_BLK, PM1A_EVT_BLK, RTC_PORT, SCI_IRQ,
+    COM1_IRQ, COM1_PORT, IOAPIC_BASE, LAPIC_BASE, PCI_ECAM_BASE, PCI_MMIO_BASE, PCI_MMIO_SIZE,
+    PM1A_CNT_BLK, PM1A_EVT_BLK, RTC_PORT, SCI_IRQ,
 };
 
 const OEM_ID: &[u8; 6] = b"MIDGRD";
@@ -203,6 +205,24 @@ struct MadtInterruptOverride {
     flags: U16,
 }
 
+/// The MCFG's fields after its header (the configuration space allocations follow).
+#[derive(FromBytes, IntoBytes, Immutable, KnownLayout)]
+#[repr(C)]
+struct Mcfg {
+    reserved: [u8; 8],
+}
+
+/// An MCFG entry: the ECAM region of a range of buses.
+#[derive(FromBytes, IntoBytes, Immutable, KnownLayout)]
+#[repr(C)]
+struct McfgAllocation {
+    base: U64,
+    segment: U16,
+    start_bus: u8,
+    end_bus: u8,
+    reserved: U32,
+}
+
 /// A MADT entry: Local APIC NMI.
 #[derive(FromBytes, IntoBytes, Immutable, KnownLayout)]
 #[repr(C)]
@@ -227,6 +247,7 @@ const _: () = {
     assert!(size_of::<MadtIoApic>() == 12);
     assert!(size_of::<MadtInterruptOverride>() == 10);
     assert!(size_of::<MadtLocalApicNmi>() == 6);
+    assert!(size_of::<McfgAllocation>() == 16);
 };
 
 /// The length field of a MADT entry.
@@ -269,8 +290,9 @@ impl Layout {
     }
 }
 
-/// The DSDT: \_S5 and the legacy devices, with their PNP IDs and resources (Linux finds
-/// them without, but its defaults do not always match, e.g., the RTC's IRQ).
+/// The DSDT: \_S5, the legacy devices, with their PNP IDs and resources (Linux finds
+/// them without, but its defaults do not always match, e.g., the RTC's IRQ), and the PCI
+/// host bridge.
 fn dsdt() -> Vec<u8> {
     let s5 = u64::from(pm1::S5_SLP_TYP);
     let aml = aml::term_list(&[
@@ -311,9 +333,11 @@ fn dsdt() -> Vec<u8> {
                         ),
                     ],
                 ),
-                // Motherboard resources: the PM1 blocks' ports (the FADT points to them).
+                // Motherboard resources: the PM1 blocks' ports (the FADT points to them)
+                // and the ECAM region (Linux only uses the MCFG's regions that are
+                // reserved here).
                 aml::device(
-                    "PM1",
+                    "MBRD",
                     &[
                         aml::name("_HID", aml::eisa_id("PNP0C02")),
                         aml::name(
@@ -321,6 +345,26 @@ fn dsdt() -> Vec<u8> {
                             aml::resource_template(&[
                                 aml::io(PM1A_EVT_BLK, pm1::EVT_LEN),
                                 aml::io(PM1A_CNT_BLK, pm1::CNT_LEN),
+                                aml::memory32_fixed(PCI_ECAM_BASE as u32, pci::ECAM_SIZE as u32),
+                            ]),
+                        ),
+                    ],
+                ),
+                // A conventional PCI host bridge (no PCIe, such that Linux does not need
+                // _OSC): bus 0 and the memory window for the BARs. The devices only
+                // interrupt with MSI-X, so there is no _PRT.
+                aml::device(
+                    "PCI0",
+                    &[
+                        aml::name("_HID", aml::eisa_id("PNP0A03")),
+                        aml::name("_UID", aml::integer(0)),
+                        aml::name("_SEG", aml::integer(0)),
+                        aml::name("_BBN", aml::integer(0)),
+                        aml::name(
+                            "_CRS",
+                            aml::resource_template(&[
+                                aml::word_bus_number(0, 0),
+                                aml::dword_memory(PCI_MMIO_BASE as u32, PCI_MMIO_SIZE as u32),
                             ]),
                         ),
                     ],
@@ -412,6 +456,20 @@ fn madt(num_cpus: u32) -> Vec<u8> {
     sdt(b"APIC", 5, &body)
 }
 
+/// The MCFG: the ECAM region of bus 0 (of segment 0).
+fn mcfg() -> Vec<u8> {
+    let mut body = Mcfg { reserved: [0; 8] }.as_bytes().to_vec();
+    let allocation = McfgAllocation {
+        base: PCI_ECAM_BASE.into(),
+        segment: 0.into(),
+        start_bus: 0,
+        end_bus: 0,
+        reserved: 0.into(),
+    };
+    body.extend_from_slice(allocation.as_bytes());
+    sdt(b"MCFG", 1, &body)
+}
+
 /// Writes the tables to `address`, with the RSDP first (16-byte aligned, such that Linux
 /// also finds it when it scans the BIOS area).
 pub(crate) fn write(memory: &GuestMemory, address: u64, num_cpus: u32) -> Result<(), MemoryError> {
@@ -423,7 +481,8 @@ pub(crate) fn write(memory: &GuestMemory, address: u64, num_cpus: u32) -> Result
     let facs = layout.add(facs().as_bytes(), 64);
     let fadt = layout.add(&fadt(facs, dsdt), 8);
     let madt = layout.add(&madt(num_cpus), 8);
-    let entries = [U64::new(fadt), U64::new(madt)];
+    let mcfg = layout.add(&mcfg(), 8);
+    let entries = [U64::new(fadt), U64::new(madt), U64::new(mcfg)];
     let xsdt = layout.add(&sdt(b"XSDT", 1, entries.as_bytes()), 8);
 
     let mut rsdp = Rsdp {

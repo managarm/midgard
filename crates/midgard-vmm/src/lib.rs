@@ -27,6 +27,7 @@ mod devices;
 mod host;
 mod logging;
 mod machine;
+mod pci;
 mod platform;
 mod vcpu;
 mod virtio;

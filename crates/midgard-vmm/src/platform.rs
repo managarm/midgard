@@ -2,7 +2,7 @@
 //! which I/O ports and which interrupt lines its devices use. Keeping them in one place
 //! makes it easy to see that nothing overlaps.
 
-use crate::virtio;
+use crate::{pci, virtio};
 
 // Guest-physical memory. RAM starts at zero; the MMIO hole is at the top of the 4 GiB.
 
@@ -17,6 +17,11 @@ pub(crate) const HIGH_MEMORY: u64 = 0x10_0000;
 pub(crate) const MAX_LOW_RAM: u64 = 0xC000_0000;
 /// The first virtio-mmio device; each one has [`virtio::MMIO_SIZE`] bytes.
 pub(crate) const VIRTIO_BASE: u64 = 0xD000_0000;
+/// The memory window of the PCI host bridge, where the devices' BARs are.
+pub(crate) const PCI_MMIO_BASE: u64 = 0xE000_0000;
+pub(crate) const PCI_MMIO_SIZE: u64 = 0x1000_0000;
+/// The PCI bus' configuration space (ECAM, [`pci::ECAM_SIZE`] bytes).
+pub(crate) const PCI_ECAM_BASE: u64 = 0xF000_0000;
 /// The I/O APIC (24 pins, ID 0), which the hypervisor emulates (the backends put it at
 /// its default base).
 pub(crate) const IOAPIC_BASE: u64 = midgard_hv::x86::IOAPIC_BASE;
@@ -56,7 +61,9 @@ const _: () = {
         i += 1;
     }
     assert!(MAX_LOW_RAM <= VIRTIO_BASE);
-    assert!(VIRTIO_BASE + VIRTIO_IRQS.len() as u64 * virtio::MMIO_SIZE <= IOAPIC_BASE);
+    assert!(VIRTIO_BASE + VIRTIO_IRQS.len() as u64 * virtio::MMIO_SIZE <= PCI_MMIO_BASE);
+    assert!(PCI_MMIO_BASE + PCI_MMIO_SIZE <= PCI_ECAM_BASE);
+    assert!(PCI_ECAM_BASE + pci::ECAM_SIZE <= IOAPIC_BASE);
     assert!(IOAPIC_BASE + IOAPIC_SIZE <= LAPIC_BASE);
     assert!(LAPIC_BASE + LAPIC_SIZE <= midgard_hv::RESERVED_BASE);
 };
