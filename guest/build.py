@@ -8,7 +8,8 @@ initramfs, and the distributions' disk images.
 
 The targets are `kernel` (guest/kernel.toml and guest/linux.config), `agent`
 (guest-crates/midgard-init and guest-crates/midgard-agent as static binaries, with the
-versions of the guest protocol that they speak in agent.json), `waypipe`
+versions of the guest protocol that they speak in agent.json, and guest/boot.toml, which
+tells midgard what the boot files are), `waypipe`
 (guest/waypipe.toml, a static binary, too) and the images in guest/images/<name>: image.toml
 says how to bootstrap the root file system, the files in overlay/ are copied into it, and
 `provision`, a shell script, runs in a chroot of it (as root, with the network), e.g., to
@@ -70,6 +71,8 @@ CHANNEL_FORMAT = 1
 BOOT_TARGETS = ["kernel", "agent", "waypipe"]
 # The boot files of midgard that their files are (see crates/midgard/src/boot.rs).
 BOOT_FILES = "linux"
+# What tells midgard what they are and how the guests boot with them.
+BOOT_DESCRIPTION = "boot.toml"
 # The agent and the guest's waypipe are static binaries, which run in any distribution.
 RUST_TARGET = "x86_64-unknown-linux-musl"
 CRATES = REPO / "crates"
@@ -151,6 +154,7 @@ def inputs(target):
         files += [GUEST / "kernel.toml", GUEST / "linux.config"]
     elif target == "agent":
         # (With the crate of the guest protocol, which they are built with.)
+        files += [GUEST / BOOT_DESCRIPTION]
         files += [GUEST_CRATES / "Cargo.toml", GUEST_CRATES / "Cargo.lock"]
         crates = [GUEST_CRATES / crate for crate in AGENT_CRATES] + [CRATES / "midgard-protocol"]
         for crate in crates:
@@ -301,7 +305,8 @@ def cargo_build(manifest, name, *args, env={}):
 
 def build_agent(out):
     """Builds midgard-init and midgard-agent and asks the latter which versions of the
-    guest protocol they speak (see crates/midgard-protocol/src/version.rs)."""
+    guest protocol they speak (see crates/midgard-protocol/src/version.rs). The boot files'
+    description comes with them: it has the kernel command line, which midgard-init reads."""
     log("building " + " and ".join(AGENT_CRATES))
     release = cargo_build(GUEST_CRATES / "Cargo.toml", "guest")
     for crate in AGENT_CRATES:
@@ -314,7 +319,9 @@ def build_agent(out):
         raise Failure(
             f"midgard-agent protocol printed {' '.join(answer)!r} instead of two versions"
         )
-    return AGENT_CRATES, {"protocol": {"oldest": int(answer[0]), "current": int(answer[1])}}
+    shutil.copyfile(GUEST / BOOT_DESCRIPTION, out / BOOT_DESCRIPTION)
+    protocol = {"oldest": int(answer[0]), "current": int(answer[1])}
+    return AGENT_CRATES + [BOOT_DESCRIPTION], {"protocol": protocol}
 
 
 def build_waypipe(out):

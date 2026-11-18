@@ -9,10 +9,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use midgard_protocol::control::InstanceInfo;
-use midgard_protocol::machine::{ConsoleKind, Disk, MachineConfig};
+use midgard_protocol::machine::{Disk, MachineConfig};
 use midgard_protocol::runtime;
 
-use crate::boot::{self, BootFiles};
+use crate::boot::{self, Agent, BootFiles};
 use crate::settings::{self, Role, Settings};
 use crate::template::Template;
 use crate::{log, paths, pull};
@@ -85,24 +85,25 @@ impl Instance {
         let name = self.settings.boot_files.as_deref().unwrap_or(boot::DEFAULT);
         let boot = BootFiles::load(name)?;
         boot.check()?;
+        let description = &boot.description;
         Ok(MachineConfig {
-            kernel: boot.kernel,
-            initrd: None,
-            agent: Some(boot.agent),
-            agent_in_image: false,
-            cmdline: None,
+            kernel: boot.kernel(),
+            initrd: boot.initrd(),
+            agent: boot.agent(),
+            agent_in_image: description.agent == Agent::Image,
+            cmdline: description.cmdline.clone(),
             append: Vec::new(),
             memory: self.settings.memory.unwrap_or(DEFAULT_MEMORY),
             cpus: None,
-            console: ConsoleKind::Virtio,
+            console: description.console,
             disks: vec![Disk {
                 path: self.disk(),
                 read_only: false,
             }],
             network: true,
-            share: Some("/".into()),
+            share: description.share.then(|| "/".into()),
             guest: self.settings.guest.clone(),
-            waypipe: boot.waypipe,
+            waypipe: boot.waypipe(),
         })
     }
 }

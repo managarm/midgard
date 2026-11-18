@@ -120,8 +120,8 @@ impl Channel {
         // What we cannot name is not for us (e.g., a newer midgard allows more names): we
         // leave it out instead of rejecting the channel.
         channel.boot.retain(|name, boot| {
-            let valid =
-                validate_name(name).is_ok() && boot.files.keys().all(|file| file_name(file));
+            let valid = validate_name(name).is_ok()
+                && boot.files.keys().all(|file| boot::is_file_name(file));
             if !valid {
                 log!("ignoring the channel's boot files {name:?}, whose names are invalid");
             }
@@ -136,17 +136,6 @@ impl Channel {
         });
         Ok(channel)
     }
-}
-
-/// Whether `name` can be a file of boot files: a plain name that is none of our own (those
-/// start with a dot, or are the manifest).
-fn file_name(name: &str) -> bool {
-    !name.is_empty()
-        && !name.starts_with('.')
-        && name != boot::MANIFEST
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
 }
 
 /// Where a channel or one of its files is.
@@ -420,33 +409,51 @@ fn pull_boot(
             .files
             .insert(file.clone(), info.sha256.to_ascii_lowercase());
     }
-    let missing: Vec<_> = boot::REQUIRED
-        .into_iter()
-        .filter(|file| !wanted.files.contains_key(*file))
-        .collect();
-    if !missing.is_empty() {
-        bail!(
-            "the channel's boot files {name} lack {}, which is not installed either",
-            missing.join(" and ")
-        );
-    }
+    // The boot files' description says which files they need.
+    let complete = |dir: &Path| {
+        let description = boot::read_description(dir)
+            .with_context(|| format!("cannot use the channel's boot files {name}"))?;
+        let missing: Vec<_> = description
+            .required()
+            .into_iter()
+            .filter(|file| !wanted.files.contains_key(*file))
+            .collect();
+        if !missing.is_empty() {
+            bail!(
+                "the channel's boot files {name} lack {}, which is not installed either",
+                missing.join(" and ")
+            );
+        }
+        Ok(())
+    };
     let item = PullItem::BootFiles(name.to_string());
     if installed == wanted {
+        complete(&dir)?;
         return report(PullEvent::UpToDate(item));
     }
     let stage = stage(root, name)?;
     let result = (|| {
-        for (file, sha256) in &wanted.files {
+        let fetch = |file: &String, report: &mut Report| {
             let to = stage.join(file);
             match entry.files.get(file) {
-                Some(info) if installed.files.get(file) != Some(sha256) => {
-                    source.download(info, file, &to, report)?;
+                Some(info) if installed.files.get(file) != Some(&wanted.files[file]) => {
+                    source.download(info, file, &to, report)
                 }
-                _ => {
-                    copy_synced(&dir.join(file), &to)
-                        .with_context(|| format!("failed to write {to:?}"))?;
-                }
+                _ => copy_synced(&dir.join(file), &to)
+                    .with_context(|| format!("failed to write {to:?}")),
             }
+        };
+        // The description first, such that we do not download files to no avail.
+        let (description, rest): (Vec<_>, Vec<_>) = wanted
+            .files
+            .keys()
+            .partition(|file| *file == boot::DESCRIPTION);
+        for file in description {
+            fetch(file, report)?;
+        }
+        complete(&stage)?;
+        for file in rest {
+            fetch(file, report)?;
         }
         boot::write_manifest(&stage, &wanted)?;
         install(&stage, root, name)
@@ -801,6 +808,49 @@ mod tests {
         let manifest = boot::read_manifest(&installed).unwrap();
         assert_eq!(manifest.files["vmlinuz"], sha256(b"kernel"));
         assert!(manifest.protocol.is_some());
+
+        // Boot files say themselves what they need: these lack what Linux's need.
+        let description: &[u8] = b"kernel = \"eir\"\ninitrd = \"initrd.cpio\"\nagent = \"image\"\n";
+        let files = |files: &[(&str, &[u8])]| {
+            let files: Vec<_> = files
+                .iter()
+                .map(|(name, data)| {
+                    format!("\"{name}\": {{{}}}", publish(&channel_dir, name, data))
+                })
+                .collect();
+            let text = format!(
+                r#"{{"format": 1, "boot": {{"other": {{"files": {{{}}}}}}}}}"#,
+                files.join(", ")
+            );
+            std::fs::write(channel_dir.join(CHANNEL_FILE), text).unwrap();
+            Source::open(Some(channel_dir.to_str().unwrap())).unwrap()
+        };
+        let source = files(&[("boot.toml", description), ("eir", b"eir")]);
+        let boot_entry = &source.channel.boot["other"];
+        let error = pull_boot(&source, &boot_root, "other", boot_entry, &mut report);
+        let error = format!("{:#}", error.unwrap_err());
+        assert!(error.contains("lack initrd.cpio"), "{error}");
+        let source = files(&[
+            ("boot.toml", description),
+            ("eir", b"eir"),
+            ("initrd.cpio", b"initrd"),
+        ]);
+        let boot_entry = &source.channel.boot["other"];
+        pull_boot(&source, &boot_root, "other", boot_entry, &mut report).unwrap();
+        let other = boot_root.join("other");
+        assert_eq!(std::fs::read(other.join("boot.toml")).unwrap(), description);
+        assert_eq!(std::fs::read(other.join("eir")).unwrap(), b"eir");
+        // A description that we cannot read stays out.
+        let source = files(&[("boot.toml", b"kernel = 1"), ("eir", b"eir")]);
+        let boot_entry = &source.channel.boot["other"];
+        let error = pull_boot(&source, &boot_root, "other", boot_entry, &mut report);
+        let error = format!("{:#}", error.unwrap_err());
+        assert!(
+            error.contains("cannot use the channel's boot files other"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(other.join("boot.toml")).unwrap(), description);
+        assert_eq!(paths::names(&boot_root), ["linux", "other"]);
 
         // bifrost went away.
         let mut report = |_| bail!("gone");

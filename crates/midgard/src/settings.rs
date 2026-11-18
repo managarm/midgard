@@ -222,23 +222,29 @@ fn validate_user(user: &str) -> Result<()> {
     Ok(())
 }
 
-/// The format of a settings file, which is all that we read of a file of a newer format.
+/// The format of a file, which is all that we read of a file of a newer format.
 #[derive(Deserialize)]
 struct Header {
     format: Option<u32>,
 }
 
-/// Parses a settings file.
-pub fn parse(text: &str, role: Role) -> Result<Settings> {
+/// Checks the format of a file (TOML with `format`) of which we read the formats up to
+/// `newest`.
+pub fn check_format(text: &str, newest: u32) -> Result<()> {
     let header: Header = toml::from_str(text)?;
     match header.format {
         Some(0) => bail!("format must be at least 1"),
-        Some(format) if format > FORMAT => bail!(
+        Some(format) if format > newest => bail!(
             "it has the format {format}, which needs a newer midgard (this one reads up to \
-             format {FORMAT})"
+             format {newest})"
         ),
-        _ => {}
+        _ => Ok(()),
     }
+}
+
+/// Parses a settings file.
+pub fn parse(text: &str, role: Role) -> Result<Settings> {
+    check_format(text, FORMAT)?;
     let file: SettingsFile = toml::from_str(text)?;
     if role == Role::Template && file.template.name.is_some() {
         bail!("[template] name is only for instance files (a template's directory names it)");

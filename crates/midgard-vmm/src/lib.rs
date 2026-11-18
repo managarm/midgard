@@ -32,5 +32,11 @@ mod platform;
 mod vcpu;
 mod virtio;
 
+/// The addresses of the guest's network, which is the same in every VM (e.g., for kernel
+/// parameters that configure the guest's interface).
+pub mod network {
+    pub use crate::host::net::{DNS_IP, GUEST_IP, HOST_IP, NETMASK};
+}
+
 pub use machine::{Machine, MachineHandle, Stop, start, validate_memory};
 pub use virtio::vsock::{VsockListener, VsockStream};

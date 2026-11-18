@@ -132,6 +132,38 @@ pub fn vsock_listen(port: u32) -> Result<RawFd, Error> {
     }
 }
 
+/// A pidfd for `pid` (or -1 with errno set). Linux's musl lacks the wrapper; Managarm has
+/// it, but no syscall().
+pub fn pidfd_open(pid: i32) -> RawFd {
+    // SAFETY: pidfd_open() only takes numbers.
+    #[cfg(target_os = "linux")]
+    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) } as RawFd;
+    // SAFETY: pidfd_open() only takes numbers.
+    #[cfg(target_os = "managarm")]
+    let pidfd = unsafe { libc::pidfd_open(pid, 0) };
+    pidfd
+}
+
+/// Sends `signal` to the process of `pidfd`.
+pub fn pidfd_send_signal(pidfd: RawFd, signal: i32) {
+    // SAFETY: pidfd_send_signal() takes no siginfo_t (null) and no flags.
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            pidfd,
+            signal,
+            std::ptr::null::<libc::siginfo_t>(),
+            0,
+        )
+    };
+    // SAFETY: pidfd_send_signal() takes no siginfo_t (null) and no flags.
+    #[cfg(target_os = "managarm")]
+    unsafe {
+        libc::pidfd_send_signal(pidfd, signal, std::ptr::null_mut(), 0)
+    };
+}
+
 pub fn accept(listener: RawFd) -> std::io::Result<RawFd> {
     // SAFETY: We do not need the peer's address.
     let fd = unsafe {

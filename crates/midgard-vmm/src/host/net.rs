@@ -37,16 +37,21 @@ use smoltcp::wire::{
 use crate::host::ping::PingSocket;
 use crate::logging::{ReportOnce, log};
 
-pub(crate) const GUEST_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 15);
-pub(crate) const HOST_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 2);
-pub(crate) const DNS_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 3);
+/// The guest's address.
+pub const GUEST_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 15);
+/// The guest's network mask.
+pub const NETMASK: Ipv4Addr = Ipv4Addr::new(255, 255, 255, 0);
+/// The guest's gateway, which is the host (its loopback interface).
+pub const HOST_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 2);
+/// The guest's DNS server (the host's).
+pub const DNS_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 3);
 const BROADCAST_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 255);
 pub(crate) const GUEST_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
 const GATEWAY_MAC: [u8; 6] = [0x52, 0x55, 0x0A, 0x00, 0x02, 0x02];
 
 /// The kernel parameter that configures the guest's interface.
 pub(crate) fn kernel_parameter() -> String {
-    format!("ip={GUEST_IP}::{HOST_IP}:255.255.255.0:midgard:eth0:off:{DNS_IP}")
+    format!("ip={GUEST_IP}::{HOST_IP}:{NETMASK}:midgard:eth0:off:{DNS_IP}")
 }
 
 const TCP_BUFFER: usize = 64 * 1024;

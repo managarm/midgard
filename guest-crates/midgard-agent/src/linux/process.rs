@@ -11,7 +11,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 use async_io::Async;
 
-use super::sys::{Error, cstring};
+use super::sys::{self, Error, cstring};
 use super::{log, rt};
 
 /// The stdin / stdout / stderr of a new process.
@@ -101,16 +101,7 @@ impl Child {
 
     /// Sends `signal` to the process.
     pub fn kill(&self, signal: i32) {
-        // SAFETY: pidfd_send_signal() takes no siginfo_t (null) and no flags.
-        unsafe {
-            libc::syscall(
-                libc::SYS_pidfd_send_signal,
-                self.pidfd.as_raw_fd(),
-                signal,
-                std::ptr::null::<libc::siginfo_t>(),
-                0,
-            )
-        };
+        sys::pidfd_send_signal(self.pidfd.as_raw_fd(), signal);
     }
 }
 
@@ -227,8 +218,7 @@ pub fn spawn(command: &Command, stdio: &Stdio) -> Result<Child, Error> {
         }
     }
 
-    // SAFETY: pidfd_open() only takes numbers.
-    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) } as RawFd;
+    let pidfd = sys::pidfd_open(pid);
     let pidfd_error = std::io::Error::last_os_error();
     // SAFETY: We own the write end; reading the errno is plain I/O.
     let errno = unsafe {

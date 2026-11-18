@@ -1,0 +1,10 @@
+# What midgard's boot files linux are and how the guests boot with them (see
+# crates/midgard/src/boot.rs): build.py puts this file into them, with the agent.
+
+kernel = "vmlinuz"
+agent = "initramfs"
+waypipe = "guest-waypipe"
+console = "virtio"
+# The guest's console and its network. (midgard-init mounts the first disk as the root
+# file system.)
+cmdline = "reboot=k panic=-1 console=hvc0 ip={guest-ip}::{gateway}:{netmask}:midgard:eth0:off:{dns}"

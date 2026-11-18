@@ -2,7 +2,7 @@
 name = "midgard-agent"
 version = "0.1.0"
 edition = "2024"
-description = "midgard's guest agent in the Linux VMs: runs sessions for the CLI"
+description = "midgard's guest agent in the Linux and Managarm VMs: runs sessions for the CLI"
 license = "MIT"
 
 [dependencies]

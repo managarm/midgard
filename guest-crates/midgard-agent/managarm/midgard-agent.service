@@ -1,0 +1,16 @@
+# midgard-agent in Managarm guests, which ship it in their image (see main.rs). midgard puts
+# midgard.agent on the kernel command line of the guests that it gives a vsock device.
+[Unit]
+Description=midgard's guest agent
+ConditionKernelCommandLine=midgard.agent
+# The agent cannot reach midgard until udev started vsockserver, so we retry until it can.
+StartLimitIntervalSec=0
+
+[Service]
+# (The agent installs itself in /run/midgard, where midgard-init puts it in Linux guests.)
+ExecStart=/usr/libexec/midgard/midgard-agent serve
+Restart=on-failure
+RestartSec=1
+
+[Install]
+WantedBy=multi-user.target

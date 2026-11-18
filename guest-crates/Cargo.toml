@@ -1,5 +1,6 @@
-# The crates that run in midgard's Linux guests. They are a workspace of their own (see
-# ../Cargo.toml) because they get built as statically linked musl binaries.
+# The crates that run in midgard's guests. They are a workspace of their own (see
+# ../Cargo.toml) because they get built for the guests: as statically linked musl binaries
+# for Linux guests, and by bootstrap-managarm for Managarm guests (midgard-agent only).
 [workspace]
 resolver = "3"
 members = ["midgard-agent", "midgard-init"]

@@ -19,6 +19,10 @@ use sys::{Error, mount};
 /// The PATH of the commands that we run.
 const PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
+/// The root file system's device unless the kernel command line names one: the first
+/// disk.
+const DEFAULT_ROOT: &str = "/dev/vda";
+
 /// Logs a line to the console, in one write: the distribution's init writes there, too.
 macro_rules! log {
     ($($arg:tt)*) => {{
@@ -42,10 +46,12 @@ pub fn main() {
     }
 }
 
-/// Returns the value of `name=` on the kernel command line.
+/// Returns the value of `name=` on the kernel command line (of the last one, such that
+/// what is appended to the command line overrides what is in front of it).
 fn parameter(cmdline: &str, name: &str) -> Option<String> {
     cmdline
         .split_whitespace()
+        .rev()
         .find_map(|p| p.strip_prefix(name)?.strip_prefix('=').map(str::to_string))
 }
 
@@ -61,8 +67,7 @@ fn boot() -> Result<()> {
     // First of all, whether midgard and we fit together: the rest depends on it.
     let config = fetch_config()?;
     let cmdline = std::fs::read_to_string("/proc/cmdline").context("reading /proc/cmdline")?;
-    let root = parameter(&cmdline, param::ROOT)
-        .with_context(|| format!("no {}= parameter", param::ROOT))?;
+    let root = parameter(&cmdline, param::ROOT).unwrap_or_else(|| DEFAULT_ROOT.into());
     let fstype = parameter(&cmdline, param::ROOT_FSTYPE).unwrap_or_else(|| "ext4".into());
     let agent = load_agent()?;
     let waypipe = display::load();
@@ -293,5 +298,19 @@ fn mount_share() {
         Err(Error::Os { error, .. })
             if matches!(error.raw_os_error(), Some(libc::EINVAL | libc::ENODEV)) => {}
         Err(error) => log!("{error}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parameters() {
+        let cmdline = "console=hvc0 midgard.root=/dev/vda quiet midgard.root=/dev/vdb\n";
+        assert_eq!(parameter(cmdline, param::ROOT).as_deref(), Some("/dev/vdb"));
+        assert_eq!(parameter(cmdline, "console").as_deref(), Some("hvc0"));
+        assert_eq!(parameter(cmdline, param::ROOT_FSTYPE), None);
+        assert_eq!(parameter(cmdline, "quiet"), None);
     }
 }

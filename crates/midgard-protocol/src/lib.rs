@@ -49,7 +49,7 @@ pub const SHARE_MOUNT: &str = "/mnt/managarm";
 
 /// Kernel parameters that midgard passes to the agent.
 pub mod param {
-    /// The root file system's device.
+    /// The root file system's device (default: /dev/vda, the first disk).
     pub const ROOT: &str = "midgard.root";
     /// The root file system's type (default: ext4).
     pub const ROOT_FSTYPE: &str = "midgard.rootfstype";
