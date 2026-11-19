@@ -1,0 +1,30 @@
+# Managarm: the base system of the nightly xbps repository with midgard's agent, which
+# Managarm starts itself (with systemd), and the guest's waypipe. Managarm configures the
+# packages when an instance boots for the first time. The static xbps is the one that
+# bootstrap-managarm's xbstrap uses, and provision-sysroot.py and the repository's key come
+# from bootstrap-managarm.
+
+[bootstrap]
+method = "managarm"
+channel = "nightly"
+packages = ["base", "midgard-agent", "waypipe"]
+
+[bootstrap.xbps]
+url = "https://repo-default.voidlinux.org/static/xbps-static-static-0.60.4_1.x86_64-musl.tar.xz"
+sha256 = "603b3c55e9cabd5af79b461b929b14e1556a443c97b5714d188681c2172d9e28"
+
+[bootstrap.provision-sysroot]
+url = "https://raw.githubusercontent.com/managarm/bootstrap-managarm/156c5e94ae6f4bda0d808af572089494767c5be9/extrafiles/managarm-scripts/provision-sysroot.py"
+sha256 = "f6b3d465fe9bab579873628fdd5304c3aa0e2abd3cc0e73afbb58adb4adbb8ec"
+
+[bootstrap.key]
+url = "https://raw.githubusercontent.com/managarm/bootstrap-managarm/156c5e94ae6f4bda0d808af572089494767c5be9/extrafiles/managarm-scripts/xbps-keys/5d:d2:5b:a6:50:95:c7:b9:a4:10:e4:63:39:d0:b8:c5.plist"
+sha256 = "8bbaacadb57d3e9bf3851c92df1109b13d7304ed59cbecb0270eafe2a018aedf"
+
+# Managarm mounts the first partition of its root type (without root= on the kernel
+# command line), and only ext2. The partition's UUID is the one that
+# overlay/etc/managarm/partitions.toml names.
+[disk]
+file-system = "ext2"
+partition-type = "64212B3B-56A1-4DFB-971E-BC8CD027996A"
+partition-uuid = "326d940d-86c3-47ae-92fe-d0a321aa3977"

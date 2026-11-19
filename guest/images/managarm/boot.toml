@@ -1,0 +1,10 @@
+# The boot files managarm, which the Managarm image's instances boot with (boot-files copies
+# them out of the image): eir boots through multiboot2, and the image starts midgard's agent.
+
+kernel = "eir-mb2"
+initrd = "initrd.cpio"
+agent = "image"
+# Managarm has neither a virtio-console nor a virtio-fs driver.
+console = "serial"
+share = false
+cmdline = "serial netserver.ip={guest-ip} netserver.subnet={netmask} netserver.gateway={gateway}"

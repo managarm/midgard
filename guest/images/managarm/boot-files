@@ -1,0 +1,10 @@
+# Copies the boot files out of the image (rootfs.py runs it on the host, as root in its user
+# namespace, with the root file system and the directory that the boot files go to): eir,
+# which midgard boots through multiboot2, and the initrd, which Managarm's gen-initrd.py packs
+# from the image's files.
+
+root=$1
+out=$2
+cp "$root/usr/managarm/bin/eir-mb2" "$out/"
+python3 "$root/usr/managarm/bin/gen-initrd.py" --triple x86_64-managarm --sysroot "$root" \
+    -o "$out/initrd.cpio"

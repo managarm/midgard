@@ -1,0 +1,12 @@
+# The settings of the VM instances made from the Managarm image: bifrost create copies this
+# file into each instance, with the user that sessions run as (which user-setup creates).
+# They boot with the image's boot files.
+
+memory = "2G"
+boot-files = "managarm"
+
+[template]
+description = "Managarm (nightly)"
+
+[guest]
+user-setup = ["/etc/midgard/user-setup"]

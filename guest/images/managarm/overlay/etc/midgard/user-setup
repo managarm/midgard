@@ -1,0 +1,6 @@
+#!/bin/sh
+# Creates midgard's default user (midgard's agent runs this as root on every boot, once the
+# guest booted and before sessions run: `user-setup`).
+set -eu
+user=$1
+id "$user" >/dev/null 2>&1 || useradd -m -s /bin/bash "$user"

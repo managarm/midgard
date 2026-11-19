@@ -1,0 +1,5 @@
+# The root partition (see [disk] in image.toml). Without an ESP, update-boot.py update-esp,
+# which the packages run when they are installed, leaves the boot files alone: midgard boots
+# the instances with the boot files that come with the image.
+[root]
+partuuid = "326d940d-86c3-47ae-92fe-d0a321aa3977"
