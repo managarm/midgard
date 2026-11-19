@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
-"""Creates the root file system of one of midgard's images (guest/images/<name>) as an ext4
-file system: it bootstraps the root file system as image.toml's [bootstrap] table says,
-copies the overlay into it, runs the provision script in a chroot of it and creates the
-file system (mke2fs -d).
+"""Creates the disk of one of midgard's images (guest/images/<name>): it bootstraps the root
+file system as image.toml's [bootstrap] table says, copies the overlay into it, runs the
+provision script in a chroot of it, copies the boot files out of it (with the boot-files
+script, if the image has one) and creates the file system (mke2fs -d) as image.toml's
+[disk] table says.
 
-    rootfs.py build <recipe> <work dir> <bootstrap>
+    rootfs.py build <recipe> <work dir> <image>
 
 build.py runs it as root in a user namespace (unshare --map-root-user --map-auto), such
 that the files can have any owner and the package managers can run the packages' scripts.
-<bootstrap> is the [bootstrap] table as JSON, in which build.py added the paths of the
-downloads (`file`). The root file system is in <work dir>/root while it is built (a build
-that was killed leaves it behind; the next one removes it), and the file system is
-<work dir>/root.ext4.
+<image> is image.toml as JSON, in which build.py added the paths of the downloads
+(`file`). The root file system is in <work dir>/root while it is built (a build that was
+killed leaves it behind; the next one removes it), the disk is <work dir>/disk.raw and the
+boot files are in <work dir>/boot.
 """
 
 import argparse
@@ -24,9 +25,10 @@ import subprocess
 import sys
 from pathlib import Path
 
-# The size of the images' file systems (which are sparse, so this only limits what the
-# disks can hold).
+# The size of the images' disks (which are sparse, so this only limits what they can hold).
 IMAGE_SIZE = 64 << 30
+# Where the partition of disks with a partition table starts (in sectors of 512 bytes).
+PARTITION_START = 2048
 # The environment of commands in chroots of images.
 CHROOT_ENV = {
     "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
@@ -130,6 +132,33 @@ def bootstrap(spec, root, work):
             f"--keyring={keyring}/usr/share/keyrings/debian-archive-keyring.gpg",
             f"--include={','.join(spec['include'])}", spec["suite"], root, spec["mirror"],
         )  # fmt: skip
+    elif method == "managarm":
+        # Managarm's packages from its xbps repository (`channel`), installed as
+        # bootstrap-managarm's managarm-install.py does: with a static xbps, and with its
+        # provision-sysroot.py, which sets up the repository (with its key) and the system
+        # users. The packages stay unconfigured (their scripts are Managarm programs):
+        # Managarm configures them when it boots for the first time.
+        require("systemd-sysusers", "xz")
+        xbps = work / "xbps"
+        scripts = work / "managarm-scripts"
+        xbps.mkdir()
+        (scripts / "xbps-keys").mkdir(parents=True)
+        run("tar", "-xJf", spec["xbps"]["file"], "-C", xbps)
+        # (provision-sysroot.py reads the keys next to it, by the names in the repository.)
+        provision_sysroot = scripts / "provision-sysroot.py"
+        shutil.copyfile(spec["provision-sysroot"]["file"], provision_sysroot)
+        key = spec["key"]["url"].rsplit("/", 1)[1]
+        shutil.copyfile(spec["key"]["file"], scripts / "xbps-keys" / key)
+        apply = [sys.executable, provision_sysroot, "apply", "--root", root]
+        run(*apply, "--arch", "x86_64", f"--xbps-{spec['channel']}")
+        # (Not into the image's package cache.)
+        run(
+            xbps / "usr/bin/xbps-install", "-y", "-S", "-U", "-r", root,
+            "-C", root / "etc/xbps.d", "-c", work / "xbps-cache", *spec["packages"],
+            env=dict(os.environ, XBPS_TARGET_ARCH="x86_64"),
+        )  # fmt: skip
+        # (After the packages, which ship the users' sysusers.d files.)
+        run(*apply, "--base-dirs", "--sysusers")
     else:
         raise Failure(f"there is no bootstrap method {method}")
 
@@ -207,10 +236,16 @@ def provision(root, script):
         in_image(root, ".midgard-provision").unlink()
 
 
-def finish(root, name):
+def finish(recipe, root, name):
     """What every image gets. midgard-init configures the network (it writes
-    /etc/resolv.conf) and sets the host name from /etc/hostname."""
-    in_image(root, "etc/resolv.conf").unlink(missing_ok=True)
+    /etc/resolv.conf) and sets the host name from /etc/hostname. Guests that start the
+    agent themselves (without midgard-init) keep the /etc/resolv.conf of their overlay
+    (the bootstrap and provision may have replaced it)."""
+    resolv_conf = recipe / "overlay/etc/resolv.conf"
+    if resolv_conf.is_file():
+        write_file(root, "etc/resolv.conf", resolv_conf.read_bytes())
+    else:
+        in_image(root, "etc/resolv.conf").unlink(missing_ok=True)
     write_file(root, "etc/hostname", f"{name}\n".encode())
     hosts = (
         f"127.0.0.1\tlocalhost\n127.0.1.1\t{name}\n::1\t\tlocalhost ip6-localhost ip6-loopback\n"
@@ -218,39 +253,72 @@ def finish(root, name):
     write_file(root, "etc/hosts", hosts.encode())
 
 
+def copy_boot_files(recipe, root, boot):
+    """Runs an image's boot-files script on the host, with the root file system and the
+    directory that the boot files go to (in namespaces of its own, such that nothing that
+    it started outlives it)."""
+    boot.mkdir()
+    in_namespaces("/bin/sh", "-eu", recipe / "boot-files", root, boot)
+
+
+def create_disk(spec, root, disk, name):
+    """Creates the disk with the root file system as image.toml's [disk] table says: the
+    file system (`file-system`, default: ext4) takes all of the disk, or the one partition
+    of a GPT if the table has the partition's type (`partition-type`; with its UUID,
+    `partition-uuid`, if the table has one)."""
+    file_system = spec.get("file-system", "ext4")
+    with open(disk, "wb") as file:
+        file.truncate(IMAGE_SIZE)
+    # The inode tables and the journal are zeroed now (as holes in the sparse file), such
+    # that the guest kernel does not initialize them later (which would grow the disk).
+    options = ["lazy_itable_init=0", "lazy_journal_init=0"]
+    size = []
+    if partition_type := spec.get("partition-type"):
+        require("sfdisk")
+        entry = f"start={PARTITION_START}, type={partition_type}"
+        if partition_uuid := spec.get("partition-uuid"):
+            entry += f", uuid={partition_uuid}"
+        table = f"label: gpt\n{entry}\n"
+        run("sfdisk", "-q", disk, input=table.encode(), stdout=subprocess.DEVNULL)
+        dump = subprocess.run(["sfdisk", "-J", disk], check=True, capture_output=True, text=True)
+        (partition,) = json.loads(dump.stdout)["partitiontable"]["partitions"]
+        options.append(f"offset={partition['start'] * 512}")
+        size = [f"{partition['size'] * 512 // 1024}k"]
+    run(
+        "mke2fs", "-q", "-t", file_system, "-b", "4096", "-L", name, "-E", ",".join(options),
+        "-d", root, disk, *size,
+    )  # fmt: skip
+
+
 def cmd_build(args):
     recipe = args.recipe.resolve()
     name = recipe.name
     work = args.work.resolve()
-    spec = json.loads(args.bootstrap)
+    spec = json.loads(args.image)
     require("mount", "tar", "mke2fs")
     root = work / "root"
+    boot = work / "boot"
     scratch = [root, work / "debootstrap", work / "keyring"]
-    # (Left behind by a build that was killed.)
-    for path in scratch:
+    scratch += [work / "xbps", work / "managarm-scripts", work / "xbps-cache"]
+    # (Left behind by a build that was killed. The boot files are build.py's to remove.)
+    for path in scratch + [boot]:
         remove_tree(path)
     root.mkdir()
     try:
         log(f"bootstrapping {name}")
-        bootstrap(spec, root, work)
+        bootstrap(spec["bootstrap"], root, work)
         if (recipe / "overlay").is_dir():
             install_overlay(recipe / "overlay", root)
         if (recipe / "provision").exists():
             log(f"provisioning {name}")
             provision(root, recipe / "provision")
-        finish(root, name)
+        finish(recipe, root, name)
+        if (recipe / "boot-files").exists():
+            log(f"copying the boot files out of {name}")
+            copy_boot_files(recipe, root, boot)
 
-        log(f"creating the file system of {name}")
-        ext4 = work / "root.ext4"
-        with open(ext4, "wb") as file:
-            file.truncate(IMAGE_SIZE)
-        # The inode tables and the journal are zeroed now (as holes in the sparse file),
-        # such that the guest kernel does not initialize them later (which would grow the
-        # disk).
-        run(
-            "mke2fs", "-q", "-t", "ext4", "-b", "4096", "-L", name,
-            "-E", "lazy_itable_init=0,lazy_journal_init=0", "-d", root, ext4,
-        )  # fmt: skip
+        log(f"creating the disk of {name}")
+        create_disk(spec.get("disk", {}), root, work / "disk.raw", name)
     finally:
         # (Signals must not interrupt the cleanup.)
         for signum in [signal.SIGINT, signal.SIGTERM, signal.SIGHUP]:
@@ -264,10 +332,10 @@ def main():
         description=__doc__.split("\n\n")[0], formatter_class=argparse.RawDescriptionHelpFormatter
     )
     commands = parser.add_subparsers(dest="command", required=True, metavar="command")
-    build = commands.add_parser("build", help="create the file system of an image")
+    build = commands.add_parser("build", help="create the disk of an image")
     build.add_argument("recipe", type=Path, help="guest/images/<name>")
     build.add_argument("work", type=Path, help="the work directory")
-    build.add_argument("bootstrap", help="the [bootstrap] table as JSON")
+    build.add_argument("image", help="image.toml as JSON")
     build.set_defaults(handler=cmd_build)
     # (See chroot().)
     enter = commands.add_parser("_chroot")

@@ -61,7 +61,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            bc binutils bison e2fsprogs flex gcc gpgv libelf-dev make perl uidmap wget zstd
+            bc binutils bison e2fsprogs fdisk flex gcc gpgv libelf-dev make perl uidmap wget \
+            xz-utils zstd
       # Images are built in a user namespace (unshare --map-auto), which needs subordinate
       # IDs and which Ubuntu restricts.
       - name: Allow user namespaces

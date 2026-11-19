@@ -11,12 +11,17 @@ The targets are `kernel` (guest/kernel.toml and guest/linux.config), `agent`
 versions of the guest protocol that they speak in agent.json, and guest/boot.toml, which
 tells midgard what the boot files are), `waypipe`
 (guest/waypipe.toml, a static binary, too) and the images in guest/images/<name>: image.toml
-says how to bootstrap the root file system, the files in overlay/ are copied into it, and
+says how to bootstrap the root file system ([bootstrap]) and what the disk is ([disk];
+default: an ext4 file system on all of it), the files in overlay/ are copied into it, and
 `provision`, a shell script, runs in a chroot of it (as root, with the network), e.g., to
 install packages. An image is midgard's template <name>: <name>.tar with the template's
-directory, <name>/disk.qcow2.zst (its sparse 64 GiB ext4 file system as a qcow2 image,
-compressed with zstd) and <name>/template.toml (the settings of the VM instances that
-midgard creates from it).
+directory, <name>/disk.qcow2.zst (its sparse 64 GiB disk as a qcow2 image, compressed with
+zstd) and <name>/template.toml (the settings of the VM instances that midgard creates from
+it). Images whose kernel comes with them (Managarm's) also come with the boot files that
+their template boots with (boot-files in template.toml): `boot-files`, a shell script,
+copies them out of the root file system (on the host, see guest/rootfs.py), and the image's
+boot.toml tells midgard what they are. They are <name>-<file> in the output (with
+<name>-boot.toml).
 
 `build` builds targets into the output directory, with <target>.json, which lists their
 files with their SHA-256 and what they were built from, and channel.json, which makes the
@@ -26,17 +31,18 @@ template. CI builds the targets, too (.github/workflows/guest.yml), and guest/pu
 publishes the files of a workflow run as a guest release, which `bifrost pull` installs by
 default; `targets` lists the targets (whose inputs changed) as JSON, for CI.
 
-Images are built without root: guest/rootfs.py, which creates an image's file system,
-runs as root in a user namespace (unshare --map-root-user --map-auto, which needs
-subordinate IDs for the user in /etc/subuid and /etc/subgid), such that the files can have
-any owner and the package managers can run the packages' scripts.
+Images are built without root: guest/rootfs.py, which creates an image's disk, runs as
+root in a user namespace (unshare --map-root-user --map-auto, which needs subordinate IDs
+for the user in /etc/subuid and /etc/subgid), such that the files can have any owner and
+the package managers can run the packages' scripts.
 
 Downloads and intermediate files are in $XDG_CACHE_HOME/midgard-build
 (~/.cache/midgard-build); the output directory defaults to its dist directory. Needs
 Python 3.12, and `build` needs what building Linux needs (make, gcc, flex, bison, bc, the
 libelf headers) for the kernel, cargo with the target x86_64-unknown-linux-musl for the
-agent and waypipe (and git for the latter) and, for images, util-linux (unshare, mount),
-e2fsprogs and zstd.
+agent and waypipe (and git for the latter) and, for images, util-linux (unshare, mount,
+and sfdisk for disks with a partition table), e2fsprogs and zstd (and xz and
+systemd-sysusers for Managarm's).
 """
 
 import argparse
@@ -202,28 +208,36 @@ def write_manifest(out, target, files, extra):
 def write_channel(directory, entries, base=""):
     """Writes channel.json, which makes a directory with targets' files (or the URL `base`
     that serves them) a channel that `bifrost pull` installs from: the boot targets' files
-    as the boot files linux and the images as templates. `entries` are the targets'
-    manifests. (Images from before templates were tar files are left out.)"""
+    as the boot files linux, the images as templates and the boot files that images come
+    with (`boot-files`, by the name that their templates boot with). `entries` are the
+    targets' manifests. (Images from before templates were tar files are left out.)"""
 
     def file(name, sha256):
         size = (directory / name).stat().st_size
         return {"url": base + name, "sha256": sha256, "size": size}
 
-    boot = {"files": {}}
+    boot = {}
     templates = {}
     for target, entry in sorted(entries.items()):
-        for name, sha256 in entry["files"].items():
-            if target in BOOT_TARGETS:
-                boot["files"][name] = file(name, sha256)
-            elif name == f"{target}.tar":
-                about = ["description", "settings", "boot"]
-                about = {key: entry[key] for key in about if key in entry}
-                templates[target] = {**file(name, sha256), **about}
-        if "protocol" in entry:
-            boot["protocol"] = entry["protocol"]
+        if target in BOOT_TARGETS:
+            linux = boot.setdefault(BOOT_FILES, {"files": {}})
+            for name, sha256 in entry["files"].items():
+                linux["files"][name] = file(name, sha256)
+            if "protocol" in entry:
+                linux["protocol"] = entry["protocol"]
+            continue
+        tar = f"{target}.tar"
+        if tar in entry["files"]:
+            about = ["description", "settings", "boot"]
+            about = {key: entry[key] for key in about if key in entry}
+            templates[target] = {**file(tar, entry["files"][tar]), **about}
+        if "boot-files" in entry:
+            own = boot.setdefault(entry["boot"], {"files": {}})
+            for name, stored in entry["boot-files"].items():
+                own["files"][name] = file(stored, entry["files"][stored])
     channel = {
         "format": CHANNEL_FORMAT,
-        "boot": {BOOT_FILES: boot} if boot["files"] else {},
+        "boot": boot,
         "templates": templates,
     }
     (directory / CHANNEL_FILE).write_text(json.dumps(channel, indent=2) + "\n")
@@ -410,52 +424,103 @@ def add_to_tar(tar, path, name):
         tar.addfile(info)
 
 
+def image_boot_files(recipe, boot):
+    """The boot files that an image's boot-files script copied out of it into `boot`, with
+    the image's boot.toml: which files they are (by their names in the boot files'
+    directory) and the files themselves."""
+    description = load_toml(recipe / BOOT_DESCRIPTION)
+    required = [description[key] for key in ["kernel", "initrd"] if key in description]
+    files = {}
+    for path in sorted(boot.iterdir()):
+        # (Regular files with the names that midgard accepts, see is_file_name() in
+        # crates/midgard/src/boot.rs.)
+        name = path.name
+        valid = re.fullmatch(r"[\w-][\w.-]*", name, re.ASCII) and name != "manifest.json"
+        if path.is_symlink() or not path.is_file() or not valid:
+            raise Failure(f"{recipe / 'boot-files'} copied {name}, which cannot be a boot file")
+        files[name] = path
+    missing = [file for file in required if file not in files]
+    if missing:
+        raise Failure(f"{recipe / 'boot-files'} did not copy {', '.join(missing)}")
+    if BOOT_DESCRIPTION in files:
+        raise Failure(f"{recipe / 'boot-files'} must not copy {BOOT_DESCRIPTION}")
+    files[BOOT_DESCRIPTION] = recipe / BOOT_DESCRIPTION
+    return files
+
+
 def build_image(name, out, namespace):
-    """Builds <name>.tar: rootfs.py creates the file system in the user namespace."""
+    """Builds <name>.tar (and the image's boot files): rootfs.py creates the disk in the
+    user namespace."""
     recipe = IMAGES / name
-    spec = load_toml(recipe / "image.toml")["bootstrap"]
+    spec = load_toml(recipe / "image.toml")
+    settings = load_toml(recipe / "template.toml")
+    # What channel.json says about the template.
+    about = {
+        "description": settings.get("template", {}).get("description"),
+        "settings": settings.get("format", 1),
+        "boot": settings.get("boot-files", BOOT_FILES),
+    }
+    # The image comes with the boot files that its instances boot with.
+    has_boot_files = (recipe / BOOT_DESCRIPTION).exists()
+    if has_boot_files != (recipe / "boot-files").exists():
+        raise Failure(f"{recipe} needs both {BOOT_DESCRIPTION} and boot-files, or neither")
+    if has_boot_files and about["boot"] == BOOT_FILES:
+        raise Failure(f"{recipe / 'template.toml'} must name its boot files (boot-files)")
     fetch_downloads(spec)
     # The work directory is next to the output, as /tmp may be a small tmpfs.
     work = out / f".{name}.work"
     work.mkdir(exist_ok=True)
-    ext4 = work / "root.ext4"
-    qcow2 = work / "root.qcow2"
+    raw = work / "disk.raw"
+    qcow2 = work / "disk.qcow2"
+    boot = work / "boot"
     template = work / name
+    # The boot files, and their names in the output directory (which the other targets'
+    # files share).
+    boot_files = {}
+    stored = {}
     try:
         run_terminating(
             *namespace, sys.executable, GUEST / "rootfs.py", "build", recipe, work, json.dumps(spec)
         )
+        if has_boot_files:
+            boot_files = image_boot_files(recipe, boot)
+            stored = {file: f"{name}-{file}" for file in boot_files}
         log(f"creating {name}.tar")
-        run(sys.executable, GUEST / "mkqcow2.py", ext4, qcow2)
-        ext4.unlink()
+        run(sys.executable, GUEST / "mkqcow2.py", raw, qcow2)
+        raw.unlink()
         template.mkdir(exist_ok=True)
         run("zstd", "-q", "-f", "-T0", "-15", "--rm", qcow2, "-o", template / "disk.qcow2.zst")
         shutil.copyfile(recipe / "template.toml", template / "template.toml")
-        settings = load_toml(recipe / "template.toml")
-        # What channel.json says about the template.
-        about = {
-            "description": settings.get("template", {}).get("description"),
-            "settings": settings.get("format", 1),
-            "boot": settings.get("boot-files", BOOT_FILES),
-        }
         # (Not compressed again: the disk is compressed already.)
         partial = out / f"{name}.tar.partial"
         with tarfile.open(partial, "w", format=tarfile.PAX_FORMAT) as tar:
             add_to_tar(tar, template, name)
             for file in ["template.toml", "disk.qcow2.zst"]:
                 add_to_tar(tar, template / file, f"{name}/{file}")
+        for file, path in boot_files.items():
+            shutil.copyfile(path, out / f"{stored[file]}.partial")
+        # (Last, such that a build that fails or is interrupted leaves the files of the
+        # previous one, which its manifest lists.)
         partial.rename(out / f"{name}.tar")
+        for file in boot_files:
+            (out / f"{stored[file]}.partial").rename(out / stored[file])
     finally:
-        ext4.unlink(missing_ok=True)
+        raw.unlink(missing_ok=True)
         qcow2.unlink(missing_ok=True)
+        shutil.rmtree(boot, ignore_errors=True)
         shutil.rmtree(template, ignore_errors=True)
         (out / f"{name}.tar.partial").unlink(missing_ok=True)
+        for file in stored.values():
+            (out / f"{file}.partial").unlink(missing_ok=True)
         # (Unless a rootfs.py that was killed left the root file system behind.)
         try:
             work.rmdir()
         except OSError:
             pass
-    return [f"{name}.tar"], {key: value for key, value in about.items() if value is not None}
+    if stored:
+        about["boot-files"] = stored
+    files = [f"{name}.tar", *stored.values()]
+    return files, {key: value for key, value in about.items() if value is not None}
 
 
 def cmd_build(args):
