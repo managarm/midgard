@@ -130,6 +130,33 @@ def bootstrap(spec, root, work):
             f"--keyring={keyring}/usr/share/keyrings/debian-archive-keyring.gpg",
             f"--include={','.join(spec['include'])}", spec["suite"], root, spec["mirror"],
         )  # fmt: skip
+    elif method == "managarm":
+        # Managarm's packages from its xbps repository (`channel`), installed as
+        # bootstrap-managarm's managarm-install.py does: with a static xbps, and with its
+        # provision-sysroot.py, which sets up the repository (with its key) and the system
+        # users. The packages stay unconfigured (their scripts are Managarm programs):
+        # Managarm configures them when it boots for the first time.
+        require("systemd-sysusers", "xz")
+        xbps = work / "xbps"
+        scripts = work / "managarm-scripts"
+        xbps.mkdir()
+        (scripts / "xbps-keys").mkdir(parents=True)
+        run("tar", "-xJf", spec["xbps"]["file"], "-C", xbps)
+        # (provision-sysroot.py reads the keys next to it, by the names in the repository.)
+        provision_sysroot = scripts / "provision-sysroot.py"
+        shutil.copyfile(spec["provision-sysroot"]["file"], provision_sysroot)
+        key = spec["key"]["url"].rsplit("/", 1)[1]
+        shutil.copyfile(spec["key"]["file"], scripts / "xbps-keys" / key)
+        apply = [sys.executable, provision_sysroot, "apply", "--root", root]
+        run(*apply, "--arch", "x86_64", f"--xbps-{spec['channel']}")
+        # (Not into the image's package cache.)
+        run(
+            xbps / "usr/bin/xbps-install", "-y", "-S", "-U", "-r", root,
+            "-C", root / "etc/xbps.d", "-c", work / "xbps-cache", *spec["packages"],
+            env=dict(os.environ, XBPS_TARGET_ARCH="x86_64"),
+        )  # fmt: skip
+        # (After the packages, which ship the users' sysusers.d files.)
+        run(*apply, "--base-dirs", "--sysusers")
     else:
         raise Failure(f"there is no bootstrap method {method}")
 
@@ -255,6 +282,7 @@ def cmd_build(args):
     require("mount", "tar", "mke2fs")
     root = work / "root"
     scratch = [root, work / "debootstrap", work / "keyring"]
+    scratch += [work / "xbps", work / "managarm-scripts", work / "xbps-cache"]
     # (Left behind by a build that was killed.)
     for path in scratch:
         remove_tree(path)

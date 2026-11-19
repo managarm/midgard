@@ -37,7 +37,8 @@ Downloads and intermediate files are in $XDG_CACHE_HOME/midgard-build
 Python 3.12, and `build` needs what building Linux needs (make, gcc, flex, bison, bc, the
 libelf headers) for the kernel, cargo with the target x86_64-unknown-linux-musl for the
 agent and waypipe (and git for the latter) and, for images, util-linux (unshare, mount,
-and sfdisk for disks with a partition table), e2fsprogs and zstd.
+and sfdisk for disks with a partition table), e2fsprogs and zstd (and xz and
+systemd-sysusers for Managarm's).
 """
 
 import argparse
