@@ -236,10 +236,16 @@ def provision(root, script):
         in_image(root, ".midgard-provision").unlink()
 
 
-def finish(root, name):
+def finish(recipe, root, name):
     """What every image gets. midgard-init configures the network (it writes
-    /etc/resolv.conf) and sets the host name from /etc/hostname."""
-    in_image(root, "etc/resolv.conf").unlink(missing_ok=True)
+    /etc/resolv.conf) and sets the host name from /etc/hostname. Guests that start the
+    agent themselves (without midgard-init) keep the /etc/resolv.conf of their overlay
+    (the bootstrap and provision may have replaced it)."""
+    resolv_conf = recipe / "overlay/etc/resolv.conf"
+    if resolv_conf.is_file():
+        write_file(root, "etc/resolv.conf", resolv_conf.read_bytes())
+    else:
+        in_image(root, "etc/resolv.conf").unlink(missing_ok=True)
     write_file(root, "etc/hostname", f"{name}\n".encode())
     hosts = (
         f"127.0.0.1\tlocalhost\n127.0.1.1\t{name}\n::1\t\tlocalhost ip6-localhost ip6-loopback\n"
@@ -306,7 +312,7 @@ def cmd_build(args):
         if (recipe / "provision").exists():
             log(f"provisioning {name}")
             provision(root, recipe / "provision")
-        finish(root, name)
+        finish(recipe, root, name)
         if (recipe / "boot-files").exists():
             log(f"copying the boot files out of {name}")
             copy_boot_files(recipe, root, boot)
