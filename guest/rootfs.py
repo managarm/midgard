@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
-"""Creates the root file system of one of midgard's images (guest/images/<name>) as an ext4
-file system: it bootstraps the root file system as image.toml's [bootstrap] table says,
-copies the overlay into it, runs the provision script in a chroot of it and creates the
-file system (mke2fs -d).
+"""Creates the disk of one of midgard's images (guest/images/<name>): it bootstraps the root
+file system as image.toml's [bootstrap] table says, copies the overlay into it, runs the
+provision script in a chroot of it and creates the file system (mke2fs -d) as image.toml's
+[disk] table says.
 
-    rootfs.py build <recipe> <work dir> <bootstrap>
+    rootfs.py build <recipe> <work dir> <image>
 
 build.py runs it as root in a user namespace (unshare --map-root-user --map-auto), such
 that the files can have any owner and the package managers can run the packages' scripts.
-<bootstrap> is the [bootstrap] table as JSON, in which build.py added the paths of the
-downloads (`file`). The root file system is in <work dir>/root while it is built (a build
-that was killed leaves it behind; the next one removes it), and the file system is
-<work dir>/root.ext4.
+<image> is image.toml as JSON, in which build.py added the paths of the downloads
+(`file`). The root file system is in <work dir>/root while it is built (a build that was
+killed leaves it behind; the next one removes it), and the disk is <work dir>/disk.raw.
 """
 
 import argparse
@@ -24,9 +23,10 @@ import subprocess
 import sys
 from pathlib import Path
 
-# The size of the images' file systems (which are sparse, so this only limits what the
-# disks can hold).
+# The size of the images' disks (which are sparse, so this only limits what they can hold).
 IMAGE_SIZE = 64 << 30
+# Where the partition of disks with a partition table starts (in sectors of 512 bytes).
+PARTITION_START = 2048
 # The environment of commands in chroots of images.
 CHROOT_ENV = {
     "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
@@ -218,11 +218,40 @@ def finish(root, name):
     write_file(root, "etc/hosts", hosts.encode())
 
 
+def create_disk(spec, root, disk, name):
+    """Creates the disk with the root file system as image.toml's [disk] table says: the
+    file system (`file-system`, default: ext4) takes all of the disk, or the one partition
+    of a GPT if the table has the partition's type (`partition-type`; with its UUID,
+    `partition-uuid`, if the table has one)."""
+    file_system = spec.get("file-system", "ext4")
+    with open(disk, "wb") as file:
+        file.truncate(IMAGE_SIZE)
+    # The inode tables and the journal are zeroed now (as holes in the sparse file), such
+    # that the guest kernel does not initialize them later (which would grow the disk).
+    options = ["lazy_itable_init=0", "lazy_journal_init=0"]
+    size = []
+    if partition_type := spec.get("partition-type"):
+        require("sfdisk")
+        entry = f"start={PARTITION_START}, type={partition_type}"
+        if partition_uuid := spec.get("partition-uuid"):
+            entry += f", uuid={partition_uuid}"
+        table = f"label: gpt\n{entry}\n"
+        run("sfdisk", "-q", disk, input=table.encode(), stdout=subprocess.DEVNULL)
+        dump = subprocess.run(["sfdisk", "-J", disk], check=True, capture_output=True, text=True)
+        (partition,) = json.loads(dump.stdout)["partitiontable"]["partitions"]
+        options.append(f"offset={partition['start'] * 512}")
+        size = [f"{partition['size'] * 512 // 1024}k"]
+    run(
+        "mke2fs", "-q", "-t", file_system, "-b", "4096", "-L", name, "-E", ",".join(options),
+        "-d", root, disk, *size,
+    )  # fmt: skip
+
+
 def cmd_build(args):
     recipe = args.recipe.resolve()
     name = recipe.name
     work = args.work.resolve()
-    spec = json.loads(args.bootstrap)
+    spec = json.loads(args.image)
     require("mount", "tar", "mke2fs")
     root = work / "root"
     scratch = [root, work / "debootstrap", work / "keyring"]
@@ -232,7 +261,7 @@ def cmd_build(args):
     root.mkdir()
     try:
         log(f"bootstrapping {name}")
-        bootstrap(spec, root, work)
+        bootstrap(spec["bootstrap"], root, work)
         if (recipe / "overlay").is_dir():
             install_overlay(recipe / "overlay", root)
         if (recipe / "provision").exists():
@@ -240,17 +269,8 @@ def cmd_build(args):
             provision(root, recipe / "provision")
         finish(root, name)
 
-        log(f"creating the file system of {name}")
-        ext4 = work / "root.ext4"
-        with open(ext4, "wb") as file:
-            file.truncate(IMAGE_SIZE)
-        # The inode tables and the journal are zeroed now (as holes in the sparse file),
-        # such that the guest kernel does not initialize them later (which would grow the
-        # disk).
-        run(
-            "mke2fs", "-q", "-t", "ext4", "-b", "4096", "-L", name,
-            "-E", "lazy_itable_init=0,lazy_journal_init=0", "-d", root, ext4,
-        )  # fmt: skip
+        log(f"creating the disk of {name}")
+        create_disk(spec.get("disk", {}), root, work / "disk.raw", name)
     finally:
         # (Signals must not interrupt the cleanup.)
         for signum in [signal.SIGINT, signal.SIGTERM, signal.SIGHUP]:
@@ -264,10 +284,10 @@ def main():
         description=__doc__.split("\n\n")[0], formatter_class=argparse.RawDescriptionHelpFormatter
     )
     commands = parser.add_subparsers(dest="command", required=True, metavar="command")
-    build = commands.add_parser("build", help="create the file system of an image")
+    build = commands.add_parser("build", help="create the disk of an image")
     build.add_argument("recipe", type=Path, help="guest/images/<name>")
     build.add_argument("work", type=Path, help="the work directory")
-    build.add_argument("bootstrap", help="the [bootstrap] table as JSON")
+    build.add_argument("image", help="image.toml as JSON")
     build.set_defaults(handler=cmd_build)
     # (See chroot().)
     enter = commands.add_parser("_chroot")

@@ -11,12 +11,13 @@ The targets are `kernel` (guest/kernel.toml and guest/linux.config), `agent`
 versions of the guest protocol that they speak in agent.json, and guest/boot.toml, which
 tells midgard what the boot files are), `waypipe`
 (guest/waypipe.toml, a static binary, too) and the images in guest/images/<name>: image.toml
-says how to bootstrap the root file system, the files in overlay/ are copied into it, and
+says how to bootstrap the root file system ([bootstrap]) and what the disk is ([disk];
+default: an ext4 file system on all of it), the files in overlay/ are copied into it, and
 `provision`, a shell script, runs in a chroot of it (as root, with the network), e.g., to
 install packages. An image is midgard's template <name>: <name>.tar with the template's
-directory, <name>/disk.qcow2.zst (its sparse 64 GiB ext4 file system as a qcow2 image,
-compressed with zstd) and <name>/template.toml (the settings of the VM instances that
-midgard creates from it).
+directory, <name>/disk.qcow2.zst (its sparse 64 GiB disk as a qcow2 image, compressed with
+zstd) and <name>/template.toml (the settings of the VM instances that midgard creates from
+it).
 
 `build` builds targets into the output directory, with <target>.json, which lists their
 files with their SHA-256 and what they were built from, and channel.json, which makes the
@@ -26,17 +27,17 @@ template. CI builds the targets, too (.github/workflows/guest.yml), and guest/pu
 publishes the files of a workflow run as a guest release, which `bifrost pull` installs by
 default; `targets` lists the targets (whose inputs changed) as JSON, for CI.
 
-Images are built without root: guest/rootfs.py, which creates an image's file system,
-runs as root in a user namespace (unshare --map-root-user --map-auto, which needs
-subordinate IDs for the user in /etc/subuid and /etc/subgid), such that the files can have
-any owner and the package managers can run the packages' scripts.
+Images are built without root: guest/rootfs.py, which creates an image's disk, runs as
+root in a user namespace (unshare --map-root-user --map-auto, which needs subordinate IDs
+for the user in /etc/subuid and /etc/subgid), such that the files can have any owner and
+the package managers can run the packages' scripts.
 
 Downloads and intermediate files are in $XDG_CACHE_HOME/midgard-build
 (~/.cache/midgard-build); the output directory defaults to its dist directory. Needs
 Python 3.12, and `build` needs what building Linux needs (make, gcc, flex, bison, bc, the
 libelf headers) for the kernel, cargo with the target x86_64-unknown-linux-musl for the
-agent and waypipe (and git for the latter) and, for images, util-linux (unshare, mount),
-e2fsprogs and zstd.
+agent and waypipe (and git for the latter) and, for images, util-linux (unshare, mount,
+and sfdisk for disks with a partition table), e2fsprogs and zstd.
 """
 
 import argparse
@@ -411,23 +412,23 @@ def add_to_tar(tar, path, name):
 
 
 def build_image(name, out, namespace):
-    """Builds <name>.tar: rootfs.py creates the file system in the user namespace."""
+    """Builds <name>.tar: rootfs.py creates the disk in the user namespace."""
     recipe = IMAGES / name
-    spec = load_toml(recipe / "image.toml")["bootstrap"]
+    spec = load_toml(recipe / "image.toml")
     fetch_downloads(spec)
     # The work directory is next to the output, as /tmp may be a small tmpfs.
     work = out / f".{name}.work"
     work.mkdir(exist_ok=True)
-    ext4 = work / "root.ext4"
-    qcow2 = work / "root.qcow2"
+    raw = work / "disk.raw"
+    qcow2 = work / "disk.qcow2"
     template = work / name
     try:
         run_terminating(
             *namespace, sys.executable, GUEST / "rootfs.py", "build", recipe, work, json.dumps(spec)
         )
         log(f"creating {name}.tar")
-        run(sys.executable, GUEST / "mkqcow2.py", ext4, qcow2)
-        ext4.unlink()
+        run(sys.executable, GUEST / "mkqcow2.py", raw, qcow2)
+        raw.unlink()
         template.mkdir(exist_ok=True)
         run("zstd", "-q", "-f", "-T0", "-15", "--rm", qcow2, "-o", template / "disk.qcow2.zst")
         shutil.copyfile(recipe / "template.toml", template / "template.toml")
@@ -446,7 +447,7 @@ def build_image(name, out, namespace):
                 add_to_tar(tar, template / file, f"{name}/{file}")
         partial.rename(out / f"{name}.tar")
     finally:
-        ext4.unlink(missing_ok=True)
+        raw.unlink(missing_ok=True)
         qcow2.unlink(missing_ok=True)
         shutil.rmtree(template, ignore_errors=True)
         (out / f"{name}.tar.partial").unlink(missing_ok=True)
