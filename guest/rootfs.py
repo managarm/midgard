@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Creates the disk of one of midgard's images (guest/images/<name>): it bootstraps the root
 file system as image.toml's [bootstrap] table says, copies the overlay into it, runs the
-provision script in a chroot of it and creates the file system (mke2fs -d) as image.toml's
+provision script in a chroot of it, copies the boot files out of it (with the boot-files
+script, if the image has one) and creates the file system (mke2fs -d) as image.toml's
 [disk] table says.
 
     rootfs.py build <recipe> <work dir> <image>
@@ -10,7 +11,8 @@ build.py runs it as root in a user namespace (unshare --map-root-user --map-auto
 that the files can have any owner and the package managers can run the packages' scripts.
 <image> is image.toml as JSON, in which build.py added the paths of the downloads
 (`file`). The root file system is in <work dir>/root while it is built (a build that was
-killed leaves it behind; the next one removes it), and the disk is <work dir>/disk.raw.
+killed leaves it behind; the next one removes it), the disk is <work dir>/disk.raw and the
+boot files are in <work dir>/boot.
 """
 
 import argparse
@@ -245,6 +247,14 @@ def finish(root, name):
     write_file(root, "etc/hosts", hosts.encode())
 
 
+def copy_boot_files(recipe, root, boot):
+    """Runs an image's boot-files script on the host, with the root file system and the
+    directory that the boot files go to (in namespaces of its own, such that nothing that
+    it started outlives it)."""
+    boot.mkdir()
+    in_namespaces("/bin/sh", "-eu", recipe / "boot-files", root, boot)
+
+
 def create_disk(spec, root, disk, name):
     """Creates the disk with the root file system as image.toml's [disk] table says: the
     file system (`file-system`, default: ext4) takes all of the disk, or the one partition
@@ -281,10 +291,11 @@ def cmd_build(args):
     spec = json.loads(args.image)
     require("mount", "tar", "mke2fs")
     root = work / "root"
+    boot = work / "boot"
     scratch = [root, work / "debootstrap", work / "keyring"]
     scratch += [work / "xbps", work / "managarm-scripts", work / "xbps-cache"]
-    # (Left behind by a build that was killed.)
-    for path in scratch:
+    # (Left behind by a build that was killed. The boot files are build.py's to remove.)
+    for path in scratch + [boot]:
         remove_tree(path)
     root.mkdir()
     try:
@@ -296,6 +307,9 @@ def cmd_build(args):
             log(f"provisioning {name}")
             provision(root, recipe / "provision")
         finish(root, name)
+        if (recipe / "boot-files").exists():
+            log(f"copying the boot files out of {name}")
+            copy_boot_files(recipe, root, boot)
 
         log(f"creating the disk of {name}")
         create_disk(spec.get("disk", {}), root, work / "disk.raw", name)
